@@ -356,7 +356,7 @@ readRef kind rawName subs env =
 -- | The transaction a bare read of this (qualified) global is pinned
 -- to right now: its own entry in 'envPinOverrides' if a @@BIND(...)@
 -- list gave it one, otherwise the block-wide 'envPinnedTx'. 'Nothing'
--- means the read is live. Only meaningful for globals — locals have no
+-- means the read is live. Only meaningful for globals, locals have no
 -- history to pin to, and callers never ask about them.
 effectivePin :: Text -> Env -> Maybe TxId
 effectivePin name env = Map.findWithDefault (envPinnedTx env) name (envPinOverrides env)
@@ -369,7 +369,7 @@ effectivePin name env = Map.findWithDefault (envPinnedTx env) name (envPinOverri
 --
 -- With a bind list, only the listed globals take the new pin; every
 -- other global keeps whatever pin the enclosing scope gave it (or stays
--- live), so an inner block never silently releases an outer pin — only
+-- live), so an inner block never silently releases an outer pin, only
 -- an explicit @@TX(LAST)@ does. The list must be a subset of the
 -- enclosing bind list ('BindScope' otherwise); with no enclosing list
 -- (no enclosing bind at all) any global may be named.

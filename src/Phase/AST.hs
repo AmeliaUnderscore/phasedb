@@ -255,7 +255,7 @@ data BindName = BindName
 -- * 'psPin' is the @@TX(...)@ argument, resolved at run time by
 --   'Phase.Eval.resolvePinExpr' ('TimeTravelLast' = release the pin).
 -- * 'psBind' is the optional bind list. 'Nothing' (no @@BIND@ clause)
---   means "every global the enclosing scope has bound" — every global
+--   means "every global the enclosing scope has bound", every global
 --   at all when nothing encloses it. @Just []@ is a real, empty list.
 data PinSpec = PinSpec
   { psPin  :: !Expr
@@ -324,11 +324,11 @@ data Stmt
     -- 'Stmt.If'/'Stmt.For'/(here, bare 'Stmt.Do') hold no body.
     -- @DO TAG(args)@ etc. is 'SDo (Just target)'.
   | SDoWith !PinSpec !(Maybe CallTarget)
-     -- ^ @DO WITH @TX(expr) [@BIND(...)]@ — with no target, a dotted block
+     -- ^ @DO WITH @TX(expr) [@BIND(...)]@, with no target, a dotted block
      -- exactly like 'SDo' 'Nothing' (same block resolution; the opener
      -- line just ends in this clause instead of a bare @DO@, see
      -- 'Phase.Lines.endsWithBareDo'). With a target,
-     -- @DO WITH @TX(expr) [@BIND(...)] TAG(args)@ — one 'SDo' call made
+     -- @DO WITH @TX(expr) [@BIND(...)] TAG(args)@, one 'SDo' call made
      -- inside the same pin scope. Either way, the GLOBALS the scope has
      -- bound are answered as of one pinned transaction instead of live
      -- (docs/tx-pinning-design.md Part 2); the rest read live. The

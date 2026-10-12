@@ -1361,6 +1361,152 @@ testStorageGroup ctx = do
     (map llDepth (buildLogicalLines " DO WITH @TX(^[-2]ITEM(1)) @BIND(^ITEM)\n. WRITE 1"))
     [0, 1]
 
+  -- 2d. DO WITH @TX(...) @BIND(...) (docs/tx-pinning-design.md,
+  -- "Explicit global bindings"). A bind list selects WHICH globals the pin
+  -- applies to; every other global reads live. Revisions, oldest first:
+  --   t+1 ^B=b1   t+2 ^A=a1   t+3 ^B=b2   t+4 ^A=a2   t+5 ^B=b3
+  -- so live is a2/b3, and @TX(^[-1]A(1)) (evaluated live) pins to t+2,
+  -- where A was a1 and B was b1.
+  let pairSrc = " SET ^B(1)=\"b1\"\n SET ^A(1)=\"a1\"\n SET ^B(1)=\"b2\"\n SET ^A(1)=\"a2\"\n SET ^B(1)=\"b3\"\n"
+      pinA = "@TX(^[-1]A(1))"
+      showAB = " WRITE ^A(1),\",\",^B(1),!\n"
+      baseTx3 = seLastTx (envStorage adminEnv)
+
+  expectOut "@BIND(^A): the bound global is pinned, the unbound one reads live" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n." ++ showAB)
+    "a1,b3\n"
+
+  expectOut "no @BIND clause pins every global (unchanged behavior)" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ "\n." ++ showAB)
+    "a1,b1\n"
+
+  expectOut "@BIND(^B): binding the other global pins that one instead" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^B)\n." ++ showAB)
+    "a2,b1\n"
+
+  expectOut "an empty @BIND() binds nothing, so everything reads live" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND()\n." ++ showAB)
+    "a2,b3\n"
+
+  -- Nesting: a narrower inner list leaves what only the outer pinned at
+  -- the outer pin; @TX(LAST) releases just the globals the inner names.
+  expectOut "a narrower inner @BIND keeps the outer pin on globals it does not name" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A,^B)\n. DO WITH @TX(LAST) @BIND(^A)\n.." ++ showAB)
+    "a2,b1\n"
+
+  -- An omitted inner list re-pins what the enclosing list bound -- and
+  -- nothing else: ^B stays live rather than being swept into the pin.
+  expectOut "an omitted inner @BIND re-pins only the previously bound globals" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. DO WITH @TX(" ++ show (baseTx3 + 4) ++ ")\n.." ++ showAB)
+    "a2,b3\n"
+
+  expectOut "an omitted inner @BIND with @TX(LAST) releases everything the outer bound" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A,^B)\n. DO WITH @TX(LAST)\n.." ++ showAB)
+    "a2,b3\n"
+
+  expectOut "with no enclosing bind list a nested @BIND may name any global" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ "\n. DO WITH @TX(LAST) @BIND(^B)\n.." ++ showAB)
+    "a1,b3\n"
+
+  do r <- runPhaseIn adminEnv (pairSrc ++ " DO WITH @TX(LAST) @BIND(^A)\n. DO WITH @TX(LAST) @BIND(^A,^B)\n.. WRITE 1,!\n")
+     case r of
+       Left (BindScope "B") -> runAssert ctx "a nested @BIND naming a global the outer list did not bind is <BIND SCOPE>" True ""
+       other                -> runAssert ctx "a nested @BIND naming a global the outer list did not bind is <BIND SCOPE>" False (show (fmap getOutputText other))
+  assertEqual ctx "<BIND SCOPE> error text" (formatError (BindScope "B"))
+    "<BIND SCOPE> ^B is not bound by the enclosing DO WITH / CALL WITH"
+
+  -- Relative addressing is per global: ^[-N] counts back from the pin
+  -- for a bound global, but from the live latest for an unbound one.
+  expectOut "^[-N] counts from the pin for a bound global and from live for an unbound one" adminEnv
+    (pairSrc ++ " DO WITH @TX(^A(1)) @BIND(^A)\n. WRITE ^[-1]A(1),\",\",^[-1]B(1),!\n")
+    "a1,b2\n"
+
+  -- $DATA / $GET read through the per-global pin too. ^NEW appears after
+  -- the pin point: bound, it does not exist yet; unbound, it does.
+  let dataSrc = pairSrc ++ " SET ^NEW(1)=\"x\"\n"
+  expectOut "$DATA of an unbound global is live inside a bound block" adminEnv
+    (dataSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. WRITE $DATA(^NEW(1)),$DATA(^A(1)),!\n")
+    "11\n"
+  expectOut "$DATA of a bound global is as of the pin" adminEnv
+    (dataSrc ++ " DO WITH " ++ pinA ++ " @BIND(^NEW)\n. WRITE $DATA(^NEW(1)),$DATA(^A(1)),!\n")
+    "01\n"
+
+  -- $ORDER walks the children as of the pin only for a BOUND global.
+  expectOut "$ORDER of a bound global walks the children as of the pin" adminEnv
+    (orderSrc (" DO WITH @TX(" ++ show txOfL3 ++ ") @BIND(^L)\n. SET K=\"\"\n. " ++ walkLoop ++ " WRITE !\n"))
+    "1,2,3,\n"
+  expectOut "$ORDER of an unbound global walks the live children inside a bound block" adminEnv
+    (orderSrc (" DO WITH @TX(" ++ show txOfL3 ++ ") @BIND(^OTHER)\n. SET K=\"\"\n. " ++ walkLoop ++ " WRITE !\n"))
+    "1,3,4,\n"
+
+  -- Dynamic (REF) and naked references resolve to a name first, and the
+  -- per-global pin is looked up by that name.
+  expectOut "REF(\"^A\",...) honours the per-global pin of the name it resolves to" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. WRITE REF(\"^A\",1),\",\",REF(\"^B\",1),!\n")
+    "a1,b3\n"
+  expectOut "a naked reference follows the pin of the global it resolves to (bound)" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^B)\n. WRITE ^B(1),\",\",^(1),!\n")
+    "b1,b1\n"
+  expectOut "a naked reference follows the pin of the global it resolves to (unbound)" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^B)\n. WRITE ^A(1),\",\",^(1),!\n")
+    "a2,a2\n"
+
+  -- Namespace-qualified bind names match the namespace-qualified global
+  -- only; a bare ^A names a different global.
+  let nsSrc = " SET ^B(1)=\"b1\"\n SET NS^A(1)=\"a1\"\n SET ^B(1)=\"b2\"\n SET NS^A(1)=\"a2\"\n"
+      showNS = " WRITE NS^A(1),\",\",^B(1),!\n"
+  expectOut "@BIND(NS^A) pins the namespace-qualified global" adminEnv
+    (nsSrc ++ " DO WITH @TX(NS^[-1]A(1)) @BIND(NS^A)\n." ++ showNS)
+    "a1,b2\n"
+  expectOut "@BIND(^A) does not bind the global NS^A" adminEnv
+    (nsSrc ++ " DO WITH @TX(NS^[-1]A(1)) @BIND(^A)\n." ++ showNS)
+    "a2,b2\n"
+
+  -- The enclosing scope is restored on the way out of every block.
+  expectOut "the pin scope ends with the block: later reads are live again" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. WRITE ^A(1),!\n WRITE ^A(1),!\n")
+    "a1\na2\n"
+  expectOut "leaving a nested block restores the outer scope's pins" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A,^B)\n. DO WITH @TX(LAST) @BIND(^A)\n.. WRITE ^A(1),!\n. WRITE ^A(1),!\n")
+    "a2\na1\n"
+
+  -- Single-call forms: one call inside its own pin scope.
+  let Right envBind1 = defineItem "_GLOBAL" "SHOWAB" KindFunction (Just []) " RETURN ^A(1)_\",\"_^B(1)" adminEnv
+      Right envBind  = defineItem "_GLOBAL" "SHOWW" KindFunction (Just []) (T.pack (dropWhileEnd' showAB)) envBind1
+      dropWhileEnd' = reverse . dropWhile (== '\n') . reverse
+  expectOut "DO WITH @TX(...) @BIND(...) TAG() pins one call; the pin carries into it" envBind
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A) SHOWW()\n")
+    "a1,b3\n"
+  expectOut "DO WITH @TX(LAST) TAG() releases a block's pin for one call only" envBind
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. DO SHOWW()\n. DO WITH @TX(LAST) SHOWW()\n. DO SHOWW()\n")
+    "a1,b3\na2,b3\na1,b3\n"
+  expectOut "CALL WITH @TX(...) @BIND(...) is an expression-position pinned call" envBind
+    (pairSrc ++ " WRITE CALL WITH " ++ pinA ++ " @BIND(^A) SHOWAB(),!\n")
+    "a1,b3\n"
+  expectOut "CALL WITH @TX(LAST) releases a block-wide pin for that call" envBind
+    (pairSrc ++ " DO WITH " ++ pinA ++ "\n. WRITE CALL SHOWAB(),\"|\",CALL WITH @TX(LAST) SHOWAB(),!\n")
+    "a1,b1|a2,b3\n"
+
+  -- A bind list must name whole globals.
+  do r <- runPhaseIn adminEnv (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A(\"x\"))\n. WRITE 1,!\n")
+     case r of
+       Left (SyntaxError _) -> runAssert ctx "a subscripted item in @BIND(...) is a parse error" True ""
+       other                -> runAssert ctx "a subscripted item in @BIND(...) is a parse error" False (show (fmap getOutputText other))
+
+  -- Phase.Lines: a bind list after the pin still opens a block; a single
+  -- pinned call (ending in the call) does not.
+  assertEqual ctx "continuation: DO WITH @TX(...) @BIND(...) opens a block"
+    (needsContinuation " DO WITH @TX(LAST) @BIND(^A,^B)") True
+  assertEqual ctx "continuation: DO WITH @TX(...) @BIND() (empty list) opens a block"
+    (needsContinuation " DO WITH @TX(LAST) @BIND()") True
+  assertEqual ctx "continuation: DO WITH @TX(...) TAG() is a one-line call, not a block"
+    (needsContinuation " DO WITH @TX(LAST) SHOWAB()") False
+  assertEqual ctx "continuation: DO WITH @TX(...) @BIND(...) TAG() is a one-line call, not a block"
+    (needsContinuation " DO WITH @TX(LAST) @BIND(^A) SHOWAB()") False
+  assertEqual ctx "DO WITH @TX(...) @BIND(...) opens a block in Phase.Lines (depths 0 and 1)"
+    (map llDepth (buildLogicalLines " DO WITH @TX(^[-2]ITEM(1)) @BIND(^ITEM)\n. WRITE 1"))
+    [0, 1]
+
   -- The REPL's multi-line continuation rule (Phase.Lines.needsContinuation).
   -- It used to count every DO word as an unclosed opener, so even a
   -- one-line `DO tag` swallowed the following input until EOF.

@@ -260,7 +260,7 @@ endsWithBareDo txt =
 -- followed by an @@BIND(...)@ list (the time-pinned block opener,
 -- docs/tx-pinning-design.md Part 2)? It opens a dotted block exactly
 -- like a bare @DO@ does, so it has to raise the reachable depth the
--- same way — otherwise the dotted lines after it would be mistaken for
+-- same way, otherwise the dotted lines after it would be mistaken for
 -- a continuation of this one.
 --
 -- The single-call form, @DO WITH @TX(...) TAG(args)@, ends in the call

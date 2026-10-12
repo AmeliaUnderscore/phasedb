@@ -7,10 +7,6 @@ implementation differs from, or pins down, what was written before it
 existed -- in particular, the binding list below was designed as a
 whitelist and was built as a pin SELECTOR instead.
 
-This is the team's idea; the syntax below is Claude's counter-proposal
-(accepted) for the team's original `@`-based sketch, kept mostly intact
-otherwise.
-
 ## Motivation
 
 `Phase.Storage.Engine`'s `seHistory` already stores every path's
@@ -240,9 +236,7 @@ got slightly wrong:
 ### As built: `@BIND(...)`, nested scopes, and single-call forms
 
 The binding list above was written as a whitelist (an unbound global is an
-error). It was built the other way round, per Astra: **the list selects
-which globals are pinned; every other global simply reads live.** There is
-no "unbound global" error.
+error). It was built the other way round: **the list selects which globals are pinned; every other global simply reads live.** There is no "unbound global" error.
 
 - **Syntax.** `DO WITH @TX(arg) @BIND(^A,^B)`. No whitespace inside the
   list (Phase argument lists never allow it), and `@BIND` must follow

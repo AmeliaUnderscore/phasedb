@@ -75,7 +75,7 @@ Part I core is largely in place:
   - `FOR EACH var IN collection` collection traversal for globals and locals (lowered to `$ORDER`).
   - Dotted block execution for bare `DO` and `FOR` loops.
   - `DO WITH @TX(...)` pinned-read blocks, with an optional `@BIND(^A,^B)` list that pins only the named globals (every other global reads live), plus the single-call forms `DO WITH @TX(...) TAG(...)` and `CALL WITH @TX(...) TAG(...)`; see `docs/tx-pinning-design.md`.
- - `test/Main.hs` — comprehensive unit and specification test suite
+ - `test/Main.hs`, comprehensive unit and specification test suite
 - `test/Main.hs`, comprehensive unit and specification test suite
   (**225 tests**, 0 failures) validating Value coercion, Parser precedence, Lines layout,
   Stmt commands, Tree duality/collation, Eval expressions/routines,
@@ -104,13 +104,12 @@ of which carry a trailing space in the handbook source. A literal
 no-space join concatenates `^ORDERS` directly onto `MERGE`, which does
 not parse.
 
-Agreed fix with Astra: continuation now joins with a single space
-inserted **by default**. Dot-count remains the *only* signal for
-depth and for triggering continuation at all (unchanged), an
-indentation-based alternative was considered and explicitly rejected,
-because raw indentation has no reliable discrete unit the way an
-explicit dot count does, and using it would make a continuation line
-ambiguous with a fresh column-0 tag line.
+Continuation now joins with a single space inserted **by default**. 
+Dot-count remains the *only* signal for depth and for triggering 
+continuation at all (unchanged), an indentation-based alternative 
+was considered and explicitly rejected, because raw indentation has no 
+reliable discrete unit the way an explicit dot count does, and using 
+it would make a continuation line ambiguous with a fresh column-0 tag line.
 
 To get the old no-space "hard join" behavior back (e.g. splitting a
 long string literal token with no gap at all), place a literal `|`

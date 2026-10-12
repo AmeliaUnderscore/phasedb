@@ -196,7 +196,7 @@
   None of these has been compiled or run (no GHC in the authoring
   sandbox).
 
-* Feature (Astra-directed; `docs/tx-pinning-design.md`, "Explicit global
+* Feature (`docs/tx-pinning-design.md`, "Explicit global
   bindings"): `DO WITH @TX(...) @BIND(^A,^B)`. A bind list selects WHICH
   globals the pin applies to; every other global reads live (it is not an
   error to use one). With no `@BIND` clause every global is bound, exactly
@@ -232,6 +232,47 @@
   rules above, subset violation, per-global `^[-N]` baseline, `$DATA`,
   single-call forms, `Phase.Lines` block detection). Compiled and run with
   `ghc --make` (GHC 9.4.7, `-XGHC2021`; not through `cabal`): 386 of 386 pass,
+  and `app/Main.hs` compiles. The real `cabal` build under GHC 9.10+ was not
+  exercised.
+
+* Feature (`docs/tx-pinning-design.md`, "Explicit global
+  bindings"): `DO WITH @TX(...) @BIND(^A,^B)`. A bind list selects WHICH
+  globals the pin applies to; every other global reads live (it is not an
+  error to use one). With no `@BIND` clause every global is bound, exactly
+  as before. Bindings are whole globals (`^NAME` or `NS^NAME`), never
+  subscripted paths; `@BIND()` binds nothing. New AST `PinSpec`/`BindName`;
+  `SDoWith` now carries a `PinSpec` and an optional call target.
+  Pins are now per global: `Env.envPinnedTx` stays the block-wide pin (a
+  block with no bind list), and two new fields carry the rest --
+  `envPinOverrides` (per-global pins from a bind list; `Nothing` = explicitly
+  live) and `envBindScope` (the innermost enclosing bind list, `Nothing` =
+  none). `Phase.State.effectivePin` answers "what is this global pinned to
+  right now", and `readPinnedOrLive`, the `$DATA`/`$GET`/`$ORDER` implicit pin
+  (`implicitPin` now takes the global's name) and `resolveRelativeTx`'s `^[-N]`
+  baseline all go through it, so `^[-N]` counts from the pin for a bound
+  global and from live for an unbound one.
+  Nesting (`Phase.State.enterPinScope`): a nested bind list must be a subset
+  of the enclosing one (new `<BIND SCOPE> ^NAME` error, `BindScope`), unless
+  nothing encloses it; only the globals a nested list names take the new pin,
+  the rest keep the outer pin (only `@TX(LAST)` releases); a nested block with
+  no bind list re-pins exactly the globals the enclosing list bound (every
+  global, when there is no enclosing list).
+* Feature: single-call pin forms -- `DO WITH @TX(x) [@BIND(...)] TAG(args)`
+  and, in expression position, `CALL WITH @TX(x) [@BIND(...)] TAG(args)` (new
+  `Expr` constructor `CallWith`) run one call inside its own pin scope.
+  `DO WITH @TX(LAST) TAG()` is the way to release a block's pin for one call.
+  `Phase.Stmt.pDo`/`Phase.Parser.pCallExpr` share `Phase.Parser.pPinSpec`,
+  which commits once it has seen ` WITH @TX(`, so a malformed bind list is a
+  parse error instead of `DO WITH` being misread as a call to a tag named
+  `WITH` (caught by the first test of a subscripted bind item).
+  `Phase.Lines.endsWithDoWith` also recognises a block opener ending in
+  `@BIND(...)`, and does not treat the single-call form as a block opener.
+* Tests: 32 new cases (bound vs unbound reads, empty list, the nesting
+  rules above, subset violation, per-global `^[-N]` baseline, `$DATA`,
+  `$ORDER`, `REF(...)` and naked references, namespace-qualified bind names,
+  scope restoration after plain and nested blocks, single-call forms,
+  `Phase.Lines` block detection). Compiled and run with
+  `ghc --make` (GHC 9.4.7, `-XGHC2021`; not through `cabal`): 395 of 395 pass,
   and `app/Main.hs` compiles. The real `cabal` build under GHC 9.10+ was not
   exercised.
 

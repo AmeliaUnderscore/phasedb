@@ -324,13 +324,13 @@ pCallExpr = do
 -- every other Phase argument list).
 --
 -- The pin argument is either the bare word @LAST@ (release: back to live
--- data) or an ordinary expression — typically a global reference carrying
+-- data) or an ordinary expression, typically a global reference carrying
 -- a relative time-travel bracket, e.g. @^[-2]FOO("BAR")@, or an absolute
 -- transaction number.
 --
 -- Each bind-list item names a WHOLE global, spelled like a global
 -- reference without subscripts: @^NAME@ or @NS^NAME@. A subscripted item
--- is a parse error on purpose — bindings are per global, not per path.
+-- is a parse error on purpose, bindings are per global, not per path.
 -- @\@BIND()@ (an empty list) is accepted: it binds nothing.
 --
 -- Fails WITHOUT consuming input unless the text starts with @ WITH

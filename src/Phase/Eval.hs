@@ -1229,7 +1229,7 @@ runDoBlock = do
 
 -- | Run an action inside a @DO WITH@ / @CALL WITH@ pin scope: resolve
 -- the pin ('resolvePinExpr') and the bind list, install the scope
--- ('Phase.State.enterPinScope' — which also enforces that a nested
+-- ('Phase.State.enterPinScope', which also enforces that a nested
 -- bind list is a subset of the enclosing one), run the action, then
 -- restore the enclosing scope.
 --

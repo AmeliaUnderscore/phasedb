@@ -110,7 +110,7 @@ import Phase.Storage.Types (StorageError (..), TxId, WalOp (..), WalRecord (..))
 -- Version history:
 --   1 -- initial binary format (length-prefixed records, checkpoints)
 --   2 -- 'WalCommit' gained a username field (the team's user/role
---        system); per Astra, breaking compatibility with existing
+--        system); breaking compatibility with existing
 --        (test-only) databases across this bump is fine, so there is
 --        no dual-format reader, a v1 file simply won't have this
 --        version byte and will be treated as unreadable.
