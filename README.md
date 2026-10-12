@@ -74,6 +74,8 @@ Part I core is largely in place:
   - Reference parameters: `DO DOUBLEIT(&x)` / `CALL DOUBLEIT(&x)` with true local variable aliasing across call frames.
   - `FOR EACH var IN collection` collection traversal for globals and locals (lowered to `$ORDER`).
   - Dotted block execution for bare `DO` and `FOR` loops.
+  - `DO WITH @TX(...)` pinned-read blocks, with an optional `@BIND(^A,^B)` list that pins only the named globals (every other global reads live), plus the single-call forms `DO WITH @TX(...) TAG(...)` and `CALL WITH @TX(...) TAG(...)`; see `docs/tx-pinning-design.md`.
+ - `test/Main.hs` — comprehensive unit and specification test suite
 - `test/Main.hs`, comprehensive unit and specification test suite
   (**225 tests**, 0 failures) validating Value coercion, Parser precedence, Lines layout,
   Stmt commands, Tree duality/collation, Eval expressions/routines,

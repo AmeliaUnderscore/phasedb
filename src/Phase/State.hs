@@ -26,6 +26,8 @@ module Phase.State
   , childCountRef
   , mergeRef
   , resolveRelativeTx
+  , effectivePin
+  , enterPinScope
   , readAtTxRef
   , dataAtTxRef
   , orderAtTxRef
@@ -47,6 +49,8 @@ module Phase.State
 import Control.Monad (mplus)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime)
@@ -118,6 +122,12 @@ data EvalError
   -- ^ A naked reference (@^(subs)@) was used before any NAMED global
   -- had been referenced yet in this session, so there is nothing for
   -- it to mean. Real M's own error name for exactly this.
+  | BindScope Text
+  -- ^ A nested @DO WITH@/@CALL WITH@ @@BIND(...)@ list named a global
+  -- (qualified name) that the enclosing block's own bind list did not
+  -- bind. A nested bind list must be a subset of the one around it; the
+  -- only block that may bind any global is one with no enclosing bind
+  -- list at all (docs/tx-pinning-design.md, "Explicit global bindings").
   deriving (Eq, Show)
 
 -- | Format an error according to Phase's error convention (<ERROR_NAME>).
@@ -155,6 +165,8 @@ formatError (NullSubscript name subs) =
   in "<SUBSCRIPT> " <> name <> "(" <> subTxt <> ") -- the null string is not a valid subscript"
 formatError NakedReference =
   "<NAKED> no global reference has been established yet"
+formatError (BindScope name) =
+  "<BIND SCOPE> ^" <> name <> " is not bound by the enclosing DO WITH / CALL WITH"
 
 -- --------------------------------------------------------------------
 -- Call Frames
@@ -219,6 +231,24 @@ data Env = Env
                                         -- inside the block discards the whole 'Env' (see
                                         -- 'Phase.Eval.Eval'), so a pin cannot leak out of
                                         -- a failed block.
+  , envPinOverrides     :: !(Map Text (Maybe TxId))
+                                        -- ^ Per-global pins installed by a @DO WITH@ /
+                                        -- @CALL WITH@ block that carries an @@BIND(...)@
+                                        -- list, keyed by qualified global name. A global
+                                        -- listed here is read as of its own entry
+                                        -- ('Nothing' = explicitly LIVE, which beats a
+                                        -- non-live 'envPinnedTx'); every other global
+                                        -- falls back to 'envPinnedTx'. Empty outside such
+                                        -- a block. See 'effectivePin' / 'enterPinScope'.
+  , envBindScope        :: !(Maybe (Set Text))
+                                        -- ^ The bind list of the innermost enclosing
+                                        -- block that has one: the only globals a nested
+                                        -- @@BIND(...)@ may name, and the globals a nested
+                                        -- block WITHOUT a bind list re-pins. 'Nothing' =
+                                        -- no enclosing bind list (so anything may be
+                                        -- bound, and a bind-less block re-pins every
+                                        -- global). Kept apart from the overrides so an
+                                        -- empty list (@@BIND()@) stays distinct from none.
   , envLastGlobalRef    :: !(Maybe Text) -- ^ The fully-qualified name (namespace already
                                         -- folded in) of the last NAMED global referenced,
                                         -- read, written, killed, locked, or passed to an
@@ -278,6 +308,8 @@ initEnvWithStorage storage = Env
   , envNow              = posixSecondsToUTCTime 0
   , envCurrentUser      = "_nobody"
   , envPinnedTx         = Nothing
+  , envPinOverrides     = Map.empty
+  , envBindScope        = Nothing
   , envLastGlobalRef    = Nothing
   }
 
@@ -321,6 +353,45 @@ readRef kind rawName subs env =
 -- Now 'IO'-based: 'Phase.Storage.Engine.readAtTx' may need to
 -- re-read the @.db@ file for a deep time-travel target further back
 -- than what's currently resident in memory, see its own docs.
+-- | The transaction a bare read of this (qualified) global is pinned
+-- to right now: its own entry in 'envPinOverrides' if a @@BIND(...)@
+-- list gave it one, otherwise the block-wide 'envPinnedTx'. 'Nothing'
+-- means the read is live. Only meaningful for globals — locals have no
+-- history to pin to, and callers never ask about them.
+effectivePin :: Text -> Env -> Maybe TxId
+effectivePin name env = Map.findWithDefault (envPinnedTx env) name (envPinOverrides env)
+
+-- | Enter a @DO WITH@ / @CALL WITH@ pin scope: the pure state change,
+-- given the transaction the scope pins to ('Nothing' = @@TX(LAST)@,
+-- release) and its bind list ('Nothing' = no @@BIND@ clause). The caller
+-- saves ('envPinnedTx', 'envPinOverrides', 'envBindScope') beforehand
+-- and restores them afterwards.
+--
+-- With a bind list, only the listed globals take the new pin; every
+-- other global keeps whatever pin the enclosing scope gave it (or stays
+-- live), so an inner block never silently releases an outer pin — only
+-- an explicit @@TX(LAST)@ does. The list must be a subset of the
+-- enclosing bind list ('BindScope' otherwise); with no enclosing list
+-- (no enclosing bind at all) any global may be named.
+--
+-- Without a bind list, the scope re-pins the globals the enclosing
+-- scope had bound: the enclosing bind list if there is one, otherwise
+-- every global (a block-wide pin).
+enterPinScope :: Maybe TxId -> Maybe (Set Text) -> Env -> Either EvalError Env
+enterPinScope newTx (Just names) env =
+  case envBindScope env of
+    Just scope
+      | (bad : _) <- Set.toList (names `Set.difference` scope) -> Left (BindScope bad)
+    _ -> Right env
+           { envPinOverrides = Set.foldr (\n -> Map.insert n newTx) (envPinOverrides env) names
+           , envBindScope    = Just names
+           }
+enterPinScope newTx Nothing env =
+  case envBindScope env of
+    Nothing    -> Right env { envPinnedTx = newTx }
+    Just scope -> Right env
+                    { envPinOverrides = Set.foldr (\n -> Map.insert n newTx) (envPinOverrides env) scope }
+
 -- | Resolve a time-travel bracket's RELATIVE form (Part 1 of relative
 -- revision addressing, @docs/tx-pinning-design.md@, @^[-N]@/@LAST@/
 -- @LAST-N@, all of which 'Phase.Eval.resolveTimeTravelExpr' reduces to
@@ -352,7 +423,7 @@ resolveRelativeTx fromLive targetName subs n env =
       -- explicit @LAST@ spelling ('fromLive' = True) always counts from
       -- the true live latest, which is what makes @LAST@ the escape
       -- hatch back out of a pin (docs/tx-pinning-design.md Part 2).
-      revs = case (fromLive, envPinnedTx env) of
+      revs = case (fromLive, effectivePin targetName env) of
                (False, Just pin) -> dropWhile (\r -> revTx r > pin) allRevs
                _                 -> allRevs
   in case drop (max 0 n) revs of

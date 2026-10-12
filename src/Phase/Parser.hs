@@ -46,6 +46,7 @@ module Phase.Parser
   , pCallArg
   , pCallTarget
   , pCallExpr
+  , pPinSpec
   , pIdentifier
   , pNamespaceIdentifier
   , parseExpr
@@ -305,11 +306,65 @@ pCallTarget =
     pArgList = between (char '(') (char ')') (pCallArg `sepBy` char ',')
 
 -- | Expression-position function invocation: @CALL target(args...)@ (Part II §1).
+--
+-- With a pin clause, @CALL WITH @TX(x) [@BIND(...)] target(args...)@, the
+-- call runs inside its own pin scope ('CallWith', see 'pPinSpec').
 pCallExpr :: PParser Expr
 pCallExpr = do
   _ <- caseInsensitiveKeywordString "CALL" *> notFollowedBy alphaNum
+  mPin <- optionMaybe pPinSpec
   _ <- skipMany1 (char ' ' <|> char '\t')
-  Call <$> pCallTarget
+  target <- pCallTarget
+  pure (maybe (Call target) (\spec -> CallWith spec target) mPin)
+
+-- | The pin clause shared by @DO WITH@ ('Phase.Stmt.pDo') and
+-- @CALL WITH@ ('pCallExpr'): one space, the word @WITH@, one space,
+-- @\@TX(@ pin-argument @)@, then optionally one space and
+-- @\@BIND(@ global, global, ... @)@ (no whitespace inside the list, like
+-- every other Phase argument list).
+--
+-- The pin argument is either the bare word @LAST@ (release: back to live
+-- data) or an ordinary expression — typically a global reference carrying
+-- a relative time-travel bracket, e.g. @^[-2]FOO("BAR")@, or an absolute
+-- transaction number.
+--
+-- Each bind-list item names a WHOLE global, spelled like a global
+-- reference without subscripts: @^NAME@ or @NS^NAME@. A subscripted item
+-- is a parse error on purpose — bindings are per global, not per path.
+-- @\@BIND()@ (an empty list) is accepted: it binds nothing.
+--
+-- Fails WITHOUT consuming input unless the text starts with @ WITH
+-- \@TX(@, so an ordinary @DO tag@/@CALL tag@ whose tag merely begins
+-- with "WITH" still parses as before. Once that prefix has matched the
+-- parser is committed: a malformed pin argument or @\@BIND@ list (say a
+-- subscripted item) is a real parse error, not a silent fallback to
+-- reading @DO WITH@ as a call to a tag named @WITH@.
+pPinSpec :: PParser PinSpec
+pPinSpec = do
+  try (char ' ' *> caseInsensitiveKeywordString "WITH" *> char ' ' *> char '@'
+         *> caseInsensitiveKeywordString "TX" *> lookAhead (char '('))
+  pin <- between (char '(') (char ')') (try pPinLast <|> pExpr)
+  bind <- optionMaybe pBindClause
+  pure (PinSpec pin bind)
+  where
+    pPinLast = TimeTravelLast <$ (caseInsensitiveKeywordString "LAST" *> notFollowedBy alphaNum *> lookAhead (char ')'))
+
+    pBindClause = do
+      _ <- try (char ' ' *> char '@' *> caseInsensitiveKeywordString "BIND")
+      between (char '(') (char ')') (pBindName `sepBy` char ',')
+
+    pBindName = try pQualified <|> pBare
+
+    pQualified = do
+      ns <- pNamespaceIdentifier
+      _ <- char '^'
+      name <- pIdentifier
+      pure (BindName (Just ns) name)
+
+    pBare = do
+      _ <- char '^'
+      name <- pIdentifier
+      pure (BindName Nothing name)
 
 pParenExpr :: PParser Expr
 pParenExpr = between (char '(') (char ')') pExpr

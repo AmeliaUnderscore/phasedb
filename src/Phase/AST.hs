@@ -29,6 +29,8 @@ module Phase.AST
 
     -- * Expressions
   , Expr (..)
+  , PinSpec (..)
+  , BindName (..)
 
     -- * Statements (skeleton, extended as later parts are implemented)
   , Stmt (..)
@@ -216,6 +218,12 @@ data Expr
   | Call !CallTarget
     -- ^ An expression-position function invocation, @CALL tag(args...)@ (Part II §1).
     -- Yields the first returned value (or empty string if none).
+  | CallWith !PinSpec !CallTarget
+    -- ^ @CALL WITH @TX(x) [@BIND(...)] tag(args...)@: an expression-position
+    -- 'Call' made inside its own pin scope (docs/tx-pinning-design.md,
+    -- "Explicit global bindings"). The pin scope lasts for the call only;
+    -- it is how a pinned block hands one call a different pin, or
+    -- @@TX(LAST)@ to release its pinned globals for that call.
   | TimeTravelLast
     -- ^ The @LAST@ keyword, valid ONLY inside a time-travel bracket
     -- (@^[...]@'s content, a 'Ref' or 'RefDynamic' time-travel
@@ -231,6 +239,28 @@ data Expr
     -- something in this one syntactic position (relative revision
     -- addressing, docs/tx-pinning-design.md Part 1).
   deriving (Eq, Show)
+
+-- | One global named in an @@BIND(...)@ list. Whole globals only (never
+-- a subscripted path): the namespace qualifier mirrors 'Ref', and
+-- 'Phase.Eval' folds the two into the qualified name every global read
+-- is keyed by.
+data BindName = BindName
+  { bnNamespace :: !(Maybe Text)
+  , bnName      :: !Text
+  } deriving (Eq, Show)
+
+-- | The pin clause shared by @DO WITH@ and @CALL WITH@:
+-- @WITH @TX(pin) [@BIND(^A,^B)]@.
+--
+-- * 'psPin' is the @@TX(...)@ argument, resolved at run time by
+--   'Phase.Eval.resolvePinExpr' ('TimeTravelLast' = release the pin).
+-- * 'psBind' is the optional bind list. 'Nothing' (no @@BIND@ clause)
+--   means "every global the enclosing scope has bound" — every global
+--   at all when nothing encloses it. @Just []@ is a real, empty list.
+data PinSpec = PinSpec
+  { psPin  :: !Expr
+  , psBind :: !(Maybe [BindName])
+  } deriving (Eq, Show)
 
 -- --------------------------------------------------------------------
 -- Statements, skeleton only
@@ -293,17 +323,20 @@ data Stmt
     -- carries no body of its own, per the handbook's insistence that
     -- 'Stmt.If'/'Stmt.For'/(here, bare 'Stmt.Do') hold no body.
     -- @DO TAG(args)@ etc. is 'SDo (Just target)'.
-  | SDoWith !Expr
-    -- ^ @DO WITH @TX(expr)@, a dotted block exactly like 'SDo' 'Nothing'
-    -- (same block resolution; the opener line just ends in this clause
-    -- instead of a bare @DO@, see 'Phase.Lines.endsWithBareDo'), but
-    -- every bare GLOBAL read inside it is answered as of one pinned
-    -- transaction instead of live (docs/tx-pinning-design.md Part 2).
-    -- The 'Expr' is the @@TX(...)@ argument, resolved at run time by
-    -- 'Phase.Eval.resolvePinExpr': 'TimeTravelLast' (@LAST@) unpins back
-    -- to live data; a global reference such as @^[-2]FOO("BAR")@ pins to
-    -- the transaction of THAT revision; any other expression is an
-    -- absolute transaction number.
+  | SDoWith !PinSpec !(Maybe CallTarget)
+     -- ^ @DO WITH @TX(expr) [@BIND(...)]@ — with no target, a dotted block
+     -- exactly like 'SDo' 'Nothing' (same block resolution; the opener
+     -- line just ends in this clause instead of a bare @DO@, see
+     -- 'Phase.Lines.endsWithBareDo'). With a target,
+     -- @DO WITH @TX(expr) [@BIND(...)] TAG(args)@ — one 'SDo' call made
+     -- inside the same pin scope. Either way, the GLOBALS the scope has
+     -- bound are answered as of one pinned transaction instead of live
+     -- (docs/tx-pinning-design.md Part 2); the rest read live. The
+     -- 'PinSpec' is resolved at run time by 'Phase.Eval.withPinScope':
+     -- 'TimeTravelLast' (@LAST@) releases the bound globals back to live
+     -- data; a global reference such as @^[-2]FOO("BAR")@ pins to the
+     -- transaction of THAT revision; any other expression is an
+     -- absolute transaction number.
   | SGoto CallTarget
   | SQuit (Maybe Expr)
   | SReturn [Expr]                           -- ^ bare RETURN = SReturn []; Part II §1

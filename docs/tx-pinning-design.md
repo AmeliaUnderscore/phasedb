@@ -1,10 +1,11 @@
 # Design proposal: relative revision addressing and `DO WITH` time-pinned blocks
 
-**Status: Parts 1 and 2 are IMPLEMENTED and tested** (relative revision
-addressing, and `DO WITH @TX(...)` pinned blocks). Still decided-but-not-
-built: the explicit global *binding list* refinement (see "Deferred"
-below). See "As built" at the end for where the implementation differs
-from, or pins down, what was written before it existed.
+**Status: Parts 1 and 2 and the explicit global binding list are all
+IMPLEMENTED and tested** (relative revision addressing, `DO WITH @TX(...)`
+pinned blocks, and `@BIND(...)`). See "As built" at the end for where the
+implementation differs from, or pins down, what was written before it
+existed -- in particular, the binding list below was designed as a
+whitelist and was built as a pin SELECTOR instead.
 
 This is the team's idea; the syntax below is Claude's counter-proposal
 (accepted) for the team's original `@`-based sketch, kept mostly intact
@@ -117,7 +118,7 @@ is read as of that transaction, not live. This is standard database
   for the duration of that call, using the exact same mechanism as any
   other nested `DO WITH`. No new rule to remember.
 
-### Deferred to a second pass: explicit global binding list
+### Explicit global binding list (designed as a whitelist; built as a selector -- see "As built")
 
 the team's instinct: rather than EVERY bare global inside the block being
 implicitly reachable (and implicitly pinned), require globals used
@@ -235,3 +236,56 @@ got slightly wrong:
   single-line `DO tag` made the REPL swallow the following lines until
   EOF. The rule is `Phase.Lines.needsContinuation`, now shared with and
   tested outside the REPL.
+
+### As built: `@BIND(...)`, nested scopes, and single-call forms
+
+The binding list above was written as a whitelist (an unbound global is an
+error). It was built the other way round, per Astra: **the list selects
+which globals are pinned; every other global simply reads live.** There is
+no "unbound global" error.
+
+- **Syntax.** `DO WITH @TX(arg) @BIND(^A,^B)`. No whitespace inside the
+  list (Phase argument lists never allow it), and `@BIND` must follow
+  `@TX(...)`. Each item is a WHOLE global, `^NAME` or `NS^NAME`; a
+  subscripted item is a parse error. `@BIND()` is legal and binds nothing.
+  `Phase.Parser.pPinSpec` parses the clause for both `DO WITH` and
+  `CALL WITH`.
+- **No `@BIND` clause = every global bound**, which is exactly the
+  behaviour before this refinement existed.
+- **What a bound global is pinned to.** The block's one `@TX(...)`
+  transaction, resolved through the enclosing scope as before. Writes to a
+  bound global are therefore invisible to that block's own reads of it, the
+  same snapshot behaviour as before, now per global.
+- **Pins are per global.** `Env.envPinnedTx` is still the block-wide pin
+  (a block with no bind list); `envPinOverrides` holds the per-global pins
+  a bind list installs (`Nothing` = explicitly live, so it can beat a
+  non-live block-wide pin); `envBindScope` records the innermost enclosing
+  bind list (`Nothing` = none) so a nested list can be checked against it.
+  `Phase.State.effectivePin` is the one lookup every global read uses,
+  including the `^[-N]` baseline (`resolveRelativeTx`) and the implicit pin
+  of `$DATA`/`$GET`/`$ORDER`. So `^[-N]` counts back from the pin for a bound
+  global and from the live latest for an unbound one.
+- **Nesting** (`Phase.State.enterPinScope`):
+  - A nested bind list must be a subset of the enclosing bind list, else
+    `<BIND SCOPE> ^NAME`. With no enclosing bind list (including a block
+    with `@TX(LAST)` and no list) any global may be named.
+  - Only the globals the nested list names take the nested pin. Globals the
+    outer block pinned but the inner list omits KEEP the outer pin: an inner
+    block never silently releases an outer pin, only `@TX(LAST)` does.
+  - A nested block with no bind list re-pins the globals the enclosing list
+    bound, and no others (every global, when there is no enclosing list).
+    So `DO WITH @TX(LAST)` inside a bound block releases exactly what the
+    outer block pinned, and an inner `@TX(<tx>)` does not sweep in globals
+    the outer list left live.
+- **Bindings travel through `DO`/`CALL`** the same way the pin does (they
+  are the same state), so a callee reads bound globals pinned and the rest
+  live. Escaping for one call is the single-call form below.
+- **Single-call forms.** `DO WITH @TX(x) [@BIND(...)] TAG(args)` (statement)
+  and `CALL WITH @TX(x) [@BIND(...)] TAG(args)` (expression, new `Expr`
+  constructor `CallWith`) run exactly one call inside their own pin scope
+  and restore the enclosing scope afterwards. `DO WITH @TX(LAST) TAG()`
+  releases the globals the enclosing scope pinned for that call only.
+  `SET a,b=CALL ...` (multi-value destructuring) has no `WITH` form yet.
+- **Lines.** `Phase.Lines.endsWithDoWith` treats a line ending in
+  `@TX(...)` or `@TX(...) @BIND(...)` as a block opener; the single-call
+  form ends in the call and is not one.

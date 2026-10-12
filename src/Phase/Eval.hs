@@ -31,6 +31,7 @@ import Control.Monad (forM_)
 import qualified Data.Map.Strict as Map
 import Data.Scientific (Scientific)
 import qualified Data.Scientific as Sci
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Calendar (diffDays, fromGregorian)
@@ -211,16 +212,19 @@ resolveTimeTravelExpr targetName subs ttExpr = do
 -- answered as of the pinned transaction instead of live
 -- (docs/tx-pinning-design.md Part 2); locals are never pinned, only
 -- globals have a history to pin to.
+--
+-- Which globals are pinned is per global ('effectivePin'): a block with
+-- an @@BIND(...)@ list pins only the bound ones and reads the rest live.
 readPinnedOrLive :: VarKind -> Text -> [PValue] -> Env -> Eval (Either EvalError PValue)
 readPinnedOrLive Global name subs env
-  | Just pin <- envPinnedTx env = liftIO (readAtTxRef pin name subs env)
+  | Just pin <- effectivePin name env = liftIO (readAtTxRef pin name subs env)
 readPinnedOrLive kind name subs env = pure (readRef kind name subs env)
 
 -- | The pin a plain intrinsic reference ('$DATA'/'$GET'/'$ORDER') with
 -- no bracket of its own inherits from an enclosing pinned block.
-implicitPin :: VarKind -> Eval (Maybe TxId)
-implicitPin Global = envPinnedTx <$> getEnv
-implicitPin Local  = pure Nothing
+implicitPin :: VarKind -> Text -> Eval (Maybe TxId)
+implicitPin Global name = effectivePin name <$> getEnv
+implicitPin Local _     = pure Nothing
 
 resolveWriteTarget :: Ref -> Eval (VarKind, Text, [PValue])
 resolveWriteTarget (Ref kind mNS name subExprs mTimeTravel) = do
@@ -369,6 +373,12 @@ evalExpr TimeTravelLast =
 
 evalExpr (Call target) = do
   vals <- invokeTarget target
+  case vals of
+    (v : _) -> pure v
+    []      -> pure (mkValue "")
+
+evalExpr (CallWith spec target) = do
+  vals <- withPinScope spec (invokeTarget target)
   case vals of
     (v : _) -> pure v
     []      -> pure (mkValue "")
@@ -604,7 +614,7 @@ resolveIntrinsicRef (Ref kind mNS name subExprs mTimeTravel) = do
                      Local  -> name
   rememberGlobalRef kind targetName
   mTx <- case mTimeTravel of
-           Nothing     -> implicitPin kind
+           Nothing     -> implicitPin kind targetName
            Just ttExpr -> Just <$> resolveTimeTravelExpr targetName subs ttExpr
   pure (kind, targetName, subs, mTx)
 resolveIntrinsicRef (RefDynamic []) =
@@ -617,11 +627,11 @@ resolveIntrinsicRef (RefDynamic (nameExpr : subExprs)) = do
                        else (Local,  raw)
   rememberGlobalRef kind name
   subs <- mapM evalExpr subExprs
-  mTx <- implicitPin kind
+  mTx <- implicitPin kind name
   pure (kind, name, subs, mTx)
 resolveIntrinsicRef (RefNaked subExprs) = do
   (kind, name, subs) <- resolveNakedRef subExprs
-  mTx <- implicitPin kind
+  mTx <- implicitPin kind name
   pure (kind, name, subs, mTx)
 
 evalIntrinsic :: Text -> [Expr] -> Eval PValue
@@ -1072,19 +1082,12 @@ evalStmt (SDo mTarget) _ _ =
       _ <- invokeTarget target
       pure NextStmt
 
-evalStmt (SDoWith pinExpr) _ _ = do
-  -- The pin argument is resolved THROUGH any enclosing pin (a nested
-  -- block's own @TX(...) expression reads like any other bare
-  -- reference inside the outer block), then installed for the block's
-  -- duration and restored afterwards. Restoring on the normal path is
-  -- enough: an error anywhere inside discards the whole 'Env' (see
-  -- 'Eval'), so a pin cannot outlive a failed block.
-  newPin <- resolvePinExpr pinExpr
-  oldPin <- envPinnedTx <$> getEnv
-  modifyEnv (\e -> e { envPinnedTx = newPin })
-  flow <- runDoBlock
-  modifyEnv (\e -> e { envPinnedTx = oldPin })
-  pure flow
+evalStmt (SDoWith spec mTarget) _ _ =
+  case mTarget of
+    Nothing -> withPinScope spec runDoBlock
+    Just target -> do
+      _ <- withPinScope spec (invokeTarget target)
+      pure NextStmt
 
 evalStmt (SGoto (CallTarget mTag mRoutine _)) _ _ = do
   env <- getEnv
@@ -1223,6 +1226,35 @@ runDoBlock = do
               evalRoutine blockLines
               modifyEnv (\e -> e { envPC = oldPC, envRoutines = oldRoutines })
               pure NextStmt
+
+-- | Run an action inside a @DO WITH@ / @CALL WITH@ pin scope: resolve
+-- the pin ('resolvePinExpr') and the bind list, install the scope
+-- ('Phase.State.enterPinScope' — which also enforces that a nested
+-- bind list is a subset of the enclosing one), run the action, then
+-- restore the enclosing scope.
+--
+-- The pin argument is resolved THROUGH the enclosing scope (a nested
+-- block's own @TX(...) expression reads like any other bare reference
+-- inside the outer block), and so are the bind names' qualified names.
+-- Restoring on the normal path is enough: an error anywhere inside
+-- discards the whole 'Env' (see 'Eval'), so a scope cannot outlive a
+-- failed block.
+withPinScope :: PinSpec -> Eval a -> Eval a
+withPinScope (PinSpec pinExpr mBind) body = do
+  newPin <- resolvePinExpr pinExpr
+  env0 <- getEnv
+  let bound = fmap (Set.fromList . map (\(BindName mNS n) -> qualifyGlobalName mNS n)) mBind
+  case enterPinScope newPin bound env0 of
+    Left err -> throwError err
+    Right env1 -> do
+      modifyEnv (\e -> e { envPinnedTx     = envPinnedTx env1
+                          , envPinOverrides = envPinOverrides env1
+                          , envBindScope    = envBindScope env1 })
+      result <- body
+      modifyEnv (\e -> e { envPinnedTx     = envPinnedTx env0
+                          , envPinOverrides = envPinOverrides env0
+                          , envBindScope    = envBindScope env0 })
+      pure result
 
 -- | Resolve the argument of @DO WITH @TX(...)@ to the transaction the
 -- block should be pinned to ('Nothing' = live, i.e. no pin).

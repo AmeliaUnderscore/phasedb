@@ -71,7 +71,7 @@ module Phase.Lines
   , needsContinuation
   ) where
 
-import Data.Char (isAlphaNum, isLetter)
+import Data.Char (isAlphaNum, isLetter, toUpper)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -256,16 +256,22 @@ endsWithBareDo txt =
   T.takeWhileEnd (\c -> c /= ' ' && c /= '\t') (T.stripEnd txt) == "DO"
     || endsWithDoWith txt
 
--- | Does this line end with a @DO WITH @TX(...)@ clause (the
--- time-pinned block opener, docs/tx-pinning-design.md Part 2)? It opens
--- a dotted block exactly like a bare @DO@ does, so it has to raise the
--- reachable depth the same way, otherwise the dotted lines after it
--- would be mistaken for a continuation of this one.
+-- | Does this line end with a @DO WITH @TX(...)@ clause, optionally
+-- followed by an @@BIND(...)@ list (the time-pinned block opener,
+-- docs/tx-pinning-design.md Part 2)? It opens a dotted block exactly
+-- like a bare @DO@ does, so it has to raise the reachable depth the
+-- same way — otherwise the dotted lines after it would be mistaken for
+-- a continuation of this one.
+--
+-- The single-call form, @DO WITH @TX(...) TAG(args)@, ends in the call
+-- instead and does NOT open a block, so it must not match here.
 --
 -- Finds the LAST @ WITH @TX(@ (ASCII case-insensitively), requires the
--- word before it to be @DO@ (or @DO:postcondition@), and requires the
--- parenthesis it opens to close exactly at the end of the line,
--- skipping over string literals so a @)@ inside quotes doesn't count.
+-- word before it to be @DO@ (or @DO:postcondition@), requires the
+-- parenthesis it opens to close, skipping over string literals so a
+-- @)@ inside quotes doesn't count, and requires that what follows that
+-- closing parenthesis is either nothing or exactly one @ @BIND(...)@
+-- clause whose own parenthesis closes at the end of the line.
 endsWithDoWith :: Text -> Bool
 endsWithDoWith txt =
   let t = T.stripEnd txt
@@ -277,14 +283,27 @@ endsWithDoWith txt =
       afterDelim = T.drop n t
   in n > 0
        && (lastWord == "DO" || "DO:" `T.isPrefixOf` lastWord)
-       && balancedToEnd (T.unpack afterDelim)
+       && opensBlockTail (T.unpack afterDelim)
   where
-    -- Called just after an opening paren (depth 1): True when that
-    -- paren closes exactly at the end of the input.
-    balancedToEnd :: String -> Bool
-    balancedToEnd = go (1 :: Int) False
+    -- Called just after the opening paren of @TX( (depth 1).
+    opensBlockTail :: String -> Bool
+    opensBlockTail afterOpen = case closeParen afterOpen of
+      Nothing   -> False
+      Just rest -> null rest || bindTailOnly rest
+
+    -- The rest of the line is exactly one @BIND(...) clause.
+    bindTailOnly :: String -> Bool
+    bindTailOnly rest =
+      let bindOpen = " @BIND("
+          (pre, post) = splitAt (length bindOpen) rest
+      in map toUpper pre == bindOpen && closeParen post == Just ""
+
+    -- Given the text just after an opening paren (depth 1), the text
+    -- left after that paren's matching close, skipping string literals.
+    closeParen :: String -> Maybe String
+    closeParen = go (1 :: Int) False
     go depth inStr cs = case cs of
-      [] -> False
+      [] -> Nothing
       (c : rest)
         | inStr -> if c == '"'
                      then case rest of
@@ -293,7 +312,7 @@ endsWithDoWith txt =
                      else go depth True rest
         | c == '"'  -> go depth True rest
         | c == '('  -> go (depth + 1) False rest
-        | c == ')'  -> if depth == 1 then null rest else go (depth - 1) False rest
+        | c == ')'  -> if depth == 1 then Just rest else go (depth - 1) False rest
         | otherwise -> go depth False rest
 
 isTagIdentifier :: Char -> Text -> Bool

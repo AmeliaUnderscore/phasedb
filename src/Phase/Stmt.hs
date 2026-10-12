@@ -106,7 +106,7 @@ import Text.Parsec
 import Phase.AST
 import qualified Phase.AST as AST
 import Phase.Lines (LogicalLine (..))
-import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pExpr, pIdentifier, pRef)
+import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pExpr, pIdentifier, pPinSpec, pRef)
 
 -- --------------------------------------------------------------------
 -- Entry points
@@ -688,30 +688,18 @@ pFor = do
 pDo :: PParser (Maybe Expr, Stmt)
 pDo = do
   postCond <- pKeyword "DO"
-  mWith <- optionMaybe (try pDoWithClause)
+  mWith <- optionMaybe pPinSpec
   case mWith of
-    Just pinExpr -> pure (postCond, SDoWith pinExpr)
+    Just spec -> do
+      -- @DO WITH @TX(...) [@BIND(...)]@ alone opens a dotted block;
+      -- followed by one space and a call target it is a single pinned
+      -- call instead. The same single-space/double-space rule as a
+      -- plain @DO@ decides which.
+      target <- pOptionalArg pCallTarget
+      pure (postCond, SDoWith spec target)
     Nothing -> do
       target <- pOptionalArg pCallTarget
       pure (postCond, SDo target)
-
--- | The @ WITH @TX(...)@ clause of @DO WITH @TX(...)@, one space, the
--- word @WITH@, one space, then @@TX(@ pin-argument @)@. The argument is
--- either the bare word @LAST@ (unpin: back to live data) or an ordinary
--- expression, typically a global reference carrying a relative
--- time-travel bracket, e.g. @^[-2]FOO("BAR")@, or an absolute
--- transaction number. Tried with 'try' by 'pDo' so an ordinary
--- @DO tag@ whose tag merely begins with "WITH" still parses as before.
-pDoWithClause :: PParser Expr
-pDoWithClause = do
-  _ <- char ' '
-  _ <- caseInsensitiveKeywordString "WITH"
-  _ <- char ' '
-  _ <- char '@'
-  _ <- caseInsensitiveKeywordString "TX"
-  between (char '(') (char ')') (try pPinLast <|> pExpr)
-  where
-    pPinLast = TimeTravelLast <$ (caseInsensitiveKeywordString "LAST" *> notFollowedBy alphaNum *> lookAhead (char ')'))
 
 -- | @GOTO TAG@; @GOTO TAG^ROUTINE@; @GOTO ^ROUTINE@ (§5.3). Unlike
 -- @DO@, @GOTO@ always requires a target, there is no bare @GOTO@, so
