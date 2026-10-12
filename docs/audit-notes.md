@@ -15,9 +15,15 @@ items 1 and 2 are dormant.
 2. **Transactional `KILL` stages a point kill.** `killRef` calls
    `stageKill` even when the target has descendants; `stageKillSubtree`
    exists and is unused.
-3. **`mergeRef` into a global bypasses the WAL, transactions and
-   rollback** (already flagged in a code comment). A `MERGE` into a
-   global does not persist.
+3. **FIXED -- `mergeRef` into a global bypassed the WAL, transactions and
+   rollback.** A `MERGE` into a global did not persist, left no revisions
+   (so `^[-N]`, time travel and `EXPECTING` never saw it), lost a SET
+   already staged against the same global inside a transaction, wrote
+   uncommitted staged data into `seLive`, and skipped the per-value
+   `^_USERS` last-admin check a SET gets. Now a global `MERGE` is the
+   sequence of SETs it stands for: validated per merged path before
+   anything is written, staged inside a transaction, and otherwise ONE
+   atomic `commitTransaction` (one TxId). See CHANGELOG.
 4. **`writeRef` fallback on `commitSet` failure is unreachable today**
    (only `StorageWriteConflict` is possible and `writeRef` never passes
    an expected tx). If it ever fires it updates `envGlobals` but not

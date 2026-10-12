@@ -47,6 +47,7 @@ module Phase.State
   ) where
 
 import Control.Monad (mplus)
+import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -68,6 +69,7 @@ import Phase.Auth
 import Phase.Storage.Engine
   ( StorageEngine (..)
   , commitKill
+  , commitTransaction
   , commitSet
   , dataAtTx
   , orderAtTx
@@ -78,9 +80,9 @@ import Phase.Storage.Engine
   , readLive
   )
 import Phase.Storage.Lock (LockTable, emptyLockTable)
-import Phase.Storage.Transaction (TxHandle (..), stageKill, stageSet)
-import Phase.Storage.Types (Revision (..), TxId)
-import Phase.Tree (Node (..), childCountNode, dataNode, emptyNode, getNode, killNode, mergeNode, orderNode, setNode, toSubKey)
+import Phase.Storage.Transaction (TxHandle (..), newTxHandle, stageKill, stageSet)
+import Phase.Storage.Types (Revision (..), TxId, formatStorageError)
+import Phase.Tree (Node (..), childCountNode, dataNode, dumpTree, emptyNode, findSubNode, getNode, killNode, mergeNode, orderNode, setNode, toSubKey)
 
 -- --------------------------------------------------------------------
 -- Error Handling
@@ -620,18 +622,37 @@ childCountRef kind rawName subs env =
             Nothing   -> 0
             Just node -> maybe 0 id (childCountNode subs node)
 
--- | Bulk copy from source subtree to target subtree (MERGE, Part X §1).
--- | MERGE a source subtree into a destination subtree. Checks READ
--- access on the source (if global) and WRITE access on the
+-- | MERGE a source subtree into a destination subtree (Part X §1): every
+-- value under the source path is written to the matching path under the
+-- destination, and nothing already at the destination is cleared.
+--
+-- Checks READ access on the source (if global) and WRITE access on the
 -- destination (if global), a MERGE is simultaneously "read this" and
 -- "write that", so both sides of the team's permission model apply.
 --
--- NOTE (pre-existing, not introduced by this change): global
--- destinations here are still updated only in 'envGlobals'/'seLive'
--- directly, not through 'commitSet', meaning a MERGE into a global
--- does not currently reach the WAL/persist to disk the way SET does.
--- Flagged for visibility rather than silently worked around while
--- adding the permission check.
+-- A MERGE into a LOCAL is a plain in-memory tree merge ('mergeNode').
+-- A MERGE into a GLOBAL is exactly the sequence of 'writeRef' SETs it
+-- stands for, one per merged path, and is treated that way throughout:
+--
+-- * every merged path goes through the same per-value reserved-global
+--   checks a SET does ('checkReservedGlobalWrite', the last-admin
+--   safeguard on @^_USERS@, ownership on @^_CATALOG@), ALL of them
+--   before anything is written, so a refused leaf means nothing at all
+--   was merged;
+-- * inside an active transaction the paths are STAGED, like 'writeRef'
+--   does, and 'envGlobals' is updated incrementally, committed
+--   storage ('envStorage') is not touched, so rollback still means
+--   something and a SET already staged against the same global survives;
+-- * outside one, ALL the paths commit together through
+--   'commitTransaction': ONE 'TxId', one @WalSet@ per path plus one
+--   @WalCommit@ in the WAL queue, and a revision per path, so the merge
+--   is atomic, durable, and visible to time travel, @^[-N]@ and
+--   @EXPECTING@ at a single point in history.
+--
+-- The source is read from the live state ('seLive'), the same view the
+-- ordinary read functions use, in particular it does NOT follow a
+-- @DO WITH@ pin. Merging from nothing (an absent source) is a no-op and
+-- commits nothing.
 mergeRef :: (VarKind, Text, [PValue]) -> (VarKind, Text, [PValue]) -> Env -> Either EvalError Env
 mergeRef (_, dstRawName0, dstSubs0) _ _
   | any (T.null . unPValue) dstSubs0 = Left (NullSubscript dstRawName0 dstSubs0)
@@ -641,45 +662,54 @@ mergeRef (dstKind, dstRawName, dstSubs) (srcKind, srcRawName, srcSubs) env = do
       Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
       Nothing -> Right ()
     Local -> Right ()
-  case dstKind of
-    Global ->
-      -- No 'checkUsersKillSafety'/'checkUsersSetSafety' equivalent
-      -- here: a MERGE only overlays values present in the source, so
-      -- there is no single new value to check against, and it never
-      -- removes a user outright. '_USERS' stays admin-only via
-      -- 'checkWriteAccess' regardless. 'checkCatalogAccess' only
-      -- applies when the destination global actually IS the catalog
-      -- (unlike 'checkReservedGlobalWrite', this has to be spelled out
-      -- rather than dispatched on 'dstRawName', since the same
-      -- ownership check would otherwise misfire against an unrelated
-      -- global whose subscripts happen to collide with a real
-      -- namespace/item name).
-      case checkWriteAccess (envCurrentUser env) dstRawName (envStorage env)
-             `mplus` (if dstRawName == "_CATALOG"
-                        then checkCatalogAccess (lookupUserRole (envCurrentUser env) (envStorage env)) dstSubs (envStorage env)
-                        else Nothing) of
-        Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
-        Nothing -> Right ()
-    Local -> Right ()
-  let dstName = case dstKind of
-                  Local  -> resolveLocalName dstRawName env
-                  Global -> dstRawName
-      srcName = case srcKind of
+  let srcName = case srcKind of
                   Local  -> resolveLocalName srcRawName env
                   Global -> srcRawName
       srcRoot = case srcKind of
                   Local  -> Map.findWithDefault emptyNode srcName (envLocals env)
                   Global -> Map.findWithDefault emptyNode srcName (seLive (envStorage env))
-      dstRoot = case dstKind of
-                  Local  -> Map.findWithDefault emptyNode dstName (envLocals env)
-                  Global -> Map.findWithDefault emptyNode dstName (seLive (envStorage env))
-      dstRoot' = mergeNode dstSubs dstRoot srcSubs srcRoot
   case dstKind of
-       Local  -> Right env { envLocals = Map.insert dstName dstRoot' (envLocals env) }
-       Global ->
-         let globals' = Map.insert dstName dstRoot' (envGlobals env)
-             storage' = (envStorage env) { seLive = globals' }
-         in Right env { envGlobals = globals', envStorage = storage' }
+    Local ->
+      let dstName = resolveLocalName dstRawName env
+          dstRoot = Map.findWithDefault emptyNode dstName (envLocals env)
+          dstRoot' = mergeNode dstSubs dstRoot srcSubs srcRoot
+      in Right env { envLocals = Map.insert dstName dstRoot' (envLocals env) }
+    Global -> do
+      -- Every value under the source path, as a destination path + value.
+      let leaves = [ (dstSubs ++ rel, val)
+                   | (rel, val) <- maybe [] dumpTree (findSubNode srcSubs srcRoot) ]
+      case checkWriteAccess (envCurrentUser env) dstRawName (envStorage env) of
+        Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
+        Nothing -> Right ()
+      case [ r | (subs, val) <- leaves
+               , Just r <- [checkReservedGlobalWrite dstRawName subs (Just val) env] ] of
+        (reason : _) -> Left (PermissionDenied (envCurrentUser env) reason)
+        []           -> Right ()
+      case [ subs | (subs, _) <- leaves, any (T.null . unPValue) subs ] of
+        (subs : _) -> Left (NullSubscript dstRawName subs)
+        []         -> Right ()
+      if null leaves
+        then Right env
+        else case envActiveTx env of
+          Just tx ->
+            let tx' = foldl' (\t (subs, val) -> stageSet dstRawName subs val Nothing t) tx leaves
+                node = Map.findWithDefault emptyNode dstRawName (envGlobals env)
+                node' = foldl' (\n (subs, val) -> setNode subs val n) node leaves
+            in Right env { envActiveTx = Just tx', envGlobals = Map.insert dstRawName node' (envGlobals env) }
+          Nothing ->
+            let tx = foldl' (\t (subs, val) -> stageSet dstRawName subs val Nothing t)
+                            (newTxHandle 0 (envNow env)) leaves
+            in case commitTransaction (envCurrentUser env) tx (envNow env) (envStorage env) of
+                 Right (newTx, storage') ->
+                   Right env
+                     { envStorage = storage'
+                     , envGlobals = seLive storage'
+                     , envTxId    = T.pack (show newTx)
+                     }
+                 -- No expected-tx assertions are staged, so this cannot
+                 -- fire today; surface it rather than swallow it like
+                 -- the SET fallback does.
+                 Left err -> Left (ConflictError (formatStorageError err))
 
 -- --------------------------------------------------------------------
 -- Variable Scoping (NEW) and Frame Management

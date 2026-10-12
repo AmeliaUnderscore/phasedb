@@ -1507,6 +1507,111 @@ testStorageGroup ctx = do
     (map llDepth (buildLogicalLines " DO WITH @TX(^[-2]ITEM(1)) @BIND(^ITEM)\n. WRITE 1"))
     [0, 1]
 
+  -- 2e. MERGE into a global is a real commit (audit-notes.md #3). Before
+  -- this fix 'mergeRef' wrote the merged tree straight into the live
+  -- state: no TxId, no WAL records, no history, and a staged write to the
+  -- same global was lost inside a transaction.
+  let mergeSrc = " SET src(1)=\"x\",src(2)=\"y\"\n SET src(2,1)=\"z\"\n"   -- three leaves
+      baseTxM  = seLastTx (envStorage adminEnv)
+      pendingM = length (sePendingWal (envStorage adminEnv))
+
+  do r <- runPhaseIn adminEnv (mergeSrc ++ " MERGE ^DST=src\n")
+     case r of
+       Left e -> runAssert ctx "MERGE of three leaves into a global" False (show e)
+       Right env' -> do
+         let st' = envStorage env'
+             newRecs = drop pendingM (sePendingWal st')
+         assertEqual ctx "MERGE of three leaves into a global is ONE commit (one TxId)"
+           (seLastTx st') (baseTxM + 1)
+         assertEqual ctx "MERGE queues one WalSet per merged leaf plus one WalCommit, all under that TxId"
+           ( length [ () | WalRecord _ WalSet{} <- newRecs ]
+           , length [ () | WalRecord _ WalCommit{} <- newRecs ]
+           , all ((== baseTxM + 1) . wrTxId) newRecs )
+           (3, 1, True)
+         assertEqual ctx "MERGE: the merged values are readable afterwards"
+           (map (\subs -> readRef Global "DST" (map mkValue subs) env') [["1"], ["2"], ["2", "1"]])
+           (map (Right . mkValue) ["x", "y", "z"])
+
+  expectOut "MERGE into a global records history: ^[-1] sees the value before the second MERGE" adminEnv
+    (" SET src(1)=\"x\"\n MERGE ^DST=src\n SET src(1)=\"x2\"\n MERGE ^DST=src\n WRITE ^DST(1),\",\",^[-1]DST(1),!\n")
+    "x2,x\n"
+
+  do r <- runPhaseIn adminEnv " MERGE ^DST=nosuch\n"
+     case r of
+       Left e -> runAssert ctx "MERGE from an absent source is a no-op" False (show e)
+       Right env' -> assertEqual ctx "MERGE from an absent source commits nothing"
+                       (seLastTx (envStorage env'), length (sePendingWal (envStorage env')))
+                       (baseTxM, pendingM)
+
+  -- It reaches the disk: write through a real file engine, flush the way
+  -- the REPL does, reopen, read it back.
+  mergePath <- tmpPath "test_phasedb_merge.db"
+  do e <- doesFileExist mergePath
+     if e then removeFile mergePath else pure ()
+  mOpen <- openStorageEngine mergePath
+  case mOpen of
+    Left e -> runAssert ctx "MERGE persistence: open a fresh file engine" False (show e)
+    Right eng0 -> do
+      nowM <- getCurrentTime
+      boot <- bootstrapCreateUser "TESTADMIN" "testpassword123" RAdmin nowM eng0
+      case boot of
+        Left e -> runAssert ctx "MERGE persistence: bootstrap admin" False (T.unpack e)
+        Right eng1 -> do
+          let fileEnv = initEnv { envStorage = eng1, envGlobals = seLive eng1
+                                , envCurrentUser = "TESTADMIN", envNow = nowM }
+          r <- runPhaseIn fileEnv (mergeSrc ++ " MERGE ^DST=src\n")
+          case r of
+            Left e -> runAssert ctx "MERGE persistence: run the MERGE" False (show e)
+            Right env' -> do
+              _ <- flushPendingWal (envStorage env')
+              reopened <- openStorageEngine mergePath
+              case reopened of
+                Left e -> runAssert ctx "MERGE persistence: reopen" False (show e)
+                Right eng2 ->
+                  assertEqual ctx "MERGE into a global survives a reopen (it reached the WAL)"
+                    (map (\subs -> readLive "DST" (map mkValue subs) eng2) [["1"], ["2"], ["2", "1"]])
+                    (map (Right . mkValue) ["x", "y", "z"])
+  do e <- doesFileExist mergePath
+     if e then removeFile mergePath else pure ()
+
+  -- Inside an active transaction a MERGE stages, like SET does: the
+  -- earlier staged write to the same global survives, every merged path
+  -- is staged, and nothing reaches committed storage or the WAL queue.
+  let txEnv0 = adminEnv { envActiveTx = Just (newTxHandle 0 dummyTime) }
+      Right txEnv1 = writeRef Global "DST" [mkValue "a"] (mkValue "A") txEnv0
+      Right txEnv2 = writeRef Local "src" [mkValue "1"] (mkValue "x") txEnv1
+  case mergeRef (Global, "DST", []) (Local, "src", []) txEnv2 of
+    Left e -> runAssert ctx "MERGE inside an active transaction" False (show e)
+    Right e3 -> do
+      assertEqual ctx "MERGE in a transaction keeps the transaction's earlier staged write to that global"
+        (fmap dumpTree (Map.lookup "DST" (envGlobals e3)))
+        (Just [([mkValue "1"], mkValue "x"), ([mkValue "a"], mkValue "A")])
+      assertEqual ctx "MERGE in a transaction stages the merged path (2 staged writes in all)"
+        (fmap (Map.size . txStagedWrites) (envActiveTx e3)) (Just 2)
+      assertEqual ctx "MERGE in a transaction commits nothing (no TxId, no WAL records)"
+        (seLastTx (envStorage e3), length (sePendingWal (envStorage e3)))
+        (seLastTx (envStorage txEnv2), length (sePendingWal (envStorage txEnv2)))
+      assertEqual ctx "MERGE in a transaction does not leak uncommitted data into live storage"
+        (Map.member "DST" (seLive (envStorage e3))) False
+
+  -- Permissions are checked per merged leaf, exactly as a SET would.
+  -- TESTADMIN is the only admin, so demoting it must be refused whether
+  -- it arrives by SET or by MERGE.
+  do r <- runPhaseIn adminEnv " SET ^_USERS(\"TESTADMIN\",\"role\")=\"read\"\n"
+     case r of
+       Left (PermissionDenied _ _) -> runAssert ctx "control: SET demoting the last admin is refused" True ""
+       other -> runAssert ctx "control: SET demoting the last admin is refused" False (show (fmap getOutputText other))
+  do r <- runPhaseIn adminEnv " SET src(\"aaa\")=\"1\",src(\"role\")=\"read\"\n MERGE ^_USERS(\"TESTADMIN\")=src\n"
+     case r of
+       Left (PermissionDenied _ _) -> runAssert ctx "MERGE demoting the last admin is refused like a SET" True ""
+       other -> runAssert ctx "MERGE demoting the last admin is refused like a SET" False (show (fmap getOutputText other))
+
+  -- The MERGE source is read live even inside a pinned block (same as
+  -- before; only plain reads follow the pin).
+  expectOut "MERGE source reads are live inside a pinned block" adminEnv
+    (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A)\n. MERGE m=^A\n. WRITE m(1),\",\",^A(1),!\n")
+    "a2,a1\n"
+
   -- The REPL's multi-line continuation rule (Phase.Lines.needsContinuation).
   -- It used to count every DO word as an unclosed opener, so even a
   -- one-line `DO tag` swallowed the following input until EOF.

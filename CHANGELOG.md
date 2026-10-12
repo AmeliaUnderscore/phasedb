@@ -276,6 +276,29 @@
   and `app/Main.hs` compiles. The real `cabal` build under GHC 9.10+ was not
   exercised.
 
+* Fix (`docs/audit-notes.md` #3): `MERGE` into a global now goes through the
+  storage engine. `Phase.State.mergeRef` used to write the merged tree
+  straight into `envGlobals`/`seLive`, so the merge was never committed:
+  no TxId, no WAL records (lost on restart), no revisions (invisible to
+  `^[-N]`, time travel and `EXPECTING`). Inside a transaction it also read
+  the destination from `seLive` and overwrote `envGlobals` with the result,
+  dropping a SET already staged against the same global, and it assigned
+  `envGlobals` (staged data included) to `seLive`, leaking uncommitted data
+  past a rollback. It also skipped the per-value `checkReservedGlobalWrite`
+  a SET gets, so `MERGE ^_USERS(u)=...` could demote the last admin.
+  Now a global `MERGE` is the sequence of SETs it stands for: every merged
+  path is checked like a SET before anything is written (all or nothing);
+  inside a transaction the paths are staged and `envGlobals` updated
+  incrementally (committed storage untouched); otherwise all paths commit
+  together via `commitTransaction` -- ONE TxId, one `WalSet` per path plus
+  one `WalCommit`, one revision per path. No new `WalOp`, so replay stays
+  deterministic. An absent source is a no-op and commits nothing. The
+  source is still read live and does not follow a `DO WITH` pin. A
+  `MERGE` into a local is unchanged. 13 new tests, 8 of which failed
+  against the old code (commit count, WAL records, `^[-1]` history, reopen
+  from a real file, staged-write loss, `seLive` leak, last-admin demotion).
+  395 -> 408 tests, all passing under `ghc --make` (GHC 9.4.7).
+
 ## 0.1.0.0 -- YYYY-mm-dd
 
 * First version. Released on an unsuspecting world.
