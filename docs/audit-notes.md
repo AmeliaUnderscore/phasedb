@@ -163,9 +163,10 @@ Reachable today unless marked latent.
 
 ## Phase.Lines
 
-31. **Column-0 commands that are not in the 16-word `isCommandKeyword`
-    list become tags.** `TRANSACTION START`, `EVALUATE`, `INDEX`,
-    `HANDLE`, `BLOBSAVE` and the like are meant to degrade to
+31. **Column-0 commands that are not in the 23-word `isCommandKeyword`
+    list become tags.** (`EVALUATE`, `WHEN`, `CONDITION`, `SIGNAL`,
+    `HANDLE`, `CATCH` and `RETRY` were added as they were implemented.)
+    `TRANSACTION START`, `INDEX`, `BLOBSAVE` and the like are meant to degrade to
     `SUnsupported` (a `<NOTIMPL>` error), but typed at column 0 they are
     classified as a tag plus text, so the "unsupported" diagnostic never
     fires. The list should be the statement parser's vocabulary plus the

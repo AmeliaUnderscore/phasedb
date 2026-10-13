@@ -86,8 +86,14 @@ Part I core is largely in place:
   statement execution, bare-expression echoing (`- : <value>`), native `NAMESPACE` statement,
   column-0 `TAG(args)` definition registration, and catalog management commands (`.ns`, `.namespaces`, `.fns`, `.history`, `.revert`, `.save`).
 
-Remaining language extensions (`EVALUATE`, `INDEX`, `CONDITION`/`SIGNAL`,
-`HANDLE`/`CATCH`/`RETRY`, `BLOBSAVE`/`BLOBMETA`) currently parse successfully as
+`EVALUATE ... END EVALUATE` and explicit `DO ... END DO` blocks are
+implemented (Part II §5, Part I §5.4); both also work in the dotted spelling.
+
+`CONDITION`/`SIGNAL` and `HANDLE`/`CATCH`/`RETRY` are implemented for
+`DO` blocks (Part III §1).
+
+Remaining language extensions (`INDEX`, `BLOBSAVE`/`BLOBMETA`,
+`TRANSACTION`) currently parse successfully as
 `SUnsupported`, per the handbook's own §9 graceful-degradation
 philosophy.
 

@@ -27,7 +27,7 @@ module Phase.Eval
   , runRoutine
   ) where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import qualified Data.Map.Strict as Map
 import Data.Scientific (Scientific)
 import qualified Data.Scientific as Sci
@@ -546,14 +546,14 @@ evalExpr (BinExpr op leftExpr rightExpr) = do
       l <- evalExpr leftExpr
       r <- evalExpr rightExpr
       case scientificDiv (toNumber l) (toNumber r) of
-        Left err  -> throwError err
+        Left err  -> divisionError err l r
         Right res -> pure (mkValue (formatSci res))
 
     IntDiv -> do
       l <- evalExpr leftExpr
       r <- evalExpr rightExpr
       case exactIntQuotient (toNumber l) (toNumber r) of
-        Left err -> throwError err
+        Left err -> divisionError err l r
         Right q  -> pure (mkValue (T.pack (show q)))
 
     Mod -> do
@@ -562,7 +562,7 @@ evalExpr (BinExpr op leftExpr rightExpr) = do
       let nl = toNumber l
           nr = toNumber r
       case exactIntQuotient nl nr of
-        Left err -> throwError err
+        Left err -> divisionError err l r
         Right q  ->
           -- Exact: 'Scientific' addition/multiplication never rounds
           -- (only division does), and 'q' itself is already the exact
@@ -1035,6 +1035,72 @@ evalStmt (SForEach var collRef) stmts stmtIdx = do
 
 evalStmt (SEndDo) _ _ = pure NextStmt
 
+-- EVALUATE ... END EVALUATE (Part II §5). See 'runEvaluate'.
+evalStmt (SEvaluate subjects) _ _ = runEvaluate subjects
+evalStmt SEndEvaluate _ _ = pure NextStmt
+
+-- CONDITION / SIGNAL / HANDLE / CATCH / RETRY (Part III §1)
+
+-- A declaration does nothing when reached: its fields were collected
+-- when the routine started ('collectConditionDecls').
+evalStmt (SCondition _ _) _ _ = pure NextStmt
+
+evalStmt (SSignal name fieldExprs) _ _ = do
+  decls <- envConditionDecls <$> getEnv
+  case Map.lookup name decls of
+    Just declared ->
+      forM_ fieldExprs $ \(f, _) ->
+        when (f `notElem` declared) $
+          throwError (SyntaxError ("SIGNAL <" <> name <> "> field '" <> f <> "' is not declared by its CONDITION"))
+    Nothing -> pure ()
+  vals <- mapM (\(f, e) -> (,) f <$> evalExpr e) fieldExprs
+  throwError (Signaled (Condition name vals))
+
+-- A clause is only ever run by the handled block that owns it
+-- ('runHandledBlock'); one reached any other way has no block to belong
+-- to.
+evalStmt (SHandle _ _) _ _ =
+  throwError (SyntaxError "HANDLE without an enclosing DO block")
+evalStmt (SCatch _ _) _ _ =
+  throwError (SyntaxError "CATCH without an enclosing DO block")
+
+-- RETRY asks for the block whose HANDLE clause this is to be re-entered.
+-- It cannot jump there directly (it may be nested inside dotted blocks
+-- and loops inside the clause), so it records the request in the
+-- environment and ends the current frame; every block level on the way
+-- out sees the request and keeps unwinding until 'runHandledBlock'
+-- claims it.
+evalStmt (SRetry mCount seedExprs) _ _ = do
+  env <- getEnv
+  if not (envInHandle env)
+    then throwError (SyntaxError "RETRY outside a HANDLE clause")
+    else do
+      wanted <- case mCount of
+        Nothing -> pure True
+        Just e  -> do
+          n <- evalExpr e
+          pure (fromIntegral (envRetryCount env) < toNumber n)
+      if not wanted
+        then pure NextStmt    -- RETRY n TIMES, all n used: carry on after it
+        else do
+          let limit = retryLimit env
+          when (envRetryCount env >= limit) $
+            throwError (CustomError ("RETRY limit reached: this block has already been re-entered "
+                                     <> T.pack (show limit) <> " times (^_CONFIG(\"retry\",\"max\"))"))
+          seeds <- mapM (\(f, e) -> (,) f <$> evalExpr e) seedExprs
+          modifyEnv (\e -> e { envRetry = Just seeds })
+          pure (QuitFrame Nothing)
+
+-- A WHEN clause is only ever run by the EVALUATE that owns it, which
+-- finds it among the lines one level deeper than its header; those
+-- lines are skipped by the ordinary "indented lines belong to a block"
+-- rule. A clause reached any other way (no EVALUATE above it) is a
+-- program error, not something to skip silently.
+evalStmt (SWhen _ _) _ _ =
+  throwError (SyntaxError "WHEN without an enclosing EVALUATE")
+evalStmt SWhenOther _ _ =
+  throwError (SyntaxError "WHEN OTHER without an enclosing EVALUATE")
+
 evalStmt (SLock mSpecs) _ _ = do
   case mSpecs of
     Nothing ->
@@ -1052,10 +1118,19 @@ evalStmt (SLock mSpecs) _ _ = do
             modifyEnv (\e ->
               let locks' = releaseLocks (envJobId e) [path] (envLocks e)
               in e { envLocks = locks' })
-          _ ->
-            modifyEnv (\e ->
-              let (_, locks') = acquireLocks (envJobId e) [path] (envLocks e)
-              in e { envLocks = locks' })
+          _ -> do
+            env <- getEnv
+            let (acquired, locks') = acquireLocks (envJobId env) [path] (envLocks env)
+            if acquired || envHandlerDepth env == 0
+              then modifyEnv (\e -> e { envLocks = locks' })
+              else do
+                -- A handler is present, so a failed acquisition is a
+                -- condition rather than a silent failure (Part III §1.1).
+                timeoutMs <- maybe (pure (mkValue "0")) evalExpr (lsTimeout spec)
+                throwError (Signaled (Condition "LOCK-TIMEOUT"
+                  [ ("global", mkValue targetName)
+                  , ("path", mkValue (T.intercalate "," (map unPValue subs)))
+                  , ("timeoutMs", timeoutMs) ]))
   pure NextStmt
 
 evalStmt (SUnlock mSpecs) _ _ = do
@@ -1180,14 +1255,302 @@ invokeTarget (CallTarget mTag mRoutine mArgs) = do
       modifyEnv (\e -> e
         { envCurrentRoutine = rText
         , envRoutines = Map.insert rText astLines (envRoutines e)
+          -- The callee has its own CONDITION declarations, and is not
+          -- lexically inside the caller's HANDLE clause, so a RETRY in
+          -- it must not reach back into the caller's handled block.
+        , envConditionDecls = collectConditionDecls astLines
+        , envInHandle = False
         })
 
       retVals <- evalRoutineWithReturn astLines
 
       modifyEnv (\e ->
         let (_, e') = popFrame e
-        in e' { envCurrentRoutine = oldRoutine, envRoutines = oldRoutines })
+        in e' { envCurrentRoutine = oldRoutine, envRoutines = oldRoutines
+              , envConditionDecls = envConditionDecls env, envInHandle = envInHandle env })
       pure retVals
+
+-- --------------------------------------------------------------------
+-- Conditions: handled blocks (Part III §1)
+-- --------------------------------------------------------------------
+
+-- | The @CONDITION@ declarations of a routine, by upper-cased name.
+-- Collected from the whole routine when it starts, wherever in it they
+-- appear, as the handbook's compile-time registry would.
+collectConditionDecls :: [Line] -> Map.Map Text [Text]
+collectConditionDecls ls =
+  Map.fromListWith (++)
+    [ (n, fs) | Line _ _ ps <- ls, PredStmt _ (SCondition n fs) <- ps ]
+
+-- | Is this line the head of a @HANDLE@ or @CATCH@ clause?
+isHandlerClauseLine :: Line -> Bool
+isHandlerClauseLine l = case lineStmts l of
+  (PredStmt _ (SHandle _ _) : _) -> True
+  (PredStmt _ (SCatch _ _) : _)  -> True
+  _                              -> False
+
+-- | Does a block's line list contain a clause of its own (as opposed to
+-- one belonging to a block nested deeper inside it)? Only then does the
+-- handler machinery activate; every other block stays an ordinary block
+-- (Part III §1).
+hasHandlerClause :: [Line] -> Bool
+hasHandlerClause [] = False
+hasHandlerClause blockLines@(firstL : _) =
+  any (\l -> lineDepth l == lineDepth firstL && isHandlerClauseLine l) blockLines
+
+data ClauseKind = ClauseHandle | ClauseCatch
+  deriving (Eq, Show)
+
+-- | One @HANDLE@/@CATCH@ clause of a block: which kind, the condition
+-- it names, the optional @AS@ binding, and its body as a line list (the
+-- rest of the head's own line, if any, then the lines up to the next
+-- clause).
+data Clause = Clause
+  { clKind    :: ClauseKind
+  , clName    :: Text
+  , clBinding :: Maybe Text
+  , clBody    :: [Line]
+  }
+
+-- | Split the part of a block from its first clause head onward into
+-- clauses. @depth@ is the block's own depth: only a clause head AT that
+-- depth starts a clause, so heads of blocks nested inside a clause body
+-- stay part of that body.
+buildClauses :: Int -> [Line] -> [Clause]
+buildClauses _ [] = []
+buildClauses depth (marker : rest) =
+  let (bodyRest, next) = break (\l -> lineDepth l == depth && isHandlerClauseLine l) rest
+  in case lineStmts marker of
+       (PredStmt _ st : trailing) ->
+         let (kind, name, binding) = case st of
+               SHandle n b -> (ClauseHandle, n, b)
+               SCatch n b  -> (ClauseCatch, n, b)
+               _           -> (ClauseCatch, "", Nothing)   -- unreachable: only clause heads get here
+             headRest = [Line (lineDepth marker) Nothing trailing | not (null trailing)]
+         in Clause kind name binding (headRest ++ bodyRest) : buildClauses depth next
+       [] -> buildClauses depth rest
+
+-- | The clause that handles a condition: the first one that names it,
+-- else the first @<ANYTHING>@. A specific clause therefore wins over a
+-- catch-all whichever was written first (Part III §1).
+pickClause :: Text -> [Clause] -> Maybe Clause
+pickClause name cs =
+  case filter ((== name) . clName) cs of
+    (c : _) -> Just c
+    []      -> case filter ((== "ANYTHING") . clName) cs of
+                 (c : _) -> Just c
+                 []      -> Nothing
+
+-- | Which errors a handled block turns into a condition. A @SIGNAL@
+-- already is one. An undefined variable is the built-in @<UNDEFINED>@;
+-- being converted HERE, in the guard, is what makes it happen "only when
+-- a handler is present" (Part III §1.1): with no handled block active no
+-- guard exists, and the plain error propagates as before. Divide-by-zero
+-- and @LOCK@ failure need operands the guard cannot recover, so those
+-- are signalled at their own sites ('divisionError', @LOCK@).
+asCondition :: EvalError -> Maybe Condition
+asCondition (Signaled c) = Just c
+asCondition (UndefinedVariable name subs) =
+  Just (Condition "UNDEFINED"
+         [ ("name", mkValue name)
+         , ("path", mkValue (T.intercalate "," (map unPValue subs))) ])
+asCondition _ = Nothing
+
+-- | Run one top-level line of a handled block, catching a condition.
+-- On a catch the environment is the one from BEFORE the line, so
+-- everything earlier lines did survives and everything this line did
+-- (including output it wrote and database writes it had pending) is
+-- dropped, and the line returns @QuitFrame@ so the block's own line
+-- loop stops; the condition is left in 'envCaught' for the runner. That
+-- the whole 'Env' is a pure value is what makes this a cheap, complete
+-- rollback.
+guardLine :: Eval Flow -> Eval Flow
+guardLine act = Eval $ \env -> do
+  r <- unEval act env
+  pure $ case r of
+    Left err | Just c <- asCondition err -> Right (QuitFrame Nothing, env { envCaught = Just c })
+    other                                -> other
+
+-- | Divide-by-zero. With a handler present it is the built-in
+-- @<DIVIDE-BY-ZERO>@ condition with its operands; otherwise the plain
+-- error (Part III §1.1).
+divisionError :: EvalError -> PValue -> PValue -> Eval a
+divisionError err dividend divisor = do
+  depth <- envHandlerDepth <$> getEnv
+  if depth > 0 && err == DivideByZero
+    then throwError (Signaled (Condition "DIVIDE-BY-ZERO" [("dividend", dividend), ("divisor", divisor)]))
+    else throwError err
+
+-- | Run a block that has @HANDLE@/@CATCH@ clauses.
+--
+-- The body (every line before the first clause head) runs line by line
+-- under 'guardLine'. If a condition is caught, the clause that handles
+-- it runs once, outside the block's own handler scope (a signal raised
+-- by a clause goes to the OUTER handlers), with the condition's fields
+-- bound as locals under its @AS@ name. A @CATCH@ clause then ends the
+-- block. A @HANDLE@ clause may @RETRY@, which re-runs the whole body
+-- from its top on the environment the clause left behind, with the
+-- @WITH@ fields set as locals; earlier lines' effects are NOT undone
+-- (a @TRANSACTION@ block will add that). A condition no clause names
+-- goes on outward as an ordinary signal.
+runHandledBlock :: [Line] -> Eval Flow
+runHandledBlock [] = pure NextStmt
+runHandledBlock blockLines@(firstL : _) = do
+  env0 <- getEnv
+  let depth       = lineDepth firstL
+      isHead l    = lineDepth l == depth && isHandlerClauseLine l
+      (bodyLines, clauseLines) = break isHead blockLines
+      clauses     = buildClauses depth clauseLines
+      rName       = envCurrentRoutine env0
+      saved       = env0
+      -- Put back everything a pass of the body or a clause changes
+      -- about where and how we are running.
+      restore = modifyEnv (\e -> e
+        { envPC = envPC saved, envRoutines = envRoutines saved
+        , envHandlerDepth = envHandlerDepth saved, envInHandle = envInHandle saved
+        , envRetryCount = envRetryCount saved })
+      install ls extra = modifyEnv (\e -> extra (e { envRoutines = Map.insert rName ls (envRoutines e) }))
+
+      attempt n seeds = do
+        forM_ seeds $ \(k, v) -> modifyEnvE (writeRef Local k [] v)
+        install bodyLines (\e -> e
+          { envHandlerDepth = envHandlerDepth saved + 1, envInHandle = False
+          , envRetryCount = n, envCaught = Nothing, envRetry = Nothing })
+        _ <- evalRoutineWith True bodyLines
+        caught <- envCaught <$> getEnv
+        modifyEnv (\e -> e { envCaught = Nothing })
+        restore
+        case caught of
+          Nothing -> pure NextStmt
+          Just c  -> case pickClause (condName c) clauses of
+            Nothing -> throwError (Signaled c)
+            Just cl -> do
+              bindCondition cl c
+              install (clBody cl) (\e -> e
+                { envInHandle = clKind cl == ClauseHandle, envRetryCount = n, envRetry = Nothing })
+              _ <- evalRoutine (clBody cl)
+              requested <- envRetry <$> getEnv
+              modifyEnv (\e -> e { envRetry = Nothing })
+              restore
+              case requested of
+                Nothing     -> pure NextStmt
+                Just seeds' -> attempt (n + 1) seeds'
+
+  attempt (0 :: Int) []
+
+-- | Bind a caught condition's fields as ordinary subscripted locals
+-- under the clause's @AS@ name: @c("field")@, plus the automatic
+-- @c("message")@. A @message@ field the signaller supplied itself takes
+-- precedence over the generated one. Any earlier binding of the same
+-- name is cleared first, so a stale field from a previous condition
+-- cannot be read as part of this one.
+bindCondition :: Clause -> Condition -> Eval ()
+bindCondition cl c =
+  case clBinding cl of
+    Nothing -> pure ()
+    Just b  -> do
+      modifyEnv (\e -> either (const e) id (killRef Local b [] e))
+      modifyEnvE (writeRef Local b [mkValue "message"] (mkValue (conditionMessage c)))
+      forM_ (condFields c) $ \(f, v) ->
+        modifyEnvE (writeRef Local b [mkValue f] v)
+
+-- | Run an @EVALUATE@ (Part II §5), in place.
+--
+-- Unlike 'runDoBlock', this does NOT swap in a sub-list of lines: the
+-- clauses are looked up in the routine's own line list, as the lines
+-- that follow the header and are exactly one level deeper
+-- ('Phase.Lines' gives them that depth in both the dotted and the
+-- @END EVALUATE@ spelling). Running in place is what makes
+-- @EVALUATE@ not a scope: a @QUIT@, @RETURN@ or @GOTO@ inside a
+-- clause body leaves the enclosing routine, because its 'Flow'
+-- comes straight back out of here. (A clause body that opens its own
+-- dotted block with a trailing @DO@ still gets ordinary @DO@ block
+-- semantics for that inner block only.)
+--
+-- Semantics, in order:
+--
+--   1. Every subject is evaluated exactly once, left to right.
+--   2. Clauses are tried top to bottom; the first whose tests ALL hold
+--      (and whose @WHERE@ guard, if any, is true) runs, and no other
+--      clause runs: there is no fall-through. @WHEN OTHER@ always
+--      holds, so it only ever wins when nothing above it did.
+--   3. A clause's tests are checked left to right and stop at the
+--      first failure, and the guard is only evaluated once every test
+--      has held.
+--   4. No matching clause and no @WHEN OTHER@ is not an error.
+--
+-- A clause with a different number of tests than the header has
+-- subjects is a @<SYNTAX>@ error when it is reached.
+runEvaluate :: [EvalSubject] -> Eval Flow
+runEvaluate subjects = do
+  env <- getEnv
+  let (curLineIdx, _) = envPC env
+  case Map.lookup (envCurrentRoutine env) (envRoutines env) of
+    Nothing -> pure NextStmt
+    Just linesList
+      | curLineIdx >= length linesList -> pure NextStmt
+      | otherwise -> do
+          let curDepth = lineDepth (linesList !! curLineIdx)
+              following = zip [curLineIdx + 1 ..] (drop (curLineIdx + 1) linesList)
+              block = takeWhile (\(_, l) -> lineDepth l > curDepth) following
+              clauses = [ (i, l) | (i, l) <- block, lineDepth l == curDepth + 1, isClauseLine l ]
+          subjectVals <- mapM evalSubject subjects
+          chosen <- firstMatching subjectVals clauses
+          case chosen of
+            Nothing -> pure NextStmt
+            Just (idx, clauseLine) -> do
+              let oldPC = envPC env
+              -- The clause's own line becomes the current line, so a
+              -- trailing bare @DO@ finds the dotted body under it.
+              modifyEnv (\e -> e { envPC = (idx, 1) })
+              flow <- evalStmtSequence (drop 1 (lineStmts clauseLine))
+              modifyEnv (\e -> e { envPC = oldPC })
+              pure $ case flow of
+                ExitLine   -> NextStmt   -- only the clause's own line ended
+                SkipToElse -> NextStmt
+                other      -> other      -- JumpTo / QuitFrame leave the routine
+  where
+    isClauseLine l = case lineStmts l of
+      (PredStmt _ (SWhen _ _) : _) -> True
+      (PredStmt _ SWhenOther : _)  -> True
+      _                            -> False
+
+    -- The value the subject has for the rest of the EVALUATE, and
+    -- whether it is the condition-chain @TRUE@ subject.
+    evalSubject SubjectTrue      = pure (True, mkValue "1")
+    evalSubject (SubjectExpr e)  = (,) False <$> evalExpr e
+
+    firstMatching _ [] = pure Nothing
+    firstMatching vals ((i, l) : rest) = do
+      ok <- clauseHolds vals (psStmt (head (lineStmts l)))
+      if ok then pure (Just (i, l)) else firstMatching vals rest
+
+    clauseHolds _ SWhenOther = pure True
+    clauseHolds vals (SWhen tests mGuard)
+      | length tests /= length vals =
+          throwError (SyntaxError
+            ("WHEN has " <> T.pack (show (length tests)) <> " test(s) but its EVALUATE has "
+              <> T.pack (show (length vals)) <> " subject(s)"))
+      | otherwise = do
+          testsOk <- allM (uncurry testHolds) (zip vals tests)
+          if not testsOk
+            then pure False
+            else case mGuard of
+              Nothing -> pure True
+              Just g  -> isTruthy <$> evalExpr g
+    clauseHolds _ _ = pure False
+
+    -- One position's test against that position's subject.
+    testHolds _ AnyTest = pure True
+    testHolds (isChain, subj) (ValueTest e)
+      | isChain   = isTruthy <$> evalExpr e                   -- EVALUATE TRUE: a boolean per clause
+      | otherwise = isTruthy <$> evalExpr (BinExpr Eq (Lit subj) e)
+    testHolds (_, subj) (CompareTest op e) = isTruthy <$> evalExpr (BinExpr op (Lit subj) e)
+
+    allM _ [] = pure True
+    allM f (x : xs) = do
+      b <- f x
+      if b then allM f xs else pure False
 
 -- | Run the dotted block that follows the current line: every
 -- following line whose dot depth is strictly greater than the current
@@ -1218,14 +1581,20 @@ runDoBlock = do
               blockLines = takeWhile (\l -> lineDepth l > curDepth) following
           if null blockLines
             then pure NextStmt
-            else do
-              let oldPC       = envPC env
-                  oldRoutines = envRoutines env
-                  rName       = envCurrentRoutine env
-              modifyEnv (\e -> e { envRoutines = Map.insert rName blockLines (envRoutines e) })
-              evalRoutine blockLines
-              modifyEnv (\e -> e { envPC = oldPC, envRoutines = oldRoutines })
-              pure NextStmt
+            else if hasHandlerClause blockLines
+              then runHandledBlock blockLines
+              else do
+                let oldPC       = envPC env
+                    oldRoutines = envRoutines env
+                    rName       = envCurrentRoutine env
+                modifyEnv (\e -> e { envRoutines = Map.insert rName blockLines (envRoutines e) })
+                evalRoutine blockLines
+                modifyEnv (\e -> e { envPC = oldPC, envRoutines = oldRoutines })
+                -- A RETRY inside this block is unwinding to the handled
+                -- block it belongs to: keep going out instead of
+                -- carrying on with the lines after this one.
+                pending <- envRetry <$> getEnv
+                pure (maybe NextStmt (const (QuitFrame Nothing)) pending)
 
 -- | Run an action inside a @DO WITH@ / @CALL WITH@ pin scope: resolve
 -- the pin ('resolvePinExpr') and the bind list, install the scope
@@ -1387,7 +1756,16 @@ evalLine (Line _ _ stmts) = evalStmtSequence stmts
 
 -- | Evaluate a whole routine (list of lines), returning values if returned.
 evalRoutineWithReturn :: [Line] -> Eval [PValue]
-evalRoutineWithReturn linesList = go 0
+evalRoutineWithReturn = evalRoutineWith False
+
+-- | The line loop behind 'evalRoutineWithReturn'. With @guarded@ set,
+-- each TOP-LEVEL line of the list (a line together with the deeper lines
+-- of any block it opens counts as one) runs under 'guardLine', which is
+-- how a handled block ('runHandledBlock') catches signals. Nested
+-- blocks inside a line are run unguarded by the ordinary loop: the
+-- whole outer line is the unit that gets rolled back.
+evalRoutineWith :: Bool -> [Line] -> Eval [PValue]
+evalRoutineWith guarded linesList = go 0
   where
     totalLines = length linesList
     baseDepth = case linesList of
@@ -1403,7 +1781,7 @@ evalRoutineWithReturn linesList = go 0
             then go (lineIdx + 1)
             else do
               modifyEnv (\e -> e { envPC = (lineIdx, 0) })
-              flow <- evalLine curLine
+              flow <- (if guarded then guardLine else id) (evalLine curLine)
               case flow of
                 QuitFrame (Just vs) -> pure vs
                 QuitFrame Nothing   -> pure []
@@ -1419,5 +1797,6 @@ evalRoutine linesList = do
 -- | Helper to run a whole routine starting from an initial environment.
 runRoutine :: [Line] -> Env -> IO (Either EvalError Env)
 runRoutine routineLines env =
-  let envWithRoutine = env { envRoutines = Map.insert (envCurrentRoutine env) routineLines (envRoutines env) }
+  let envWithRoutine = env { envRoutines = Map.insert (envCurrentRoutine env) routineLines (envRoutines env)
+                           , envConditionDecls = collectConditionDecls routineLines }
   in execState (evalRoutine routineLines) envWithRoutine

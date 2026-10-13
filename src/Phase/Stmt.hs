@@ -106,7 +106,7 @@ import Text.Parsec
 import Phase.AST
 import qualified Phase.AST as AST
 import Phase.Lines (LogicalLine (..))
-import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pExpr, pIdentifier, pPinSpec, pRef)
+import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pCompareBinOp, pExpr, pIdentifier, pPinSpec, pRef)
 
 -- --------------------------------------------------------------------
 -- Entry points
@@ -228,6 +228,7 @@ reservedKeywords :: [Text]
 reservedKeywords =
   [ "SET", "KILL", "WRITE", "IF", "ELSE", "FOR", "DO", "GOTO"
   , "QUIT", "RETURN", "NEW", "MERGE", "LOCK", "UNLOCK", "NAMESPACE"
+  , "SIGNAL", "RETRY"
   ]
 
 -- | The single-space/double-space split at the heart of
@@ -364,6 +365,14 @@ pStmt stmtStart =
   <|> pElse
   <|> pFor
   <|> pEndDo
+  <|> pEndEvaluate
+  <|> pEvaluate
+  <|> pWhen
+  <|> pCondition
+  <|> pSignal
+  <|> pHandle
+  <|> pCatch
+  <|> pRetry
   <|> pDo
   <|> pGoto
   <|> pQuit
@@ -821,13 +830,209 @@ pEndDo = do
   pure (postCond, SEndDo)
 
 -- --------------------------------------------------------------------
+-- EVALUATE / WHEN / END EVALUATE (Part II §5)
+-- --------------------------------------------------------------------
+
+-- | A word that must stand alone: matches case-insensitively, then
+-- requires that what follows is whitespace or the end of the line. The
+-- stricter boundary (rather than just "not followed by a letter or
+-- digit") keeps @TRUE@, @ANY@ and @OTHER@ from swallowing the front of
+-- a longer expression such as @TRUE(1)@, @ANY_X@ or @OTHER+1@, which
+-- must still parse as ordinary expressions.
+pStandaloneWord :: Text -> PParser ()
+pStandaloneWord w =
+  try (caseInsensitiveKeywordString w *> notFollowedBy alphaNum *> lookAhead (eof <|> () <$ oneOf " \t"))
+
+-- | @ALSO@, the separator between subjects (in an @EVALUATE@ header)
+-- and between tests (in a @WHEN@ clause).
+pAlso :: PParser ()
+pAlso = spacesOnly1 *> pStandaloneWord "ALSO" *> spacesOnly1
+
+-- | @EVALUATE subject [ALSO subject]...@. The bare word @TRUE@ is the
+-- condition-chain subject ('SubjectTrue'); anything else is an
+-- expression. The header holds no body: the @WHEN@ lines that follow
+-- are separate logical lines, one level deeper ('Phase.Lines').
+pEvaluate :: PParser (Maybe Expr, Stmt)
+pEvaluate = do
+  postCond <- pKeyword "EVALUATE"
+  spacesOnly1
+  first <- pSubject
+  rest <- many (try (pAlso *> pSubject))
+  pure (postCond, SEvaluate (first : rest))
+  where
+    pSubject = (SubjectTrue <$ pStandaloneWord "TRUE") <|> (SubjectExpr <$> pExpr)
+
+-- | @WHEN test [ALSO test]... [WHERE guard]@ or @WHEN OTHER@, followed
+-- on the SAME line by the clause's body statements (parsed by
+-- 'pLine''s ordinary statement loop, since this parser stops right
+-- after the header). Unlike nearly every other command, a clause takes
+-- NO postcondition (§8): a @:@ glued to the word is a parse error, not
+-- an ignored suffix.
+pWhen :: PParser (Maybe Expr, Stmt)
+pWhen = do
+  pNoPostCondKeyword "WHEN"
+  spacesOnly1
+  (Nothing, SWhenOther) <$ pStandaloneWord "OTHER" <|> pClause
+  where
+    pClause = do
+      first <- pTest
+      rest <- many (try (pAlso *> pTest))
+      guardExpr <- optionMaybe (try (spacesOnly1 *> pStandaloneWord "WHERE" *> spacesOnly1 *> pExpr))
+      pure (Nothing, SWhen (first : rest) guardExpr)
+
+    -- ANY, then a bare operator + operand, then a plain value. The
+    -- operator alternative can't swallow a value that merely starts
+    -- with a quote or bracket, since 'pCompareBinOp' only accepts
+    -- complete operator tokens ('\'=', '>=', '[', ...), and a unary
+    -- NOT such as @'x@ is not one of them, so it falls through to
+    -- 'pExpr'.
+    pTest =
+          (AnyTest <$ pStandaloneWord "ANY")
+      <|> (CompareTest <$> pCompareBinOp <*> pExpr)
+      <|> (ValueTest <$> pValue)
+
+    -- @TRUE@ inside a WHEN is the literal 1, so @WHEN TRUE@ matches in
+    -- chain mode (and compares equal to a subject of 1 elsewhere).
+    pValue = (Lit (mkValue "1") <$ pStandaloneWord "TRUE") <|> pExpr
+
+-- | Closes an explicit @EVALUATE ... END EVALUATE@ block. Two words,
+-- like 'pEndDo', and for the same reason @END@ is not itself a
+-- reserved keyword. Parses an optional postcondition for the same
+-- "don't forbid what the handbook doesn't forbid" reasoning as
+-- 'pEndDo'.
+pEndEvaluate :: PParser (Maybe Expr, Stmt)
+pEndEvaluate = do
+  try (caseInsensitiveKeywordString "END" *> spacesOnly1 *> caseInsensitiveKeywordString "EVALUATE" *> notFollowedBy alphaNum)
+  postCond <- pPostCond
+  pure (postCond, SEndEvaluate)
+
+-- --------------------------------------------------------------------
+-- CONDITION / SIGNAL / HANDLE / CATCH / RETRY (Part III §1)
+-- --------------------------------------------------------------------
+
+-- | A command word that takes NO postcondition (§8: "The parser throws
+-- an error if a @:@ follows" @NAMESPACE@, @CONDITION@, @HANDLE@,
+-- @CATCH@ or @WHEN@). The word match is the only thing wrapped in
+-- 'try'; a colon right after it is a hard parse error, not something
+-- to quietly skip.
+pNoPostCondKeyword :: Text -> PParser ()
+pNoPostCondKeyword kw = do
+  try (caseInsensitiveKeywordString kw *> notFollowedBy alphaNum)
+  colon <- optionMaybe (lookAhead (char ':'))
+  case colon of
+    Just _  -> unexpected ("a postcondition after " ++ T.unpack kw ++ " (" ++ T.unpack kw ++ " accepts none, handbook Part I §8)")
+    Nothing -> pure ()
+
+-- | @<NAME>@: a condition name in angle brackets. Letters, digits,
+-- @-@ and @_@ after an initial letter, stored upper-cased and without
+-- the brackets so @<divide-by-zero>@ and @<DIVIDE-BY-ZERO>@ are the
+-- same condition.
+pConditionName :: PParser Text
+pConditionName = do
+  _ <- char '<'
+  c <- letter
+  cs <- many (alphaNum <|> char '-' <|> char '_')
+  _ <- char '>'
+  pure (T.toUpper (T.pack (c : cs)))
+
+-- | A comma between list items, with optional spaces on either side
+-- (the handbook writes @(field1, field2)@ and @field=expr, field=expr@
+-- with a space after each comma, though expressions themselves never
+-- tolerate whitespace). Wrapped in 'try' so that a list's last item,
+-- followed by a space that is NOT part of a comma, backtracks cleanly
+-- to being the end of the list.
+pListComma :: PParser ()
+pListComma = try (spacesOnly *> char ',' *> spacesOnly)
+
+-- | @CONDITION <NAME>(field1, field2, ...)@. The field list (and its
+-- parentheses) may be absent or empty.
+pCondition :: PParser (Maybe Expr, Stmt)
+pCondition = do
+  pNoPostCondKeyword "CONDITION"
+  spacesOnly1
+  name <- pConditionName
+  fields <- option [] (char '(' *> spacesOnly *> (pIdentifier `sepBy` pListComma) <* spacesOnly <* char ')')
+  pure (Nothing, SCondition name fields)
+
+-- | @SIGNAL <NAME>(field: expr, field: expr, ...)@. Note the @:@
+-- between a field and its value here, where @RETRY WITH@ uses @=@.
+-- Spaces are allowed around the colon (the handbook writes
+-- @field: expr@).
+pSignal :: PParser (Maybe Expr, Stmt)
+pSignal = do
+  postCond <- pKeyword "SIGNAL"
+  spacesOnly1
+  name <- pConditionName
+  fields <- option [] (char '(' *> spacesOnly *> (pField `sepBy` pListComma) <* spacesOnly <* char ')')
+  pure (postCond, SSignal name fields)
+  where
+    pField = do
+      f <- pIdentifier
+      spacesOnly
+      _ <- char ':'
+      spacesOnly
+      e <- pExpr
+      pure (f, e)
+
+-- | @HANDLE <NAME> [AS binding]@ and @CATCH <NAME> [AS binding]@: the
+-- two clause heads share one grammar. As with @WHEN@, this parser
+-- stops after the head; anything else on the same line is the start of
+-- the clause's body, parsed by 'pLine''s ordinary statement loop.
+pHandle, pCatch :: PParser (Maybe Expr, Stmt)
+pHandle = pClauseHead "HANDLE" SHandle
+pCatch  = pClauseHead "CATCH" SCatch
+
+pClauseHead :: Text -> (Text -> Maybe Text -> Stmt) -> PParser (Maybe Expr, Stmt)
+pClauseHead kw ctor = do
+  pNoPostCondKeyword kw
+  spacesOnly1
+  name <- pConditionName
+  binding <- optionMaybe (try (spacesOnly1 *> pStandaloneWord "AS" *> spacesOnly1 *> pIdentifier))
+  pure (Nothing, ctor name binding)
+
+-- | @RETRY@, @RETRY WITH f=e, ...@, @RETRY n TIMES@ and
+-- @RETRY n TIMES WITH f=e, ...@ (@TIME@ is accepted for @TIMES@, so
+-- @RETRY 1 TIME@ reads naturally). Uses 'pOptionalArg', see its docs,
+-- for the same bare-vs-argument ambiguity @QUIT@/@DO@/@NEW@ have: one
+-- space introduces this command's own argument, two or more start a
+-- new statement. Spaces are allowed around the @=@ of a @WITH@ field
+-- (the handbook writes @RETRY WITH expectedTx = c("actualTx")@).
+pRetry :: PParser (Maybe Expr, Stmt)
+pRetry = do
+  postCond <- pKeyword "RETRY"
+  (count, seeds) <- maybe (Nothing, []) id <$> pOptionalArg pRetryArgs
+  pure (postCond, SRetry count seeds)
+  where
+    pRetryArgs =
+          ((,) Nothing <$> pWith)
+      <|> do
+            n <- pExpr
+            spacesOnly1
+            _ <- pStandaloneWord "TIMES" <|> pStandaloneWord "TIME"
+            seeds <- option [] (try (spacesOnly1 *> pWith))
+            pure (Just n, seeds)
+
+    pWith = do
+      pStandaloneWord "WITH"
+      spacesOnly1
+      pSeed `sepBy1` pListComma
+
+    pSeed = do
+      f <- pIdentifier
+      spacesOnly
+      _ <- char '='
+      spacesOnly
+      e <- pExpr
+      pure (f, e)
+
+-- --------------------------------------------------------------------
 -- Fallthrough: unrecognized command word, or a bare expression
 -- --------------------------------------------------------------------
 
 -- | Anything that reaches here is either (a) a bare expression
 -- standing entirely on its own, the Part XIV REPL toplevel case,
 -- or (b) a leading word this port doesn't yet implement (MACLIB,
--- EVALUATE/WHEN, TRANSACTION, NAMESPACE, EDGE, INDEX,
+-- TRANSACTION, NAMESPACE, EDGE, INDEX,
 -- CONDITION/SIGNAL/HANDLE/CATCH/RETRY, DEFINE MACRO/DROP MACRO,
 -- BLOBSAVE/BLOBMETA, or a genuinely unrecognized word).
 --

@@ -20,6 +20,7 @@ import Phase.Parser
 import Phase.State
 import Phase.Stmt
 import Phase.Storage
+import Phase.Storage.Lock (acquireLocks, emptyLockTable)
 import Phase.Tree
 import Phase.Value
 
@@ -2256,6 +2257,493 @@ testRefDynamicGroup ctx = do
     Right env -> assertEqual ctx "MERGE REF(dst)=REF(src): values merged" (getOutputText env) "x\ny\n"
 
 -- --------------------------------------------------------------------
+-- EVALUATE / WHEN, and the explicit END blocks they share with DO
+-- (Part II §5, Part I §5.4)
+-- --------------------------------------------------------------------
+
+testEvaluateGroup :: TestContext -> IO ()
+testEvaluateGroup ctx = do
+  adminEnv <- testAdminEnv
+  let depths src = map llDepth (buildLogicalLines src)
+      stmtsOf src = case parseLogicalLine (LogicalLine 0 Nothing src) of
+        Right (Line _ _ ps) -> Right (map psStmt ps)
+        Left e              -> Left (show e)
+      run src = case mapM parseLogicalLine (buildLogicalLines src) of
+        Left parseErr -> pure (Left (show parseErr))
+        Right ls -> do
+          r <- runRoutine ls adminEnv
+          pure (either (Left . show) (Right . getOutputText) r)
+      num n = Lit (mkValue n)
+      var n = Var (mkRef Local n [])
+
+  -- ---- Phase.Lines: explicit END blocks get the same depths dotted blocks do ----
+  assertEqual ctx "Lines: DO ... END DO body is one level deeper, END keeps the opener's depth"
+    (depths " DO\n WRITE 1\n END DO\n WRITE 2") [0, 1, 0, 0]
+  assertEqual ctx "Lines: nested DO ... END DO"
+    (depths " DO\n DO\n WRITE 1\n END DO\n END DO") [0, 1, 2, 1, 0]
+  assertEqual ctx "Lines: an END-style DO with no END DO is left as before (empty body)"
+    (depths " DO\n WRITE 1") [0, 0]
+  assertEqual ctx "Lines: a stray END DO after a dotted block changes nothing"
+    (depths " DO\n. WRITE 1\n END DO") [0, 1, 0]
+  assertEqual ctx "Lines: a dotted DO inside an END DO block adds up"
+    (depths " DO\n DO\n. WRITE 1\n END DO\n END DO") [0, 1, 2, 0, 0]
+  assertEqual ctx "Lines: END DO is not itself a block opener"
+    (map (\t -> (endsWithBareDo t, opensBlock t)) ["END DO", "DO", "FOR I=1:1:3 DO"])
+    [(False, False), (True, True), (True, True)]
+  assertEqual ctx "Lines: END-style EVALUATE gives its WHEN lines one level, END EVALUATE none"
+    (depths " EVALUATE X\n WHEN 1 WRITE 1\n WHEN OTHER WRITE 2\n END EVALUATE") [0, 1, 1, 0]
+  assertEqual ctx "Lines: dotted EVALUATE is not read as a continuation of its header"
+    (depths " EVALUATE X\n. WHEN 1 WRITE 1\n. WHEN OTHER WRITE 2") [0, 1, 1]
+  assertEqual ctx "Lines: EVALUATE is an opener, even with a postcondition; EVALUATED is not"
+    (map opensBlock ["EVALUATE X", "EVALUATE:A X", "evaluate X", "EVALUATED", "SET EVALUATE=1"])
+    [True, True, True, False, False]
+  assertEqual ctx "Lines: an END of the wrong kind closes the right opener and leaves the other alone"
+    (depths " DO\n EVALUATE X\n WHEN 1 WRITE 1\n END DO") [0, 1, 1, 0]
+  assertEqual ctx "Lines: nested EVALUATE with a dotted WHEN body"
+    (depths (T.unlines
+      [ " EVALUATE A"
+      , " WHEN 1 DO"
+      , ". EVALUATE B"
+      , ". WHEN 1 WRITE \"11\""
+      , ". WHEN OTHER WRITE \"1x\""
+      , ". END EVALUATE"
+      , " WHEN OTHER WRITE \"x\""
+      , " END EVALUATE" ]))
+    [0, 1, 2, 3, 3, 2, 1, 0]
+  assertEqual ctx "Lines: EVALUATE at column 0 is a command, not a tag"
+    (map llTag (buildLogicalLines "EVALUATE X\n    WHEN 1 WRITE 1\nEND EVALUATE"))
+    [Nothing, Nothing, Nothing]
+
+  -- ---- the REPL's multi-line prompt ----
+  assertEqual ctx "continuation: DO then an undotted line keeps prompting for END DO"
+    (needsContinuation " DO\n WRITE 1") True
+  assertEqual ctx "continuation: END DO completes the block"
+    (needsContinuation " DO\n WRITE 1\n END DO") False
+  assertEqual ctx "continuation: a blank line still abandons an unclosed END-style block"
+    (needsContinuation " DO\n WRITE 1\n") False
+  assertEqual ctx "continuation: an EVALUATE header opens a block"
+    (needsContinuation " EVALUATE X") True
+  assertEqual ctx "continuation: EVALUATE with clauses still waits for END EVALUATE"
+    (needsContinuation " EVALUATE X\n WHEN 1 WRITE 1") True
+  assertEqual ctx "continuation: END EVALUATE completes it"
+    (needsContinuation " EVALUATE X\n WHEN 1 WRITE 1\n END EVALUATE") False
+  assertEqual ctx "continuation: a dotted EVALUATE line keeps the block open"
+    (needsContinuation " EVALUATE X\n. WHEN 1 WRITE 1") True
+
+  -- ---- Phase.Stmt: parsing ----
+  assertEqual ctx "parse: EVALUATE X"
+    (stmtsOf "EVALUATE X") (Right [SEvaluate [SubjectExpr (var "X")]])
+  assertEqual ctx "parse: EVALUATE TRUE is the condition-chain subject"
+    (stmtsOf "EVALUATE TRUE") (Right [SEvaluate [SubjectTrue]])
+  assertEqual ctx "parse: EVALUATE A ALSO B"
+    (stmtsOf "EVALUATE A ALSO B") (Right [SEvaluate [SubjectExpr (var "A"), SubjectExpr (var "B")]])
+  assertEqual ctx "parse: a subject that merely starts with TRUE is an ordinary expression"
+    (stmtsOf "EVALUATE TRUEISH") (Right [SEvaluate [SubjectExpr (var "TRUEISH")]])
+  assertEqual ctx "parse: WHEN value, then the body statement on the same line"
+    (fmap (take 1) (stmtsOf "WHEN 1 WRITE 2")) (Right [SWhen [ValueTest (num "1")] Nothing])
+  assertEqual ctx "parse: the clause body is parsed as ordinary following statements"
+    (fmap length (stmtsOf "WHEN 1 WRITE 2,!  SET X=1")) (Right 3)
+  assertEqual ctx "parse: WHEN OTHER"
+    (fmap (take 1) (stmtsOf "WHEN OTHER WRITE 1")) (Right [SWhenOther])
+  assertEqual ctx "parse: WHEN ANY ALSO >500"
+    (fmap (take 1) (stmtsOf "WHEN ANY ALSO >500 WRITE 1"))
+    (Right [SWhen [AnyTest, CompareTest Gt (num "500")] Nothing])
+  assertEqual ctx "parse: WHEN '=X is a negated comparison, not a unary NOT"
+    (fmap (take 1) (stmtsOf "WHEN '=X WRITE 1"))
+    (Right [SWhen [CompareTest NotEq (var "X")] Nothing])
+  assertEqual ctx "parse: WHEN >=5 reuses the expression parser's spelling (NotLt)"
+    (fmap (take 1) (stmtsOf "WHEN >=5 WRITE 1"))
+    (Right [SWhen [CompareTest NotLt (num "5")] Nothing])
+  assertEqual ctx "parse: WHEN 'X is a plain value test of a unary NOT"
+    (fmap (take 1) (stmtsOf "WHEN 'X WRITE 1"))
+    (Right [SWhen [ValueTest (UnExpr Not (var "X"))] Nothing])
+  assertEqual ctx "parse: WHEN TRUE WHERE guard"
+    (fmap (take 1) (stmtsOf "WHEN TRUE WHERE N#2=0 WRITE 1"))
+    (Right [SWhen [ValueTest (num "1")] (Just (BinExpr Eq (BinExpr Mod (var "N") (num "2")) (num "0")))])
+  assertEqual ctx "parse: OTHERS and ANYTHING are ordinary identifiers, not OTHER / ANY"
+    (fmap (take 1) (stmtsOf "WHEN OTHERS ALSO ANYTHING WRITE 1"))
+    (Right [SWhen [ValueTest (var "OTHERS"), ValueTest (var "ANYTHING")] Nothing])
+  assertEqual ctx "parse: END EVALUATE"
+    (stmtsOf "END EVALUATE") (Right [SEndEvaluate])
+  assertIsLeft ctx "parse: WHEN rejects a postcondition (§8)"
+    (stmtsOf "WHEN:X 1 WRITE 1")
+  assertIsLeft ctx "parse: EVALUATE needs a subject"
+    (stmtsOf "EVALUATE")
+
+  -- ---- Phase.Eval: END EVALUATE form ----
+  let sw v = T.unlines
+        [ " SET S=" <> v
+        , " EVALUATE S"
+        , " WHEN \"A\" WRITE \"a\""
+        , " WHEN \"B\" WRITE \"b\""
+        , " WHEN OTHER WRITE \"o\""
+        , " END EVALUATE"
+        , " WRITE \"!\"" ]
+  r1 <- run (sw "\"B\"")
+  assertEqual ctx "EVALUATE: a value clause matches" r1 (Right "b!")
+  r2 <- run (sw "\"Z\"")
+  assertEqual ctx "EVALUATE: WHEN OTHER runs when nothing matched" r2 (Right "o!")
+  r3 <- run (T.unlines [" SET S=\"Z\"", " EVALUATE S", " WHEN \"A\" WRITE \"a\"", " END EVALUATE", " WRITE \"!\""])
+  assertEqual ctx "EVALUATE: no match and no OTHER is not an error" r3 (Right "!")
+  r4 <- run (T.unlines [" SET S=\"B\"", " EVALUATE S", " WHEN \"B\" WRITE \"1\"", " WHEN \"B\" WRITE \"2\"", " WHEN OTHER WRITE \"3\"", " END EVALUATE"])
+  assertEqual ctx "EVALUATE: only the first matching clause runs (no fall-through)" r4 (Right "1")
+  r5 <- run (T.unlines [" SET S=\"x\"", " EVALUATE S", " WHEN OTHER WRITE \"o\"", " WHEN \"x\" WRITE \"x\"", " END EVALUATE"])
+  assertEqual ctx "EVALUATE: clauses are tried in order, so an early OTHER shadows later ones" r5 (Right "o")
+  r6 <- run (T.unlines [" SET S=\"B\"", " EVALUATE S", " WHEN \"B\" WRITE \"b\"  WRITE \"2\"", " END EVALUATE"])
+  assertEqual ctx "EVALUATE: a clause body can hold several statements" r6 (Right "b2")
+
+  -- dotted spelling: identical behaviour
+  r7 <- run (T.unlines [" SET S=\"B\"", " EVALUATE S", ". WHEN \"A\" WRITE \"a\"", ". WHEN \"B\" WRITE \"b\"", ". WHEN OTHER WRITE \"o\"", " WRITE \"!\""])
+  assertEqual ctx "EVALUATE: dotted form selects the same clause" r7 (Right "b!")
+  r8 <- run (T.unlines [" SET S=\"Z\"", " EVALUATE S", ". WHEN \"A\" WRITE \"a\"", ". WHEN OTHER WRITE \"o\"", " WRITE \"!\""])
+  assertEqual ctx "EVALUATE: dotted form, OTHER" r8 (Right "o!")
+
+  -- chain mode, comparisons, ALSO, WHERE
+  let chain p = T.unlines
+        [ " SET P=" <> p
+        , " EVALUATE TRUE"
+        , " WHEN P>1000 WRITE \"big\""
+        , " WHEN P>100 WRITE \"mid\""
+        , " WHEN OTHER WRITE \"small\""
+        , " END EVALUATE" ]
+  mapM_ (\(p, want) -> do
+           r <- run (chain p)
+           assertEqual ctx ("EVALUATE TRUE chain, P=" ++ T.unpack p) r (Right want))
+    [("5000", "big"), ("500", "mid"), ("1", "small")]
+
+  let cmp p = T.unlines
+        [ " SET P=" <> p
+        , " EVALUATE P"
+        , " WHEN >1000 WRITE \"big\""
+        , " WHEN >=100 WRITE \"mid\""
+        , " WHEN '=7 WRITE \"not7\""
+        , " WHEN OTHER WRITE \"seven\""
+        , " END EVALUATE" ]
+  mapM_ (\(p, want) -> do
+           r <- run (cmp p)
+           assertEqual ctx ("EVALUATE operator tests, P=" ++ T.unpack p) r (Right want))
+    [("5000", "big"), ("100", "mid"), ("3", "not7"), ("7", "seven")]
+
+  let also t n = T.unlines
+        [ " SET T=\"" <> t <> "\",N=" <> n
+        , " EVALUATE T ALSO N"
+        , " WHEN \"PREMIUM\" ALSO >500 WRITE \"p-big\""
+        , " WHEN \"PREMIUM\" ALSO ANY WRITE \"p\""
+        , " WHEN ANY ALSO >500 WRITE \"big\""
+        , " WHEN OTHER WRITE \"o\""
+        , " END EVALUATE" ]
+  mapM_ (\(t, n, want) -> do
+           r <- run (also t n)
+           assertEqual ctx ("EVALUATE ... ALSO, " ++ T.unpack t ++ "/" ++ T.unpack n) r (Right want))
+    [("PREMIUM", "600", "p-big"), ("PREMIUM", "10", "p"), ("BASIC", "600", "big"), ("BASIC", "10", "o")]
+
+  r9 <- run (T.unlines
+    [ " FOR N=1:1:4 DO"
+    , ". EVALUATE TRUE"
+    , ". WHEN TRUE WHERE N#2=0 WRITE \"e\""
+    , ". WHEN OTHER WRITE \"o\""
+    , ". END EVALUATE" ])
+  assertEqual ctx "EVALUATE: WHERE guard, inside a FOR body, END form" r9 (Right "oeoe")
+  r10 <- run (T.unlines
+    [ " FOR N=1:1:4 DO"
+    , ". EVALUATE TRUE"
+    , ".. WHEN TRUE WHERE N#2=0 WRITE \"e\""
+    , ".. WHEN OTHER WRITE \"o\"" ])
+  assertEqual ctx "EVALUATE: the same, fully dotted" r10 (Right "oeoe")
+
+  -- clause bodies that open their own blocks, and nesting
+  let nested a b = T.unlines
+        [ " SET A=" <> a <> ",B=" <> b
+        , " EVALUATE A"
+        , " WHEN 1 DO"
+        , ". EVALUATE B"
+        , ". WHEN 1 WRITE \"11\""
+        , ". WHEN OTHER WRITE \"1x\""
+        , ". END EVALUATE"
+        , " WHEN OTHER WRITE \"x\""
+        , " END EVALUATE" ]
+  mapM_ (\(a, b, want) -> do
+           r <- run (nested a b)
+           assertEqual ctx ("EVALUATE: nested, A=" ++ T.unpack a ++ " B=" ++ T.unpack b) r (Right want))
+    [("1", "1", "11"), ("1", "2", "1x"), ("2", "1", "x")]
+  r11 <- run (T.unlines
+    [ " SET S=1", " EVALUATE S", " WHEN 1 DO", ". WRITE \"a\"", ". WRITE \"b\"", " WHEN OTHER WRITE \"o\"", " END EVALUATE" ])
+  assertEqual ctx "EVALUATE: a WHEN ... DO clause runs its dotted body" r11 (Right "ab")
+
+  -- EVALUATE is not a scope
+  r12 <- run (T.unlines [" SET S=1", " EVALUATE S", " WHEN 1 WRITE \"one\"  QUIT", " END EVALUATE", " WRITE \"after\""])
+  assertEqual ctx "EVALUATE: QUIT in a clause leaves the enclosing routine" r12 (Right "one")
+  let Right envSign = defineItem "_GLOBAL" "SIGN" KindFunction (Just ["N"]) (T.unlines
+        [ " EVALUATE TRUE"
+        , " WHEN N>0 RETURN \"pos\""
+        , " WHEN N<0 RETURN \"neg\""
+        , " END EVALUATE"
+        , " RETURN \"zero\"" ]) adminEnv
+  mapM_ (\(n, want) -> do
+           res <- runRoutine (case mapM parseLogicalLine (buildLogicalLines (" WRITE CALL SIGN(" <> n <> ")")) of Right ls -> ls; Left _ -> []) envSign
+           assertEqual ctx ("EVALUATE: RETURN in a clause returns from the function, N=" ++ T.unpack n)
+             (fmap getOutputText res) (Right want))
+    [("5", "pos"), ("-5", "neg"), ("0", "zero")]
+
+  -- postcondition on EVALUATE itself, case-insensitivity, errors
+  r13 <- run (T.unlines [" SET S=1", " EVALUATE:0 S", " WHEN 1 WRITE \"x\"", " END EVALUATE", " WRITE \"end\""])
+  assertEqual ctx "EVALUATE: a false postcondition skips the whole block" r13 (Right "end")
+  r14 <- run (T.unlines [" SET S=1", " evaluate S", " when 2 WRITE \"two\"", " when 1 WRITE \"one\"", " when other WRITE \"o\"", " end evaluate"])
+  assertEqual ctx "EVALUATE: keywords are case-insensitive" r14 (Right "one")
+  r15 <- run " WHEN 1 WRITE \"x\""
+  assertIsLeft ctx "EVALUATE: a WHEN with no EVALUATE is a runtime error" r15
+  r16 <- run (T.unlines [" EVALUATE A ALSO B", " WHEN 1 WRITE \"x\"", " END EVALUATE"])
+  assertIsLeft ctx "EVALUATE: a clause with the wrong number of tests is a runtime error" r16
+
+  -- explicit DO ... END DO runs its body like a dotted DO
+  r17 <- run (T.unlines [" DO", " WRITE \"in\"", " END DO", " WRITE \"out\""])
+  assertEqual ctx "DO ... END DO runs its body once and continues" r17 (Right "inout")
+  r18 <- run (T.unlines [" FOR I=1:1:3 DO", " WRITE I", " END DO", " WRITE \"!\""])
+  assertEqual ctx "FOR ... DO ... END DO repeats the END-delimited body" r18 (Right "123!")
+  r19 <- run (T.unlines [" DO", " WRITE \"a\"", " QUIT", " WRITE \"b\"", " END DO", " WRITE \"c\""])
+  assertEqual ctx "DO ... END DO: QUIT leaves just the block, like a dotted DO" r19 (Right "ac")
+
+-- --------------------------------------------------------------------
+-- CONDITION / SIGNAL / HANDLE / CATCH / RETRY (Part III §1)
+-- --------------------------------------------------------------------
+
+testConditionsGroup :: TestContext -> IO ()
+testConditionsGroup ctx = do
+  adminEnv <- testAdminEnv
+  let stmtsOf src = case parseLogicalLine (LogicalLine 0 Nothing src) of
+        Right (Line _ _ ps) -> Right (map psStmt ps)
+        Left e              -> Left (show e)
+      -- Run a script in an environment; the error stays a real EvalError
+      -- so a test can say exactly which condition escaped.
+      runIn env src = case mapM parseLogicalLine (buildLogicalLines src) of
+        Left pe -> pure (Left (SyntaxError (T.pack (show pe))))
+        Right ls -> fmap (fmap getOutputText) (runRoutine ls env)
+      run = runIn adminEnv
+      var n = Var (mkRef Local n [])
+      str = Lit . mkValue
+      cond n fs = Condition n [(k, mkValue v) | (k, v) <- fs]
+      isSyntaxError r = case r of Left (SyntaxError _) -> True; _ -> False
+      -- Specifically the "RETRY is not allowed here" error, not just any <SYNTAX>.
+      isRetryMisuse r = case r of Left (SyntaxError m) -> "RETRY" `T.isInfixOf` m; _ -> False
+
+  -- ---- parsing ----
+  assertEqual ctx "parse: CONDITION with fields"
+    (stmtsOf "CONDITION <OOPS>(reason, code)") (Right [SCondition "OOPS" ["reason", "code"]])
+  assertEqual ctx "parse: CONDITION with no field list, and names are upper-cased"
+    (stmtsOf "CONDITION <oops>") (Right [SCondition "OOPS" []])
+  assertEqual ctx "parse: condition names may contain - and _"
+    (stmtsOf "CONDITION <LOCK-TIMEOUT_2>()") (Right [SCondition "LOCK-TIMEOUT_2" []])
+  assertIsLeft ctx "parse: CONDITION rejects a postcondition (§8)" (stmtsOf "CONDITION:X <OOPS>")
+  assertEqual ctx "parse: SIGNAL with fields (spaces after : and ,)"
+    (stmtsOf "SIGNAL <OOPS>(reason: \"bad\", n: X)")
+    (Right [SSignal "OOPS" [("reason", str "bad"), ("n", var "X")]])
+  assertEqual ctx "parse: SIGNAL with no fields"
+    (stmtsOf "SIGNAL <OOPS>") (Right [SSignal "OOPS" []])
+  assertEqual ctx "parse: SIGNAL accepts a postcondition"
+    (fmap length (stmtsOf "SIGNAL:X <OOPS>")) (Right 1)
+  assertEqual ctx "parse: HANDLE with AS binding"
+    (stmtsOf "HANDLE <CONFLICT> AS c") (Right [SHandle "CONFLICT" (Just "c")])
+  assertEqual ctx "parse: HANDLE without AS"
+    (stmtsOf "HANDLE <CONFLICT>") (Right [SHandle "CONFLICT" Nothing])
+  assertEqual ctx "parse: CATCH <ANYTHING> AS e"
+    (stmtsOf "CATCH <ANYTHING> AS e") (Right [SCatch "ANYTHING" (Just "e")])
+  assertEqual ctx "parse: the rest of a clause line is its first body statements"
+    (fmap length (stmtsOf "HANDLE <X> AS c  RETRY")) (Right 2)
+  assertIsLeft ctx "parse: HANDLE rejects a postcondition (§8)" (stmtsOf "HANDLE:X <OOPS>")
+  assertIsLeft ctx "parse: CATCH rejects a postcondition (§8)" (stmtsOf "CATCH:X <OOPS>")
+  assertEqual ctx "parse: bare RETRY" (stmtsOf "RETRY") (Right [SRetry Nothing []])
+  assertEqual ctx "parse: RETRY n TIMES"
+    (stmtsOf "RETRY 3 TIMES") (Right [SRetry (Just (Lit (mkValue "3"))) []])
+  assertEqual ctx "parse: RETRY 1 TIME (singular)"
+    (stmtsOf "RETRY 1 TIME") (Right [SRetry (Just (Lit (mkValue "1"))) []])
+  assertEqual ctx "parse: RETRY WITH, spaces around = and after the comma"
+    (fmap (map (\st -> case st of SRetry Nothing ws -> map fst ws; _ -> [])) (stmtsOf "RETRY WITH a = 1, b=X"))
+    (Right [["a", "b"]])
+  assertEqual ctx "parse: RETRY n TIMES WITH ..."
+    (fmap (map (\st -> case st of SRetry (Just _) ws -> map fst ws; _ -> [])) (stmtsOf "RETRY 2 TIMES WITH a=1"))
+    (Right [["a"]])
+  assertEqual ctx "parse: two spaces end a bare RETRY and start a new statement"
+    (fmap length (stmtsOf "RETRY  WRITE 1")) (Right 2)
+  assertIsLeft ctx "parse: one space after a bare RETRY is rejected like QUIT"
+    (stmtsOf "RETRY WRITE 1")
+  assertEqual ctx "Lines: HANDLE, CATCH and the others at column 0 are commands, not tags"
+    (map llTag (buildLogicalLines "HANDLE <X> AS c\nCATCH <X>\nRETRY\nSIGNAL <X>\nCONDITION <X>"))
+    (replicate 5 Nothing)
+
+  -- ---- SIGNAL / CATCH basics ----
+  r1 <- run (T.unlines
+    [ "DO", "    WRITE \"before \"", "    SIGNAL <OOPS>(reason: \"bad\")", "    WRITE \"not reached\""
+    , "CATCH <OOPS> AS e", "    WRITE \"caught: \",e(\"reason\")", "END DO", "WRITE \" after\"" ])
+  assertEqual ctx "CATCH: runs, binds fields, and the program carries on after END DO"
+    r1 (Right "before caught: bad after")
+  r2 <- run " SIGNAL <X>(a: 1)"
+  assertEqual ctx "SIGNAL with no handler is an ordinary halting error"
+    r2 (Left (Signaled (cond "X" [("a", "1")])))
+  assertEqual ctx "an unhandled signal prints as <NAME> field=value"
+    (fmap formatError (either Just (const Nothing) r2)) (Just "<X> a=1")
+  r3 <- run (T.unlines [ "DO", "SIGNAL <OOPS>(reason: \"bad\")", "CATCH <OOPS> AS e", "WRITE e(\"message\")", "END DO" ])
+  assertEqual ctx "the automatic message field is <NAME> followed by the fields"
+    r3 (Right "<OOPS> reason=bad")
+  r4 <- run (T.unlines [ "DO", "SIGNAL <OOPS>(message: \"custom\")", "CATCH <OOPS> AS e", "WRITE e(\"message\")", "END DO" ])
+  assertEqual ctx "a message field the signaller supplied wins over the generated one" r4 (Right "custom")
+  r5 <- run (T.unlines [ "DO", "SIGNAL <OOPS>", "CATCH <OOPS>", "WRITE \"no binding needed\"", "END DO" ])
+  assertEqual ctx "AS is optional" r5 (Right "no binding needed")
+  r6 <- run (T.unlines [ "DO", "SIGNAL <oops>", "CATCH <OOPS>", "WRITE \"same\"", "END DO" ])
+  assertEqual ctx "condition names are case-insensitive" r6 (Right "same")
+  r7 <- run (T.unlines
+    [ "DO", "SIGNAL <A>(a: 1)", "CATCH <A> AS e", "END DO"
+    , "DO", "SIGNAL <B>(b: 2)", "CATCH <B> AS e", "WRITE $DATA(e(\"a\")),$DATA(e(\"b\"))", "END DO" ])
+  assertEqual ctx "a binding is cleared before each new condition, so no stale fields" r7 (Right "01")
+  r8 <- run (T.unlines [ "DO", "SIGNAL <X>", "CATCH <X>", "END DO", "WRITE \"after\"" ])
+  assertEqual ctx "a clause with an empty body swallows the condition and the program continues"
+    r8 (Right "after")
+  r9 <- run (T.unlines [ " DO", " . SIGNAL <X>", " . CATCH <X>", " . WRITE \"dotted\"" ])
+  assertEqual ctx "clauses work in the dotted spelling too" r9 (Right "dotted")
+
+  -- ---- clause selection ----
+  r10 <- run (T.unlines
+    [ "DO", "SIGNAL <OOPS>", "CATCH <ANYTHING>", "WRITE \"any\"", "CATCH <OOPS>", "WRITE \"specific\"", "END DO" ])
+  assertEqual ctx "a specific clause beats <ANYTHING> even when ANYTHING is written first" r10 (Right "specific")
+  r11 <- run (T.unlines [ "DO", "SIGNAL <WEIRD>", "CATCH <OOPS>", "WRITE \"oops\"", "CATCH <ANYTHING>", "WRITE \"any\"", "END DO" ])
+  assertEqual ctx "<ANYTHING> catches whatever no other clause names" r11 (Right "any")
+  r12 <- run (T.unlines [ "DO", "SIGNAL <WEIRD>", "CATCH <OOPS>", "WRITE \"oops\"", "END DO", "WRITE \"unreached\"" ])
+  assertEqual ctx "no matching clause: the signal goes on and halts" r12 (Left (Signaled (cond "WEIRD" [])))
+  r13 <- run (T.unlines
+    [ "DO", "DO", "SIGNAL <A>", "CATCH <B>", "WRITE \"inner\"", "END DO", "CATCH <A>", "WRITE \"outer\"", "END DO" ])
+  assertEqual ctx "an unmatched signal reaches the next enclosing handler" r13 (Right "outer")
+  r14 <- run (T.unlines
+    [ "DO", "SIGNAL <A>", "CATCH <A>", "SIGNAL <B>", "CATCH <B>", "WRITE \"same block\"", "END DO" ])
+  assertEqual ctx "a signal raised BY a clause is not caught by the same block's other clauses"
+    r14 (Left (Signaled (cond "B" [])))
+
+  -- ---- what a caught signal undoes ----
+  r15 <- run (T.unlines
+    [ "DO", "SET a=1", "SET ^CT(2)=7", "SIGNAL <X>", "CATCH <X>", "WRITE $DATA(a),$DATA(^CT(2))", "END DO" ])
+  assertEqual ctx "effects of lines BEFORE the failing one survive, locals and globals" r15 (Right "11")
+  r16 <- run (T.unlines
+    [ "DO", "SET a=1  SET ^CT(1)=5  WRITE \"gone\"  SIGNAL <X>", "CATCH <X>", "WRITE $DATA(a),$DATA(^CT(1)),\"|\"", "END DO" ])
+  assertEqual ctx "the failing LINE is atomic: its sets, global writes and output are dropped" r16 (Right "00|")
+  r17 <- run (T.unlines
+    [ "DO", "FOR I=1:1:5 DO", ". IF I=3 SIGNAL <STOP>(at: I)", ". WRITE I", "CATCH <STOP> AS s", "WRITE \"|\",s(\"at\")", "END DO" ])
+  assertEqual ctx "a FOR containing the error is one atomic unit (documented granularity)" r17 (Right "|3")
+  r18 <- run (T.unlines
+    [ " FOR I=1:1:3 DO", " . IF I=2 SIGNAL <SKIP>", " . WRITE I", " . CATCH <SKIP>", " . WRITE \"s\"" ])
+  assertEqual ctx "a handler inside a FOR body is applied per iteration" r18 (Right "1s3")
+
+  -- ---- signals from inside calls ----
+  let Right envThrow = defineItem "_GLOBAL" "THROW" KindFunction (Just []) " SIGNAL <FROMFN>(where: \"fn\")" adminEnv
+  r19 <- runIn envThrow (T.unlines [ "DO", "WRITE CALL THROW()", "CATCH <FROMFN> AS e", "WRITE e(\"where\")", "END DO" ])
+  assertEqual ctx "a signal raised in a called function, in expression position, is caught by the caller's block"
+    r19 (Right "fn")
+  let Right envDecl = defineItem "_GLOBAL" "THROW2" KindFunction (Just []) " SIGNAL <D>(undeclared: 1)" envThrow
+  r20 <- runIn envDecl (T.unlines [ " CONDITION <D>(only)", " DO", " WRITE CALL THROW2()", " CATCH <D>", " WRITE \"c\"", " END DO" ])
+  assertEqual ctx "CONDITION declarations belong to their own routine: the callee is not bound by the caller's"
+    r20 (Right "c")
+
+  -- ---- CONDITION declarations ----
+  r21 <- run (T.unlines [ " CONDITION <D>(reason)", " DO", " SIGNAL <D>(reason: \"ok\")", " CATCH <D> AS e", " WRITE e(\"reason\")", " END DO" ])
+  assertEqual ctx "a declared field is accepted" r21 (Right "ok")
+  r22 <- run (T.unlines [ " CONDITION <D>(reason)", " DO", " SIGNAL <D>(reasno: \"typo\")", " CATCH <ANYTHING>", " WRITE \"caught\"", " END DO" ])
+  assertEqual ctx "an undeclared field is a <SYNTAX> error, which a condition handler does not catch"
+    (isSyntaxError r22) True
+  r23 <- run (T.unlines [ " DO", " SIGNAL <D>(reasno: \"typo\")", " CATCH <D>", " WRITE \"c\"", " END DO", " CONDITION <D>(reason)" ])
+  assertEqual ctx "a declaration after its first use still applies (collected up front)" (isSyntaxError r23) True
+  r24 <- run (T.unlines [ " DO", " SIGNAL <E>(anything: 1)", " CATCH <E>", " WRITE \"c\"", " END DO" ])
+  assertEqual ctx "an undeclared condition has no field restriction" r24 (Right "c")
+
+  -- ---- RETRY ----
+  r25 <- run (T.unlines
+    [ " SET n=0", "DO", "    SET n=n+1", "    IF n<3 SIGNAL <AGAIN>(count: n)", "    WRITE \"done n=\",n"
+    , "HANDLE <AGAIN> AS c", "    WRITE \"retry \",c(\"count\"),\" \"", "    RETRY", "END DO" ])
+  assertEqual ctx "RETRY re-runs the body; effects of earlier passes are kept (n keeps counting)"
+    r25 (Right "retry 1 retry 2 done n=3")
+  r26 <- run (T.unlines
+    [ " SET n=0", "DO", "    IF n<1 SIGNAL <AGAIN>(next: 10)", "    WRITE \"n=\",n"
+    , "HANDLE <AGAIN> AS c", "    RETRY WITH n = c(\"next\")", "END DO" ])
+  assertEqual ctx "RETRY WITH sets locals for the next pass, evaluated while the binding is still in scope"
+    r26 (Right "n=10")
+  r27 <- run (T.unlines
+    [ " SET n=0", "DO", "    SET n=n+1", "    SIGNAL <AGAIN>", "HANDLE <AGAIN>", "    RETRY 2 TIMES", "    WRITE \"gave up after \",n", "END DO" ])
+  assertEqual ctx "RETRY 2 TIMES: two re-entries (three runs), then it falls through to the next statement"
+    r27 (Right "gave up after 3")
+  r28 <- run (T.unlines
+    [ " SET n=0", "DO", "    SET n=n+1", "    SIGNAL <AGAIN>", "HANDLE <AGAIN>", "    RETRY 1 TIME", "    WRITE \"n=\",n", "END DO" ])
+  assertEqual ctx "RETRY 1 TIME: one re-entry" r28 (Right "n=2")
+  r29 <- run (T.unlines
+    [ " SET n=0", "DO", "    SET n=n+1", "    IF n<3 SIGNAL <AGAIN>", "    WRITE \"n=\",n", "HANDLE <AGAIN>", "    RETRY 5 TIMES", "END DO" ])
+  assertEqual ctx "RETRY n TIMES stops as soon as the body succeeds" r29 (Right "n=3")
+  r30 <- run (T.unlines
+    [ " SET n=0", "DO", "    SET n=n+1", "    IF n<3 SIGNAL <AGAIN>", "    WRITE \"n=\",n", "HANDLE <AGAIN>", "    IF 1 DO", "    . RETRY", "    WRITE \"unreachable\"", "END DO" ])
+  assertEqual ctx "RETRY inside a nested block of the clause unwinds all the way out" r30 (Right "n=3")
+  r31 <- run (T.unlines [ " SET ^_CONFIG(\"retry\",\"max\")=5", " DO", " SIGNAL <X>", " HANDLE <X>", " RETRY", " END DO" ])
+  assertEqual ctx "a plain RETRY that never succeeds hits the configured ceiling"
+    (either (\e -> "RETRY limit reached" `T.isInfixOf` formatError e && "5 times" `T.isInfixOf` formatError e) (const False) r31) True
+  r32 <- run (T.unlines [ " DO", " SIGNAL <X>", " HANDLE <X>", " RETRY", " END DO" ])
+  assertEqual ctx "the default ceiling is 1000"
+    (either (\e -> "1000 times" `T.isInfixOf` formatError e) (const False) r32) True
+  r33 <- run (T.unlines [ " SET ^_CONFIG(\"retry\",\"max\")=3", " SET n=0", " DO", " SET n=n+1", " SIGNAL <X>", " HANDLE <X>", " RETRY 10 TIMES", " WRITE \"n=\",n", " END DO" ])
+  assertEqual ctx "the ceiling also bounds a counted RETRY"
+    (either (\e -> "RETRY limit reached" `T.isInfixOf` formatError e) (const False) r33) True
+
+  r34 <- run " RETRY"
+  assertEqual ctx "RETRY outside any block is a <SYNTAX> error" (isRetryMisuse r34) True
+  r35 <- run (T.unlines [ " DO", " SIGNAL <X>", " CATCH <X>", " RETRY", " END DO" ])
+  assertEqual ctx "RETRY in a CATCH clause is a <SYNTAX> error (only HANDLE retries)" (isRetryMisuse r35) True
+  r36 <- run (T.unlines [ " DO", " RETRY", " HANDLE <X>", " WRITE 1", " END DO" ])
+  assertEqual ctx "RETRY in the body of a block, not in a HANDLE clause, is a <SYNTAX> error" (isRetryMisuse r36) True
+  let Right envRetryer = defineItem "_GLOBAL" "RETRYER" KindFunction (Just []) (T.unlines [ " RETRY", " RETURN 1" ]) adminEnv
+  r37 <- runIn envRetryer (T.unlines [ " DO", " SIGNAL <X>", " HANDLE <X>", " SET v=CALL RETRYER()", " END DO" ])
+  assertEqual ctx "RETRY inside a function called from a HANDLE clause is not lexically in it" (isRetryMisuse r37) True
+  r38 <- run " HANDLE <X>"
+  assertEqual ctx "a stray HANDLE with no block is a <SYNTAX> error" (isSyntaxError r38) True
+
+  -- ---- built-in conditions ----
+  r39 <- run (T.unlines [ "DO", "WRITE 1/0", "CATCH <DIVIDE-BY-ZERO> AS e", "WRITE e(\"dividend\"),\"/\",e(\"divisor\")", "END DO" ])
+  assertEqual ctx "<DIVIDE-BY-ZERO> carries dividend and divisor" r39 (Right "1/0")
+  r40 <- run (T.unlines [ "DO", "WRITE 7#0", "CATCH <DIVIDE-BY-ZERO> AS e", "WRITE e(\"dividend\"),\"/\",e(\"divisor\")", "END DO" ])
+  assertEqual ctx "<DIVIDE-BY-ZERO> from modulo too" r40 (Right "7/0")
+  r41 <- run (T.unlines [ "DO", "WRITE 9\\0", "CATCH <DIVIDE-BY-ZERO>", "WRITE \"idiv\"", "END DO" ])
+  assertEqual ctx "<DIVIDE-BY-ZERO> from integer division too" r41 (Right "idiv")
+  r42 <- run " WRITE 1/0"
+  assertEqual ctx "with no handler present, divide by zero stays the plain error" r42 (Left DivideByZero)
+  r43 <- run (T.unlines [ "DO", "WRITE 1/0", "CATCH <OTHER>", "END DO" ])
+  assertEqual ctx "a handler that does not name it: the built-in condition halts"
+    r43 (Left (Signaled (cond "DIVIDE-BY-ZERO" [("dividend", "1"), ("divisor", "0")])))
+  r44 <- run (T.unlines [ "DO", "WRITE \"a\"", "CATCH <X>", "END DO", "WRITE 1/0" ])
+  assertEqual ctx "after the block ends the handler is gone: plain error again" r44 (Left DivideByZero)
+  r45 <- run (T.unlines [ "DO", "SIGNAL <X>", "CATCH <X>", "END DO", "WRITE 1/0" ])
+  assertEqual ctx "...also after a caught signal" r45 (Left DivideByZero)
+  let Right envDiv = defineItem "_GLOBAL" "DIVIDER" KindFunction (Just []) " RETURN 1/0" adminEnv
+  r46 <- runIn envDiv (T.unlines [ "DO", "WRITE CALL DIVIDER()", "CATCH <DIVIDE-BY-ZERO>", "WRITE \"in callee\"", "END DO" ])
+  assertEqual ctx "a handler applies to everything in its dynamic extent, callees included" r46 (Right "in callee")
+
+  r47 <- run (T.unlines [ "DO", "WRITE nope(1,2)", "CATCH <UNDEFINED> AS e", "WRITE e(\"name\"),\"|\",e(\"path\")", "END DO" ])
+  assertEqual ctx "<UNDEFINED> for a local carries name and path" r47 (Right "nope|1,2")
+  r48 <- run (T.unlines [ "DO", "WRITE ^NOPE(5)", "CATCH <UNDEFINED> AS e", "WRITE e(\"name\"),\"|\",e(\"path\")", "END DO" ])
+  assertEqual ctx "<UNDEFINED> for a global carries name and path" r48 (Right "^NOPE|5")
+  r49 <- run " WRITE nope"
+  assertEqual ctx "with no handler present an undefined variable stays the plain error"
+    (either (\e -> case e of UndefinedVariable _ _ -> True; _ -> False) (const False) r49) True
+  r50 <- run (T.unlines [ "DO", "WRITE $GET(nope,\"dflt\")", "CATCH <UNDEFINED>", "WRITE \"caught\"", "END DO" ])
+  assertEqual ctx "$GET of an undefined variable is not an error, so does not signal" r50 (Right "dflt")
+
+  -- LOCK-TIMEOUT: another job already holds ^A(1)
+  let heldByOther = case acquireLocks "OTHERJOB" [GlobalPath "A" [mkValue "1"]] emptyLockTable of
+        (_, t) -> t
+      envLocked = adminEnv { envLocks = heldByOther }
+  r51 <- runIn envLocked (T.unlines
+    [ "DO", "LOCK +^A(1):7", "CATCH <LOCK-TIMEOUT> AS e", "WRITE e(\"global\"),\"|\",e(\"path\"),\"|\",e(\"timeoutMs\")", "END DO" ])
+  assertEqual ctx "<LOCK-TIMEOUT> when a handler is present: global, path, timeoutMs" r51 (Right "A|1|7")
+  r52 <- runIn envLocked " LOCK +^A(1):7"
+  assertEqual ctx "with no handler a failed LOCK still does not signal" (fmap (const ()) r52) (Right ())
+  r53 <- runIn envLocked (T.unlines [ "DO", "LOCK +^A(2)", "WRITE \"got it\"", "CATCH <LOCK-TIMEOUT>", "WRITE \"timeout\"", "END DO" ])
+  assertEqual ctx "a LOCK that succeeds under a handler does not signal" r53 (Right "got it")
+
+  -- ---- plain blocks are untouched ----
+  r54 <- run (T.unlines [ "DO", "WRITE 1/0", "END DO" ])
+  assertEqual ctx "a block with no clause stays an ordinary block: no handler is present" r54 (Left DivideByZero)
+
+-- --------------------------------------------------------------------
 -- Main
 -- --------------------------------------------------------------------
 
@@ -2268,6 +2756,8 @@ main = do
   runGroup ctx "Phase.Parser" testParserGroup
   runGroup ctx "Phase.Lines" testLinesGroup
   runGroup ctx "Phase.Stmt" testStmtGroup
+  runGroup ctx "EVALUATE / WHEN and END blocks (Part II §5)" testEvaluateGroup
+  runGroup ctx "CONDITION / SIGNAL / HANDLE / CATCH / RETRY (Part III §1)" testConditionsGroup
   runGroup ctx "Phase.Tree" testTreeGroup
   runGroup ctx "Phase.Eval (Expr)" testEvalExprGroup
   runGroup ctx "Phase.Eval (Stmt & Routine)" testEvalStmtGroup

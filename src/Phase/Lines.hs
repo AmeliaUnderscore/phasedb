@@ -60,6 +60,25 @@
 --      could legitimately need to start with, e.g., @\\5@ as real
 --      Phase code.
 --
+--   4. __Explicit @X ... END X@ blocks__ (Part I §5.4, Part II §5,
+--      Part III): @DO ... END DO@ and @EVALUATE ... END EVALUATE@ are
+--      resolved HERE too, into the very same depth numbers dotted
+--      blocks use, so a block is still just "the following lines
+--      that are deeper" and no nested-block AST exists. The two
+--      spellings are alternatives for one thing. A block opener
+--      (a line ending in a bare @DO@, or an @EVALUATE@ header) is
+--      DOTTED when the next line has more dots than it does, which is
+--      exactly the old behaviour; otherwise it is an @END@-style
+--      candidate. Candidates are matched to @END DO@ / @END EVALUATE@
+--      lines with a stack (an @END@ closes the nearest open candidate
+--      of its own kind), and every line strictly between a matched
+--      pair gets one extra level of depth, on top of whatever dots it
+--      carries. The @END@ line keeps its opener's depth. A candidate
+--      that never gets its @END@ is left exactly as it was: a bare
+--      @DO@ with an empty body, as before. Clause lines such as
+--      @WHEN@ simply sit at the body's depth and are told apart from
+--      body statements at run time.
+--
 -- This module's output ('LogicalLine') is what the statement parser
 -- consumes. Nothing past this module should ever look at a leading
 -- dot, a glue marker, or count physical vs. logical lines again,
@@ -68,10 +87,13 @@ module Phase.Lines
   ( LogicalLine (..)
   , buildLogicalLines
   , endsWithBareDo
+  , opensBlock
   , needsContinuation
   ) where
 
 import Data.Char (isAlphaNum, isLetter, toUpper)
+import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -97,9 +119,14 @@ data LogicalLine = LogicalLine
 -- an intermediate "line with unresolved continuation" type that
 -- nothing else needs.
 buildLogicalLines :: Text -> [LogicalLine]
-buildLogicalLines src =
-  let physical = map classify (T.lines src)
-  in joinContinuations physical
+buildLogicalLines = assignBlockDepths . joinedLines
+
+-- | The logical lines BEFORE explicit-block depths are assigned: tags
+-- classified, continuations joined, 'llDepth' still just the dot
+-- count. 'needsContinuation' reads this form, since it must see which
+-- openers are still waiting for their @END@.
+joinedLines :: Text -> [LogicalLine]
+joinedLines src = joinContinuations (map classify (T.lines src))
 
 -- --------------------------------------------------------------------
 -- Step 1: classify each physical line, tag? depth? bare-DO-ending?
@@ -217,7 +244,7 @@ joinContinuations = go Nothing
               -- no line above to join onto).
               go (Just (rlDepth rl, Nothing, rlText rl)) rest
             Just (accDepth, accTag, accText) ->
-              let reachable = if endsWithBareDo accText then accDepth + 1 else accDepth
+              let reachable = if opensBlock accText then accDepth + 1 else accDepth
               in if rlDepth rl > reachable
                    then
                      -- Continuation: join onto the accumulator. Default
@@ -253,8 +280,13 @@ joinContinuations = go Nothing
 -- extracted word to "DO".
 endsWithBareDo :: Text -> Bool
 endsWithBareDo txt =
-  T.takeWhileEnd (\c -> c /= ' ' && c /= '\t') (T.stripEnd txt) == "DO"
-    || endsWithDoWith txt
+  notEndLine txt
+    && (   T.takeWhileEnd (\c -> c /= ' ' && c /= '\t') (T.stripEnd txt) == "DO"
+        || endsWithDoWith txt )
+  where
+    -- An @END DO@ line also ENDS in the word DO, but it closes a
+    -- block, it never opens one.
+    notEndLine = not . isJust . endKind
 
 -- | Does this line end with a @DO WITH @TX(...)@ clause, optionally
 -- followed by an @@BIND(...)@ list (the time-pinned block opener,
@@ -324,6 +356,8 @@ isCommandKeyword kw =
   T.toUpper kw `elem`
     [ "SET", "KILL", "WRITE", "IF", "ELSE", "FOR", "DO", "GOTO"
     , "QUIT", "RETURN", "NEW", "MERGE", "LOCK", "UNLOCK", "END", "NAMESPACE"
+    , "EVALUATE", "WHEN"
+    , "CONDITION", "SIGNAL", "HANDLE", "CATCH", "RETRY"
     ]
 
 -- | Does the current accumulated text need more input before it can
@@ -347,10 +381,107 @@ needsContinuation :: Text -> Bool
 needsContinuation src
   | lastPhysicalLineBlank = False
   | otherwise =
-      case reverse (buildLogicalLines src) of
-        (ll : _) -> endsWithBareDo (llText ll) || llDepth ll > 0
+      case reverse lls of
+        (ll : _) ->
+          opensBlock (llText ll)
+            || llDepth ll > 0
+            || not (null (baUnmatched (analyzeBlocks lls)))
         []       -> False
   where
+    -- The pre-depth form: an @END@-style opener that has not met its
+    -- @END@ yet shows up as "unmatched", which is exactly the REPL's
+    -- cue to keep prompting (handbook Part XIV).
+    lls = joinedLines src
     lastPhysicalLineBlank = case reverse (T.splitOn "\n" src) of
       (l : _ : _) -> T.null (T.strip l)   -- a blank line AFTER some input
       _           -> False
+
+-- --------------------------------------------------------------------
+-- Explicit END blocks
+-- --------------------------------------------------------------------
+
+-- | Does this line's text open a block (of either spelling)? True for a
+-- line ending in a bare @DO@ / @DO WITH @TX(...)@, and for an
+-- @EVALUATE@ header. Whether the block is dotted or @END@-delimited
+-- is decided later by looking at the next line ('analyzeBlocks'); for
+-- continuation purposes ('joinContinuations') both open one extra
+-- level of reachable depth, so a dotted @WHEN@ line under an
+-- @EVALUATE@ is a new statement, not a continuation of the header.
+--
+-- @TRANSACTION@ is the next kind to be added here, one more case in
+-- 'blockOpenerKind' and 'endKind'.
+opensBlock :: Text -> Bool
+opensBlock = isJust . blockOpenerKind
+
+-- | Which kind of block, if any, this line's text opens.
+blockOpenerKind :: Text -> Maybe Text
+blockOpenerKind txt
+  | endsWithBareDo txt             = Just "DO"
+  | startsWithCommand "EVALUATE" txt = Just "EVALUATE"
+  | otherwise                      = Nothing
+
+-- | The kind of block an @END <kind>@ line closes, if this line is
+-- one. Only the kinds 'blockOpenerKind' can produce.
+endKind :: Text -> Maybe Text
+endKind txt =
+  case T.words (T.toUpper (T.strip txt)) of
+    ("END" : kind : _)
+      | kind' <- T.takeWhile isAlphaNum kind
+      , kind' `elem` ["DO", "EVALUATE"] -> Just kind'
+    _ -> Nothing
+
+-- | Is the first word of this line's text exactly @cmd@ (any case),
+-- allowing a glued postcondition (@EVALUATE:cond x@)?
+startsWithCommand :: Text -> Text -> Bool
+startsWithCommand cmd txt =
+  T.toUpper (T.takeWhile isAlphaNum (T.stripStart txt)) == cmd
+    && not (isJust (endKind txt))
+
+-- | How the explicit-@END@ blocks of a list of (pre-depth) logical
+-- lines pair up: matched @(opener index, END index)@ pairs, and the
+-- indices of @END@-style candidates that never found their @END@.
+data BlockAnalysis = BlockAnalysis
+  { baPairs     :: [(Int, Int)]
+  , baUnmatched :: [Int]
+  } deriving (Eq, Show)
+
+-- | Classify every block opener (dotted, or an @END@-style candidate)
+-- and match candidates against @END@ lines with a stack. An @END X@
+-- closes the nearest open candidate of kind X; any candidates above it
+-- on the stack (of other kinds, never closed) are left unmatched. A
+-- stray @END@ with nothing to close is ignored, as it always was.
+analyzeBlocks :: [LogicalLine] -> BlockAnalysis
+analyzeBlocks lls = go [] [] [] (zip3 [0 ..] lls (map Just (drop 1 lls) ++ [Nothing]))
+  where
+    go stack pairs unmatched [] =
+      BlockAnalysis (reverse pairs) (reverse unmatched ++ map fst (reverse stack))
+    go stack pairs unmatched ((i, ll, next) : rest)
+      | Just k <- endKind (llText ll) =
+          case break ((== k) . snd) stack of
+            (above, (o, _) : below) -> go below ((o, i) : pairs) (reverse (map fst above) ++ unmatched) rest
+            (_, [])                 -> go stack pairs unmatched rest
+      | Just k <- blockOpenerKind (llText ll)
+      , not (nextIsDeeper ll next) = go ((i, k) : stack) pairs unmatched rest
+      | otherwise = go stack pairs unmatched rest
+
+    nextIsDeeper ll (Just n) = llDepth n > llDepth ll
+    nextIsDeeper _ Nothing   = False
+
+-- | Give every line strictly inside a matched @END@ pair one extra
+-- level of depth per enclosing pair. Lines outside every pair, and
+-- the @END@ lines themselves, are unchanged.
+assignBlockDepths :: [LogicalLine] -> [LogicalLine]
+assignBlockDepths lls
+  | null pairs = lls
+  | otherwise  = go (0 :: Int) (zip [0 ..] lls)
+  where
+    pairs  = baPairs (analyzeBlocks lls)
+    opens  = Set.fromList (map fst pairs)
+    closes = Set.fromList (map snd pairs)
+
+    go _ [] = []
+    go cur ((i, ll) : rest) =
+      let cur'  = if i `Set.member` closes then cur - 1 else cur
+          ll'   = ll { llDepth = llDepth ll + cur' }
+          cur'' = if i `Set.member` opens then cur' + 1 else cur'
+      in ll' : go cur'' rest

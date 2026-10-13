@@ -49,6 +49,7 @@ module Phase.Parser
   , pPinSpec
   , pIdentifier
   , pNamespaceIdentifier
+  , pCompareBinOp
   , parseExpr
   , caseInsensitiveKeywordString
   ) where
@@ -139,21 +140,35 @@ pCompare = chainl1' pConcat compareOp
     -- Tried BEFORE the bare '<'/'>' forms since they share a prefix,
     -- 'char' would otherwise consume the '<' or '>' alone and leave a
     -- dangling '=' to confuse the next operand.
-    compareOp =
-          try (BinExpr NotSortsAfter <$ string "']]")
-      <|> try (BinExpr SortsAfter    <$ string "]]")
-      <|> try (BinExpr NotEq         <$ string "'=")
-      <|> try (BinExpr NotLt         <$ string "'<")
-      <|> try (BinExpr NotGt         <$ string "'>")
-      <|> try (BinExpr NotContains   <$ string "'[")
-      <|> try (BinExpr NotMatch      <$ string "'?")
-      <|> try (BinExpr NotLt         <$ string ">=")
-      <|> try (BinExpr NotGt         <$ string "<=")
-      <|>     (BinExpr Eq            <$ char '=')
-      <|>     (BinExpr Lt            <$ char '<')
-      <|>     (BinExpr Gt            <$ char '>')
-      <|>     (BinExpr Contains      <$ char '[')
-      <|>     (BinExpr Match         <$ char '?')
+    compareOp = BinExpr <$> pCompareBinOp
+
+-- | The comparison / contains / sorts-after / pattern-match operator
+-- tokens, each with its @'@-negated form, as a bare 'BinOp'. This is
+-- the single place those tokens are spelled: 'pCompare' wraps it as an
+-- infix operator, and "Phase.Stmt" reuses it for the operator-only
+-- @WHEN >500@ / @WHEN '=x@ tests of @EVALUATE@ (Part II §5), so the two
+-- can never disagree about which operators exist.
+--
+-- Order matters: longer operators must be tried before their shorter
+-- prefixes ('>=' before '>'), and the @'@ prefix forms are only ever
+-- tried as a full two-character token, so a unary-NOT @'@ (which
+-- "pUnary" owns) never gets consumed here.
+pCompareBinOp :: PParser BinOp
+pCompareBinOp =
+      try (NotSortsAfter <$ string "']]")
+  <|> try (SortsAfter    <$ string "]]")
+  <|> try (NotEq         <$ string "'=")
+  <|> try (NotLt         <$ string "'<")
+  <|> try (NotGt         <$ string "'>")
+  <|> try (NotContains   <$ string "'[")
+  <|> try (NotMatch      <$ string "'?")
+  <|> try (NotLt         <$ string ">=")
+  <|> try (NotGt         <$ string "<=")
+  <|>     (Eq            <$ char '=')
+  <|>     (Lt            <$ char '<')
+  <|>     (Gt            <$ char '>')
+  <|>     (Contains      <$ char '[')
+  <|>     (Match         <$ char '?')
 
 -- --------------------------------------------------------------------
 -- Level 3: _ (string concatenation). Left-associative.

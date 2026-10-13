@@ -498,7 +498,7 @@ implemented yet.
 | `CONDITION`                          | `CONDITION <NAME>(field1, field2, ...)` (Part III §1)                                                                                                                  |
 | `SIGNAL`                             | `SIGNAL <NAME>(field: expr, ...)` (Part III §1)                                                                                                                        |
 | `HANDLE` / `CATCH`                   | Clause headers inside `DO...END DO` / `TRANSACTION...END TRANSACTION` (Part III)                                                                                       |
-| `RETRY`                              | Bare `RETRY`; `RETRY WITH field=expr,...` (Part III §1)                                                                                                                |
+| `RETRY`                              | Bare `RETRY`; `RETRY [n TIMES] [WITH field=expr,...]` (Part III §1)                                                                                                                |
 | `EVALUATE` / `WHEN` / `END EVALUATE` | Part II §5                                                                                                                                                             |
 | `DEFINE MACRO` / `DROP MACRO`        | Part VI §2                                                                                                                                                             |
 | `MERGE`                              | `MERGE t=s`; `MERGE t1=s1,t2=s2,...`; `MERGE:postcondition t=s` (Part X §1)                                                                                            |
@@ -668,6 +668,35 @@ END EVALUATE
 If nothing matches, and no `OTHER` clause exists, `EVALUATE` falls
 through with no error. This matches COBOL's own permissive behavior.
 
+**Implementation note: how `EVALUATE` runs.** Phase gives it the same
+two spellings as `DO`: the `END EVALUATE` form shown above, and a dotted
+form in which the `WHEN` lines are the dotted lines under the header.
+Both end up as the same thing in the engine: the clauses are the lines
+one level deeper than the header (`Phase.Lines` assigns that depth to an
+`END`-delimited body), and `EVALUATE` runs them in place, not as a
+sub-routine. The consequences:
+
+- Every subject is evaluated once. Clauses are tried top to bottom and
+  the first match wins, with no fall-through, so a `WHEN OTHER` placed
+  above other clauses shadows them. A `WHERE` guard is only evaluated
+  after every test of its clause has held.
+- `EVALUATE` is not a scope. A `QUIT`, `RETURN` or `GOTO` in a clause
+  body leaves the enclosing routine. (A `WHEN ... DO` clause with a
+  dotted body is an ordinary dotted `DO` for that inner body only.)
+- `TRUE` is recognized as the chain subject in the `EVALUATE` header and
+  as the literal `1` in a `WHEN`; Phase has no `TRUE` literal elsewhere.
+  Against a `TRUE` subject a plain `WHEN expr` matches when `expr` is
+  true; against any other subject it matches when the subject equals
+  `expr`.
+- A `WHEN` takes no postcondition (§8). `EVALUATE` and `END EVALUATE`
+  accept one. A `WHEN` with a different number of tests than the header
+  has subjects is a `<SYNTAX>` error when reached, as is a `WHEN` with no
+  `EVALUATE` above it.
+- Explicit `DO ... END DO` works the same way: a bare `DO` whose next
+  line is not deeper is the start of an `END`-delimited body. A bare
+  `DO` that never meets an `END DO` stays the empty bare `DO` it has
+  always been, and an `END DO` closes the nearest open `DO`.
+
 **Implementation note: path-shape `WHEN` clauses are not implemented.**
 The design document describes a fourth `WHEN` mode. That mode would
 destructure a subscript-path value by segment count and wildcard (`WHEN
@@ -739,6 +768,13 @@ reference `c`. Phase then seeds each field as an ordinary local for the
 next pass. `RETRY` used outside any `HANDLE` clause is a runtime
 `<SYNTAX>` error.
 
+**`RETRY n TIMES [WITH ...]`** (also `RETRY 1 TIME`) is a bounded retry: it
+only re-enters the block while the block has been re-entered fewer than
+`n` times so far. Once the `n` re-entries are used up, `RETRY` does
+nothing and the handler body carries on with the statement after it, so
+fallback code can follow it. `n` is an ordinary expression. `RETRY 2
+TIMES` therefore lets the body run three times in all.
+
 ### 1.1 Built-in conditions
 
 **Implementation note.** `ConditionRegistry` does **not** pre-register any
@@ -754,7 +790,7 @@ fields the interpreter signals internally:
 | `<LOCK-TIMEOUT>`       | `global`, `path`, `timeoutMs`                   | A `LOCK` fails to acquire, **and** at least one enclosing `HANDLE`/`CATCH` exists. With no handler present, `LOCK` keeps its plain boolean-return behavior; no signal fires. |
 | `<UNDEFINED>`          | `name`, `path`                                  | Code reads an undefined local or global, **only when a handler is present**.                                                                                                 |
 | `<DIVIDE-BY-ZERO>`     | `dividend`, `divisor`                           | `/`, `\`, or `#` divides by zero, **only when a handler is present**. Otherwise, the plain `<DIVIDE BY ZERO>` error propagates instead.                                      |
-| `<INDEX-BUILD-FAILED>` | `indexName`, `globalName`, `reason`, `lastPath` | An index backfill or rebuild fails, or `$INDEXLOOKUP` queries an index that is not `READY` (Part IX).                                                                        |
+| `<INDEX-BUILD-FAILED>` | `indexName`, `globalName`, `reason`, `lastPath` | *Deprecated with secondary indexing; this engine never raises it.* An index backfill or rebuild fails, or `$INDEXLOOKUP` queries an index that is not `READY` (Part IX).                                                                        |
 
 **Implementation note.** `<TRAVERSAL-LIMIT>` (Part VIII) is a condition in
 concept. Phase currently raises it as a **plain `MRuntimeException`**
@@ -768,6 +804,58 @@ stack propagates outward. Phase promotes it into an ordinary halting
 error, exactly like an uncaught runtime exception. This is what makes the
 whole mechanism strictly additive: code that never uses `HANDLE`/`CATCH`
 behaves exactly as if the condition system did not exist.
+
+**Implementation note: how handled blocks run.** `HANDLE`/`CATCH` apply to
+`DO ... END DO` blocks and to dotted `DO` blocks (including `FOR` and `DO
+WITH` bodies), which is every block there is until `TRANSACTION` exists.
+A block takes part only if it has a clause of its own; every other block
+is an ordinary block. The clause heads are the lines at the block's own
+depth that start with `HANDLE`/`CATCH`: everything before the first one is
+the body, and each clause's body is the rest of its head's line plus the
+lines up to the next head. The consequences:
+
+- **Each top-level line of the body is atomic.** When a condition is
+  caught, the state is rolled back to the start of the line that raised
+  it: everything earlier lines did (locals, committed writes, output)
+  stays, and everything that line did is dropped. A line with a dotted
+  body, such as a `FOR`, is one line, so a `FOR` that raises on its third
+  pass is undone as a whole. Put the `HANDLE` inside the loop body if you
+  want per-iteration handling.
+- **`RETRY` re-runs the body on the state the handler left behind**, not on
+  the state at block entry. Earlier passes are not undone. (A `TRANSACTION`
+  block will add that.) `RETRY n TIMES` is counted per block entry and
+  shared by every `RETRY` in it.
+- **A plain `RETRY` has a ceiling**, so a handler that retries an error
+  that never goes away cannot loop forever. It is read from
+  `^_CONFIG("retry","max")` (default 1000) and also caps `RETRY n TIMES`.
+  Reaching it is an ordinary halting error, not a condition.
+- **Clauses run outside their own block's handler scope.** A signal raised
+  by a clause goes to the handlers outside the block, never to its
+  sibling clauses. `RETRY` is legal only in the body of a `HANDLE` clause,
+  lexically: not in a `CATCH` body, not in the block's body, and not in a
+  routine that a `HANDLE` body calls.
+- **The `AS` binding is optional** and is cleared before each new
+  condition is bound, so a field of an earlier condition cannot be read as
+  part of this one. A `message` field supplied to `SIGNAL` takes
+  precedence over the generated one.
+- **A handler is present** for the whole dynamic extent of a block's body,
+  callees included, and not after the block ends or while its clauses run.
+  `<DIVIDE-BY-ZERO>` and `<LOCK-TIMEOUT>` are signalled at their own sites
+  only then. `<UNDEFINED>` is made from the undefined-variable error by the
+  block that catches it, with `name` as written (a global keeps its `^`)
+  and `path` as the subscripts joined by commas. A built-in condition that
+  no clause names halts as `<DIVIDE-BY-ZERO> dividend=1, divisor=0`, not as
+  the plain `<DIVIDE BY ZERO>`.
+- **`CONDITION` declarations are per routine.** They are collected when the
+  routine starts, wherever they appear in it. A declared condition's
+  `SIGNAL` may only name its declared fields; any other field is a
+  `<SYNTAX>` error, which condition handlers do not catch. A callee is not
+  bound by its caller's declarations.
+- **Only conditions are caught.** `HANDLE`/`CATCH` never see plain errors
+  (`<PERMISSION DENIED>`, `<SYNTAX>`, and so on), `<ANYTHING>` included.
+- `<CONFLICT>` is not raised yet, because `TRANSACTION` and `EXPECTING` do
+  not exist. `<INDEX-BUILD-FAILED>` will not be, secondary indexing being
+  deprecated.
 
 ## 2. `TRANSACTION` blocks
 

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+* Feature: `CONDITION`, `SIGNAL`, `HANDLE`, `CATCH` and `RETRY` (Part III
+  §1) on `DO ... END DO` and dotted `DO` blocks. A caught signal rolls the
+  state back to the start of the failing top-level line of the block;
+  earlier lines' effects stay. `<DIVIDE-BY-ZERO>`, `<UNDEFINED>` and
+  `<LOCK-TIMEOUT>` are signalled only while a handler is present.
+  `<CONFLICT>` waits for `TRANSACTION`; `<INDEX-BUILD-FAILED>` is not
+  raised (secondary indexing is deprecated).
+* Extension: `RETRY n TIMES` / `RETRY 1 TIME` (optionally with `WITH`), a
+  bounded retry that falls through to the rest of the handler once used
+  up. Every `RETRY` is capped by `^_CONFIG("retry","max")` (default 1000).
+* HANDLE, CATCH, CONDITION, SIGNAL and RETRY are now recognized command
+  words at column 0, and `SIGNAL` and `RETRY` joined the keywords that
+  stop a bare `QUIT`/`DO` argument.
+* Feature: `EVALUATE ... WHEN ... END EVALUATE` (Part II §5): switch mode,
+  condition-chain mode (`EVALUATE TRUE`), multi-subject `ALSO`, `ANY`,
+  bare-operator tests (`WHEN >500`, `WHEN '=x`), `WHERE` guards and
+  `WHEN OTHER`. It runs in place, so it is not a scope: `QUIT`, `RETURN`
+  and `GOTO` in a clause leave the enclosing routine. The path-shape
+  clause stays deferred.
+* Feature: explicit `X ... END X` blocks are resolved in `Phase.Lines`
+  into the same depth numbers dotted blocks use (`DO ... END DO`,
+  `EVALUATE ... END EVALUATE`), so no nested-block AST was needed. A
+  block opener is dotted when the next line is deeper, otherwise an
+  `END`-style candidate matched by a stack; a candidate with no `END` is
+  left as the old empty bare `DO`. Dotted `EVALUATE` works too, and so
+  will any later block kind (`TRANSACTION`). `END DO` is no longer
+  counted as a block opener, and the REPL keeps prompting until an open
+  `END`-style block is closed.
+* `EVALUATE` and `WHEN` are now recognized command words at column 0
+  (previously classified as tags).
+* Refactor: the comparison-operator tokens are one parser
+  (`Phase.Parser.pCompareBinOp`), shared by infix comparison and by
+  `WHEN` operator tests.
 * Fix: `GOTO` was a silent no-op (`evalStmt (SGoto _)` returned
   `NextStmt`). Same-routine `GOTO TAG` now jumps via `JumpTo`;
   `GOTO TAG^NAMESPACE` transfers into that Catalog item and ends the
@@ -299,6 +332,6 @@
   from a real file, staged-write loss, `seLive` leak, last-admin demotion).
   395 -> 408 tests, all passing under `ghc --make` (GHC 9.4.7).
 
-## 0.1.0.0 -- YYYY-mm-dd
+## 0.1.0.0 -- 2026-08-02
 
 * First version. Released on an unsuspecting world.

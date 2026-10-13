@@ -40,6 +40,8 @@ module Phase.AST
   , WriteItem (..)
   , LockSpec (..)
   , ForSpec (..)
+  , EvalSubject (..)
+  , WhenTest (..)
   , PredStmt (..)
   , Line (..)
   ) where
@@ -357,12 +359,52 @@ data Stmt
     -- evaluation-time concern (walking the flat line list and
     -- tracking a stack of open blocks), not something this AST shape
     -- needs to encode.
+  | SEvaluate ![EvalSubject]
+    -- ^ @EVALUATE subject [ALSO subject]...@ (Part II §5), the header
+    -- line of an @EVALUATE ... END EVALUATE@ block (or of a dotted
+    -- one: the @WHEN@ lines are simply the deeper lines after it, see
+    -- 'Phase.Lines'). Like every block opener it holds no body: the
+    -- @WHEN@ clauses are the following lines one level deeper, found
+    -- and run by 'Phase.Eval' from the flat line list.
+  | SWhen ![WhenTest] !(Maybe Expr)
+    -- ^ @WHEN test [ALSO test]... [WHERE guard]@, the head of a clause
+    -- line. One test per subject of the enclosing 'SEvaluate'. The
+    -- clause's body is the REST of the same line's statements (its
+    -- remaining 'PredStmt's), not part of this constructor. A clause
+    -- accepts no postcondition (§8).
+  | SWhenOther
+    -- ^ @WHEN OTHER@: matches when no earlier clause did.
+  | SEndEvaluate
+    -- ^ Closes an explicit @EVALUATE ... END EVALUATE@ block. A no-op
+    -- at run time, exactly like 'SEndDo': 'Phase.Lines' already used
+    -- it to give the clause lines their depth.
+  | SCondition !Text ![Text]
+    -- ^ @CONDITION <NAME>(field, ...)@ (Part III §1): declares a
+    -- condition's field list. A no-op at run time; 'Phase.Eval' only
+    -- uses the declarations to reject an undeclared @SIGNAL@ field.
+    -- Accepts no postcondition (§8).
+  | SSignal !Text ![(Text, Expr)]
+    -- ^ @SIGNAL <NAME>(field: expr, ...)@: raise a condition. The
+    -- name is stored upper-cased, without the angle brackets.
+  | SHandle !Text !(Maybe Text)
+    -- ^ @HANDLE <NAME> [AS binding]@: the head of a retry-capable
+    -- handler clause. Like 'SWhen', the clause's body is the rest of
+    -- its line plus the lines that follow it, up to the next clause
+    -- of the same block. Accepts no postcondition (§8).
+  | SCatch !Text !(Maybe Text)
+    -- ^ @CATCH <NAME> [AS binding]@: the ordinary run-once clause.
+    -- Name @ANYTHING@ is the catch-all.
+  | SRetry !(Maybe Expr) ![(Text, Expr)]
+    -- ^ @RETRY [n TIMES] [WITH field=expr, ...]@. With a count, the
+    -- retry only happens while the block has been re-entered fewer
+    -- than @n@ times so far; past that, @RETRY@ does nothing and the
+    -- handler body carries on after it.
   | SNamespace !Text                         -- ^ NAMESPACE <name> (Part V namespace directive)
   | SExpr Expr                               -- ^ bare expression statement (Part XIV REPL toplevel)
   | SUnsupported Text Text
     -- ^ Anything recognized as "this is clearly an attempted
     -- statement" but not yet implemented by this port, MACLIB,
-    -- EVALUATE/WHEN, TRANSACTION, NAMESPACE, EDGE, INDEX,
+    -- TRANSACTION, NAMESPACE, EDGE, INDEX,
     -- CONDITION/SIGNAL/HANDLE/CATCH/RETRY, EXPECTING and
     -- reference-parameter forms of SET/DO, and BLOBSAVE/BLOBMETA all
     -- land here for now. Per the handbook's own §9: this is
@@ -378,6 +420,38 @@ data Stmt
     -- hunt for what specifically wasn't handled. The second is the
     -- full original statement text, kept for context in case a
     -- diagnostic wants to show the whole line too.
+  deriving (Eq, Show)
+
+-- | One subject of an @EVALUATE@ header (Part II §5).
+--
+-- 'SubjectTrue' is the bare word @TRUE@: the condition-chain mode, in
+-- which every plain @WHEN expr@ is its own boolean expression and
+-- matches when @expr@ is true. Phase has no @TRUE@ literal outside
+-- this position, so it is recognized here by the parser rather than
+-- read as an (undefined) local named @TRUE@. Any other subject is an
+-- ordinary expression, evaluated ONCE when the @EVALUATE@ runs.
+data EvalSubject
+  = SubjectTrue
+  | SubjectExpr !Expr
+  deriving (Eq, Show)
+
+-- | One position's test in a @WHEN@ clause (Part II §5). The handbook
+-- names exactly these three shapes ('Stmt.WhenTest' in the Java
+-- implementation); the deferred path-shape clause would be a fourth
+-- constructor here.
+--
+--   * 'ValueTest': @WHEN expr@. Against an ordinary subject it means
+--     "the subject equals @expr@" (Phase's @=@). Against 'SubjectTrue'
+--     it means "@expr@ is true". The bare word @TRUE@ inside a @WHEN@
+--     parses as the literal @1@, so @WHEN TRUE@ always matches in
+--     chain mode.
+--   * 'CompareTest': a bare comparison operator and its right-hand
+--     side, @WHEN >500@ / @WHEN '=x@: "the subject @op@ @expr@".
+--   * 'AnyTest': @ANY@, always matches.
+data WhenTest
+  = ValueTest !Expr
+  | CompareTest !BinOp !Expr
+  | AnyTest
   deriving (Eq, Show)
 
 -- | An argument to a function or routine invocation ('DO' / 'CALL').

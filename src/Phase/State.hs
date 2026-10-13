@@ -8,6 +8,9 @@
 module Phase.State
   ( -- * Error Handling
     EvalError (..)
+  , Condition (..)
+  , conditionMessage
+  , retryLimit
   , formatError
 
     -- * Call Frames & State
@@ -130,7 +133,31 @@ data EvalError
   -- bind. A nested bind list must be a subset of the one around it; the
   -- only block that may bind any global is one with no enclosing bind
   -- list at all (docs/tx-pinning-design.md, "Explicit global bindings").
+  | Signaled !Condition
+  -- ^ A condition raised by @SIGNAL@ (or by a built-in that signals
+  -- while a handler is active, Part III §1.1). Travels as an ordinary
+  -- error until a @HANDLE@/@CATCH@ clause claims it; with none, it
+  -- halts like any other error (Part III §1.2).
   deriving (Eq, Show)
+
+-- | A raised condition (Part III §1): its name, upper-cased and without
+-- the angle brackets (@"DIVIDE-BY-ZERO"@, @"CONFLICT"@, a user's
+-- @"OOPS"@), and its fields in the order they were supplied.
+data Condition = Condition
+  { condName   :: !Text
+  , condFields :: ![(Text, PValue)]
+  } deriving (Eq, Show)
+
+-- | The automatic @message@ field every condition has: its name and
+-- fields as one human-readable line, @<NAME> f1=v1, f2=v2@. A field
+-- literally named @message@ that the signaller supplied wins over this
+-- (it is the more specific text), see 'Phase.Eval''s handler binding.
+conditionMessage :: Condition -> Text
+conditionMessage c =
+  "<" <> condName c <> ">"
+    <> (if null (condFields c)
+          then ""
+          else " " <> T.intercalate ", " [k <> "=" <> unPValue v | (k, v) <- condFields c])
 
 -- | Format an error according to Phase's error convention (<ERROR_NAME>).
 formatError :: EvalError -> Text
@@ -169,6 +196,10 @@ formatError NakedReference =
   "<NAKED> no global reference has been established yet"
 formatError (BindScope name) =
   "<BIND SCOPE> ^" <> name <> " is not bound by the enclosing DO WITH / CALL WITH"
+formatError (Signaled c) =
+  case lookup "message" (condFields c) of
+    Just m  -> "<" <> condName c <> "> " <> unPValue m
+    Nothing -> conditionMessage c
 
 -- --------------------------------------------------------------------
 -- Call Frames
@@ -259,6 +290,32 @@ data Env = Env
                                         -- subscript list. 'Nothing' until the first such
                                         -- reference; a naked reference itself does not
                                         -- change it. See 'Phase.Eval.resolveNakedRef'.
+  , envHandlerDepth     :: !Int
+    -- ^ How many 'Phase.Eval.runHandledBlock' bodies are active in the
+    -- CURRENT call stack (dynamic, not lexical: a routine called from
+    -- inside a handled block sees it). Above zero means "a handler is
+    -- present" for the built-ins whose signalling is conditional on one
+    -- (Part III §1.1).
+  , envCaught           :: !(Maybe Condition)
+    -- ^ Set by the per-line guard of a handled block when it catches a
+    -- signal, and read-and-cleared by that block's runner right after
+    -- the body stops. Never set outside that handshake.
+  , envRetry            :: !(Maybe [(Text, PValue)])
+    -- ^ A @RETRY@ that has been requested and is unwinding to its
+    -- block: the already-evaluated @WITH@ seeds. Set by @RETRY@,
+    -- noticed by every block level on the way out, cleared by the
+    -- runner of the block being re-entered.
+  , envInHandle         :: !Bool
+    -- ^ Is the statement being run lexically inside a @HANDLE@ clause
+    -- body? @RETRY@ anywhere else is a @<SYNTAX>@ error.
+  , envRetryCount       :: !Int
+    -- ^ How many times the innermost handled block has been
+    -- re-entered so far; what @RETRY n TIMES@ compares against.
+  , envConditionDecls   :: !(Map Text [Text])
+    -- ^ The @CONDITION <NAME>(fields)@ declarations of the routine
+    -- being run (collected up front, so a declaration may appear after
+    -- its first @SIGNAL@ in the source, as a compile-time registry
+    -- would allow). Used only to reject an undeclared @SIGNAL@ field.
   } deriving (Eq, Show)
 
 -- | Create an initial, empty execution environment.
@@ -313,7 +370,24 @@ initEnvWithStorage storage = Env
   , envPinOverrides     = Map.empty
   , envBindScope        = Nothing
   , envLastGlobalRef    = Nothing
+  , envHandlerDepth     = 0
+  , envCaught           = Nothing
+  , envRetry            = Nothing
+  , envInHandle         = False
+  , envRetryCount       = 0
+  , envConditionDecls   = Map.empty
   }
+
+-- | The ceiling on how many times one handled block may be re-entered by
+-- RETRY, a guard against a handler that retries forever on an error that
+-- never goes away. Read from @^_CONFIG("retry","max")@, an ordinary
+-- global like the checkpoint thresholds (so it is set with Phase's own
+-- SET, by an administrator); 1000 when unset or not a positive integer.
+retryLimit :: Env -> Int
+retryLimit env =
+  case readLive "_CONFIG" [mkValue "retry", mkValue "max"] (envStorage env) of
+    Right v | [(n, "")] <- reads (T.unpack (unPValue v)), n > 0 -> n
+    _                                                           -> 1000
 
 -- --------------------------------------------------------------------
 -- Variable & Storage Access
