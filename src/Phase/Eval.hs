@@ -147,6 +147,14 @@ modifyEnvE f = Eval $ \env -> pure $ case f env of
   Left err   -> Left err
   Right env' -> Right ((), env')
 
+-- | Like 'modifyEnv', but for 'appendOutput' which now returns
+-- 'OutputResult' instead of a plain 'Env' (so it can signal the output
+-- limit being exceeded without adding IO to 'Phase.State').
+modifyEnvOutput :: (Env -> OutputResult) -> Eval ()
+modifyEnvOutput f = Eval $ \env -> pure $ case f env of
+  OutputLimitHit -> Left OutputLimitExceeded
+  OutputOk env'  -> Right ((), env')
+
 throwError :: EvalError -> Eval a
 throwError err = Eval $ \_ -> pure (Left err)
 
@@ -902,13 +910,13 @@ evalStmt (SWrite items) _ _ = do
     case item of
       Left expr -> do
         val <- evalExpr expr
-        modifyEnv (appendOutput (unPValue val))
+        modifyEnvOutput (appendOutput (unPValue val))
       Right WNewline ->
-        modifyEnv (appendOutput "\n")
+        modifyEnvOutput (appendOutput "\n")
       Right WFormFeed ->
-        modifyEnv (appendOutput "\f")
+        modifyEnvOutput (appendOutput "\f")
       Right (WTabTo col) ->
-        modifyEnv (appendOutput (T.replicate col " "))
+        modifyEnvOutput (appendOutput (T.replicate col " "))
   pure NextStmt
 
 evalStmt (SIf conds) _ _ = do

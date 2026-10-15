@@ -74,6 +74,7 @@ module Phase.Auth
 import qualified Crypto.Hash.Algorithms as Hash
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import qualified Crypto.Random.Entropy as Entropy
+import Data.ByteArray (constEq)
 import Data.ByteArray.Encoding (Base (Base16), convertFromBase, convertToBase)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -166,9 +167,17 @@ hashPassword password saltHex =
 -- pair. Recomputes the hash from the attempt and the STORED salt,
 -- then compares, never decrypts or reverses anything, since PBKDF2
 -- is one-way by design.
+--
+-- Uses 'Data.ByteArray.constEq' (from the @memory@ package, already a
+-- dependency) for the final comparison so that the response time does
+-- not leak whether the candidate was "close" to the real hash.  The
+-- @memory@ package is already listed in @phasedb-hs.cabal@ for its
+-- encoding helpers; no new dependency is introduced.
 verifyPassword :: Text -> Text -> Text -> Bool
 verifyPassword attempt storedSalt storedHash =
-  hashPassword attempt storedSalt == storedHash
+  let candidate = TE.encodeUtf8 (hashPassword attempt storedSalt)
+      stored    = TE.encodeUtf8 storedHash
+  in constEq candidate stored
 
 decodeHex :: Text -> Maybe BS.ByteString
 decodeHex t =

@@ -47,6 +47,7 @@ module Phase.State
   , appendOutput
   , getOutputText
   , clearOutput
+  , OutputResult (..)
   ) where
 
 import Control.Monad (mplus)
@@ -57,6 +58,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.ByteString as BS
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 
@@ -138,6 +141,11 @@ data EvalError
   -- while a handler is active, Part III §1.1). Travels as an ordinary
   -- error until a @HANDLE@/@CATCH@ clause claims it; with none, it
   -- halts like any other error (Part III §1.2).
+  | OutputLimitExceeded
+  -- ^ 'appendOutput' was called when the total buffered output already
+  -- equalled or exceeded 'envMaxOutputBytes'.  Raised instead of the
+  -- @OUTPUT LIMIT@ error code described in the HTTP spec (§4.1); the
+  -- server maps this constructor to that code.
   deriving (Eq, Show)
 
 -- | A raised condition (Part III §1): its name, upper-cased and without
@@ -200,6 +208,8 @@ formatError (Signaled c) =
   case lookup "message" (condFields c) of
     Just m  -> "<" <> condName c <> "> " <> unPValue m
     Nothing -> conditionMessage c
+formatError OutputLimitExceeded =
+  "<OUTPUT LIMIT> maximum output size exceeded"
 
 -- --------------------------------------------------------------------
 -- Call Frames
@@ -229,6 +239,18 @@ data Env = Env
   , envFrames           :: ![Frame]
   , envTest             :: !Bool       -- ^ Current value of $TEST (last IF or postcondition)
   , envOutput           :: ![Text]     -- ^ Buffer of output strings from WRITE
+  , envMaxOutputBytes   :: !(Maybe Int)
+    -- ^ Optional cap on total output. When set, 'appendOutput' raises
+    -- 'OutputLimitExceeded' instead of growing the buffer past this many
+    -- UTF-8 bytes. 'Nothing' = unlimited (REPL default). The HTTP server
+    -- sets this per request from the @maxOutputBytes@ config value.
+  , envFileIOEnabled    :: !Bool
+    -- ^ Whether Phase statements that perform host-filesystem I/O
+    -- (BLOBSAVE, $BLOBWRITE with a path, etc.) are permitted. 'True'
+    -- for the REPL; 'False' for API sessions (§6.5 of the HTTP spec).
+    -- Not yet enforced by any built-in (the blob store does not exist),
+    -- but the field is here so the server can set it 'False' and future
+    -- blob work does not need to touch 'Env' at all.
   , envRoutines         :: !(Map (Maybe Text) [Line]) -- ^ Loaded routines (Nothing = current script)
   , envCurrentRoutine   :: !(Maybe Text)
   , envCurrentNamespace :: !Text       -- ^ Active namespace (defaults to "_GLOBAL", Part V)
@@ -358,6 +380,8 @@ initEnvWithStorage storage = Env
   , envFrames           = []
   , envTest             = True
   , envOutput           = []
+  , envMaxOutputBytes   = Nothing
+  , envFileIOEnabled    = True
   , envRoutines         = Map.empty
   , envCurrentRoutine   = Nothing
   , envCurrentNamespace = "_GLOBAL"
@@ -852,9 +876,28 @@ popFrame env =
 -- Output Handling
 -- --------------------------------------------------------------------
 
+-- | Result of 'appendOutput': either the updated 'Env', or the error
+-- that the output limit was exceeded.  Using a dedicated type instead
+-- of @Either EvalError Env@ avoids pulling the full 'EvalError' type
+-- into callers that only care about the success case.
+data OutputResult = OutputOk !Env | OutputLimitHit
+
 -- | Append a string fragment to the environment's output buffer.
-appendOutput :: Text -> Env -> Env
-appendOutput txt env = env { envOutput = envOutput env ++ [txt] }
+--
+-- When 'envMaxOutputBytes' is set and the current buffer already
+-- equals or exceeds the limit, returns 'OutputLimitHit' without
+-- modifying the environment.  The caller ('Phase.Eval') is responsible
+-- for turning this into an 'OutputLimitExceeded' error.
+appendOutput :: Text -> Env -> OutputResult
+appendOutput txt env =
+  case envMaxOutputBytes env of
+    Nothing -> OutputOk env { envOutput = envOutput env ++ [txt] }
+    Just cap ->
+      let used  = sum (map (BS.length . TE.encodeUtf8) (envOutput env))
+          added = BS.length (TE.encodeUtf8 txt)
+      in if used + added > cap
+           then OutputLimitHit
+           else OutputOk env { envOutput = envOutput env ++ [txt] }
 
 -- | Retrieve all accumulated output as a single Text.
 getOutputText :: Env -> Text

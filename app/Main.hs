@@ -34,9 +34,11 @@ import Phase.Lines (LogicalLine (..), buildLogicalLines, needsContinuation)
 import Phase.State (Env (..), clearOutput, formatError, getOutputText, initEnv, writeRef)
 import Phase.Storage.Engine
   ( StorageEngine (..)
+  , acquireDbLock
   , compactTo
   , flushPendingWal
   , openStorageEngine
+  , releaseDbLock
   , takeCheckpoint
   )
 import Phase.Stmt (parseLogicalLine)
@@ -153,37 +155,50 @@ main = do
                  (p : _) -> p
                  []      -> "phase.db"
   putStrLn $ infoMsg "PhaseDB" ++ "  database: " ++ dimMsg dbPath
-  engResult <- openStorageEngine dbPath
-  histFile <- (++ "/.phasedb_history") <$> getHomeDirectory
-  let settings = (defaultSettings :: Settings IO)
-        { historyFile    = Just histFile
-        , autoAddHistory = False       -- we add manually for fine-grained control
-        , complete       = completeWord Nothing " \t" replCompletion
-        }
-  case engResult of
-    Left err -> do
-      -- Refuse to continue. Starting "fresh" here would keep
-      -- 'seWalPath' pointed at the damaged or foreign file, and the
-      -- first commit would append into it.
-      hPutStrLn stderr $ "Error: could not open " ++ dbPath ++ ": " ++ show err
-      hPutStrLn stderr "The file has not been modified. Restore a backup, or move it aside to start a new database."
+  -- Acquire the cross-process exclusive file lock (§9.5 of the HTTP
+  -- spec) BEFORE opening the database. If another process (e.g.
+  -- phasedb-server) already holds it, we refuse to start so neither
+  -- process can corrupt the WAL by appending concurrently.
+  mLock <- acquireDbLock dbPath
+  case mLock of
+    Nothing -> do
+      hPutStrLn stderr $ "Error: " ++ dbPath ++ " is locked by another process."
+      hPutStrLn stderr "Stop the other phasedb or phasedb-server process first."
       exitFailure
-    Right eng -> do
-      putStrLn $ "Loaded " ++ show (seLastTx eng) ++ " transactions from " ++ dimMsg dbPath
-      runInputT settings $ do
-        -- Bootstrap whenever the database has NO admin account yet, not
-        -- only when the file itself is brand new: an existing file that
-        -- somehow ended up with zero users (created empty by some other
-        -- tool, or left behind by a first run that was aborted before
-        -- the admin account was created) must not be stuck in
-        -- 'loginFlow' forever with nobody able to log in.
-        mEnv <-
-          if hasAnyUser eng
-            then loginFlow eng
-            else bootstrapFlow dbPath eng
-        case mEnv of
-          Nothing  -> pure ()
-          Just env -> loop dbPath env
+    Just dbLock -> do
+      engResult <- openStorageEngine dbPath
+      histFile <- (++ "/.phasedb_history") <$> getHomeDirectory
+      let settings = (defaultSettings :: Settings IO)
+            { historyFile    = Just histFile
+            , autoAddHistory = False       -- we add manually for fine-grained control
+            , complete       = completeWord Nothing " \t" replCompletion
+            }
+      case engResult of
+        Left err -> do
+          -- Refuse to continue. Starting "fresh" here would keep
+          -- 'seWalPath' pointed at the damaged or foreign file, and the
+          -- first commit would append into it.
+          releaseDbLock dbLock
+          hPutStrLn stderr $ "Error: could not open " ++ dbPath ++ ": " ++ show err
+          hPutStrLn stderr "The file has not been modified. Restore a backup, or move it aside to start a new database."
+          exitFailure
+        Right eng -> do
+          putStrLn $ "Loaded " ++ show (seLastTx eng) ++ " transactions from " ++ dimMsg dbPath
+          runInputT settings $ do
+            -- Bootstrap whenever the database has NO admin account yet, not
+            -- only when the file itself is brand new: an existing file that
+            -- somehow ended up with zero users (created empty by some other
+            -- tool, or left behind by a first run that was aborted before
+            -- the admin account was created) must not be stuck in
+            -- 'loginFlow' forever with nobody able to log in.
+            mEnv <-
+              if hasAnyUser eng
+                then loginFlow eng
+                else bootstrapFlow dbPath eng
+            case mEnv of
+              Nothing  -> pure ()
+              Just env -> loop dbPath env
+          releaseDbLock dbLock
   where
     -- | Flush any pending WAL records from the env's storage engine to disk.
     flushEnv :: Env -> IO Env

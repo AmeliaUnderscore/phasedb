@@ -12,6 +12,11 @@ module Phase.Storage.Engine
   , initStorageEngine
   , openStorageEngine
 
+    -- * Cross-process exclusive file lock
+  , DbLock
+  , acquireDbLock
+  , releaseDbLock
+
     -- * Live Access & Node Duality
   , readLive
   , dataLive
@@ -49,7 +54,10 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+import Control.Exception (try, IOException)
+import GHC.IO.Handle.Lock (LockMode (..), hTryLock)
 import System.Directory (copyFile, doesFileExist, removeFile, renameFile)
+import System.IO (Handle, hClose, openFile, IOMode (..))
 
 import Phase.AST (PValue (..), mkValue)
 import Phase.Storage.Transaction (TxHandle (..))
@@ -105,6 +113,45 @@ initStorageEngine = StorageEngine
   , seCommitsSinceCheckpoint = 0
   , seBytesSinceCheckpoint   = 0
   }
+
+-- --------------------------------------------------------------------
+-- Cross-process exclusive file lock
+-- --------------------------------------------------------------------
+
+-- | An opaque handle representing an exclusive lock on a @.db@ lock
+-- file (e.g. @"phase.db.lock"@).  Acquire with 'acquireDbLock' before
+-- opening the storage engine and release with 'releaseDbLock' at
+-- shutdown.
+--
+-- Uses 'GHC.IO.Handle.Lock.hTryLock' from @base@, which maps to
+-- @LockFileEx@ on Windows and @flock@/@fcntl@ on POSIX -- no @unix@
+-- package required, same pattern as 'Phase.Storage.Sync'.
+newtype DbLock = DbLock Handle
+
+-- | Try to acquire an exclusive cross-process lock on @\<dbPath\>.lock@.
+-- Returns 'Nothing' when another process (or the same process, in tests)
+-- already holds it.
+--
+-- 'openFile' itself may throw an 'IOException' with GHC's own handle-level
+-- lock tracking when the lock file is already exclusively held in the same
+-- process; that is treated the same as 'hTryLock' returning 'False'.
+acquireDbLock :: FilePath -> IO (Maybe DbLock)
+acquireDbLock dbPath = do
+  let lockPath = dbPath ++ ".lock"
+  result <- try (openFile lockPath AppendMode) :: IO (Either IOException Handle)
+  case result of
+    Left _  -> pure Nothing   -- file already locked (GHC or OS level)
+    Right h -> do
+      got <- hTryLock h ExclusiveLock
+      if got
+        then pure (Just (DbLock h))
+        else do
+          hClose h
+          pure Nothing
+
+-- | Release a 'DbLock' obtained from 'acquireDbLock'.
+releaseDbLock :: DbLock -> IO ()
+releaseDbLock (DbLock h) = hClose h
 
 -- | Open a disk-backed storage engine from a @.db@ file path.
 --

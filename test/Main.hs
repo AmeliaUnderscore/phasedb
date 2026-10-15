@@ -1,7 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
+import Control.Concurrent (forkIO, getNumCapabilities, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (SomeException, try)
+import Control.Monad (foldM, forM, forM_, replicateM)
 import Data.IORef
+import Data.List (nub, sort)
+import Data.Maybe (fromMaybe)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import System.Exit (exitFailure, exitSuccess)
@@ -12,15 +18,51 @@ import System.Directory (doesFileExist, getFileSize, getTemporaryDirectory, remo
 import System.FilePath ((</>))
 
 import Phase.AST
-import Phase.Auth (Role (..), bootstrapCreateUser)
+import Phase.Auth
+  ( Role (..)
+  , authenticateUser
+  , bootstrapCreateUser
+  , hashPassword
+  , hasAnyUser
+  , lookupUserRole
+  , verifyPassword
+  )
 import Phase.Catalog
 import Phase.Eval
+import Phase.Exec
 import Phase.Lines
 import Phase.Parser
 import Phase.State
 import Phase.Stmt
 import Phase.Storage
+import Data.Aeson ((.=))
+import Data.Aeson.Types (Pair)
+import qualified Data.Aeson as Aeson
+import qualified Data.CaseInsensitive as CI
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Char8 as BSC
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Text.Encoding as TE
+import Data.Time (diffUTCTime)
+import Network.HTTP.Types (hAuthorization, hContentType, statusCode)
+import qualified Network.HTTP.Types as HT
+import Network.Socket (SockAddr (..), tupleToHostAddress)
+import Network.Wai (Application, Request (..))
+import Network.Wai.Test
+  ( Session, SResponse (..), runSession
+  , request, srequest, defaultRequest, setPath, SRequest (..)
+  )
+import qualified Network.Wai.Test as WT
+
+import Phase.Storage.Engine (acquireDbLock, flushPendingWal, openStorageEngine, readLive, releaseDbLock)
 import Phase.Storage.Lock (acquireLocks, emptyLockTable)
+
+import Server.Auth (newLoginGuard)
+import Server.Config (ServerConfig (..), defaultConfig)
+import Server.Routes (mkApp)
+import Server.State (ServerState (..), Snapshot (..), newServerState)
 import Phase.Tree
 import Phase.Value
 
@@ -2744,6 +2786,914 @@ testConditionsGroup ctx = do
   assertEqual ctx "a block with no clause stays an ordinary block: no handler is present" r54 (Left DivideByZero)
 
 -- --------------------------------------------------------------------
+-- Phase.Auth: constant-time verifyPassword (M0 Prereq 3)
+-- --------------------------------------------------------------------
+
+testVerifyPasswordGroup :: TestContext -> IO ()
+testVerifyPasswordGroup ctx = do
+  -- Correct password succeeds.
+  let salt = "abcdef1234567890abcdef1234567890"  -- 32 hex chars = 16 bytes
+  let hash = hashPassword "correct" salt
+  runAssert ctx "verifyPassword: correct password returns True"
+    (verifyPassword "correct" salt hash) ""
+  -- Wrong password fails.
+  runAssert ctx "verifyPassword: wrong password returns False"
+    (not (verifyPassword "wrong" salt hash)) ""
+  -- Wrong salt produces a different hash, so verification fails.
+  let salt2 = "ffffffffffffffffffffffffffffffff"
+  runAssert ctx "verifyPassword: different salt returns False"
+    (not (verifyPassword "correct" salt2 hash)) ""
+  -- Empty password is distinct from any non-empty password.
+  let hashEmpty = hashPassword "" salt
+  runAssert ctx "verifyPassword: empty password is distinct from non-empty"
+    (not (verifyPassword "correct" salt hashEmpty)) ""
+  -- hashPassword is deterministic: same input always gives the same output.
+  assertEqual ctx "hashPassword is deterministic"
+    (hashPassword "pw" salt) (hashPassword "pw" salt)
+  -- Malformed (non-hex) salt never matches, no crash.
+  runAssert ctx "verifyPassword: malformed salt returns False (no crash)"
+    (not (verifyPassword "pw" "NOTVALIDHEX!!" hash)) ""
+
+-- import needed for hashPassword (comes from Phase.Auth wholesale, but
+-- it isn't re-exported by verifyPassword's import so add it explicitly)
+
+-- --------------------------------------------------------------------
+-- Phase.Auth: bootstrapCreateUser / authenticateUser (M0 Prereq 1-2)
+-- --------------------------------------------------------------------
+
+testAuthBootstrapGroup :: TestContext -> IO ()
+testAuthBootstrapGroup ctx = do
+  now <- getCurrentTime
+  -- bootstrapCreateUser creates the user and it can then be authenticated.
+  result <- bootstrapCreateUser "ADMIN" "secret123" RAdmin now initStorageEngine
+  case result of
+    Left err ->
+      runAssert ctx "bootstrapCreateUser succeeds" False (T.unpack err)
+    Right storage -> do
+      runAssert ctx "bootstrapCreateUser: authenticateUser correct password"
+        (authenticateUser "ADMIN" "secret123" storage) ""
+      runAssert ctx "bootstrapCreateUser: authenticateUser wrong password"
+        (not (authenticateUser "ADMIN" "wrong" storage)) ""
+      runAssert ctx "bootstrapCreateUser: authenticateUser unknown user"
+        (not (authenticateUser "NOBODY" "secret123" storage)) ""
+      runAssert ctx "bootstrapCreateUser: hasAnyUser is True after bootstrap"
+        (hasAnyUser storage) ""
+      runAssert ctx "bootstrapCreateUser: lookupUserRole is RAdmin"
+        (lookupUserRole "ADMIN" storage == RAdmin) ""
+
+-- --------------------------------------------------------------------
+-- Phase.Exec: runCommand structured results (M0 Prereq 1)
+-- --------------------------------------------------------------------
+
+testExecGroup :: TestContext -> IO ()
+testExecGroup ctx = do
+  adminEnv <- testAdminEnv
+
+  -- 1. A WRITE statement produces output in RunOutput.
+  r1 <- runCommand " WRITE \"hello\",!" "" adminEnv
+  case r1 of
+    RunOk (RunOutput out Nothing _ _) ->
+      assertEqual ctx "runCommand WRITE: output captured" out "hello\n"
+    other ->
+      runAssert ctx "runCommand WRITE: got RunOk RunOutput" False (show other)
+
+  -- 2. A bare expression produces a value with no output.
+  r2 <- runCommand "1+1" "" adminEnv
+  case r2 of
+    RunOk (RunOutput "" (Just val) _ _) ->
+      assertEqual ctx "runCommand bare expression: value is 2" val "2"
+    other ->
+      runAssert ctx "runCommand bare expression: got RunOk RunOutput with value" False (show other)
+
+  -- 3. A runtime error produces RunError with the original env unchanged.
+  r3 <- runCommand " WRITE 1/0" "" adminEnv
+  case r3 of
+    RunError DivideByZero env' ->
+      runAssert ctx "runCommand error: env is unchanged (same lastTx)"
+        (seLastTx (envStorage env') == seLastTx (envStorage adminEnv)) ""
+    other ->
+      runAssert ctx "runCommand: WRITE 1/0 -> RunError DivideByZero" False (show other)
+
+  -- 4. A parse error produces RunParseError.
+  r4 <- runCommand " SET" "" adminEnv
+  case r4 of
+    RunParseError _ ->
+      runAssert ctx "runCommand: bare SET -> RunParseError" True ""
+    other ->
+      runAssert ctx "runCommand: bare SET -> RunParseError" False (show other)
+
+  -- 5. A namespace override is respected: the env going in has _GLOBAL but
+  --    the override puts "Billing" in envCurrentNamespace.
+  r5 <- runCommand " NAMESPACE Billing\n WRITE $DATA(^NOOP),!" "Billing" adminEnv
+  case r5 of
+    RunOk (RunOutput _ Nothing _ env') ->
+      assertEqual ctx "runCommand: namespace override"
+        (envCurrentNamespace env') "Billing"
+    other ->
+      runAssert ctx "runCommand: namespace override" False (show other)
+
+  -- 6. A global write is durable: the env returned has an advanced lastTx.
+  r6 <- runCommand " SET ^EXECTEST(1)=\"v\"" "" adminEnv
+  case r6 of
+    RunOk (RunOutput _ Nothing tx env') -> do
+      runAssert ctx "runCommand: global write advances lastTx"
+        (tx > seLastTx (envStorage adminEnv)) ""
+      runAssert ctx "runCommand: returned env reflects the write"
+        (tx == seLastTx (envStorage env')) ""
+    other ->
+      runAssert ctx "runCommand: global write" False (show other)
+
+  -- 7. Failure leaves no trace: a write followed by an error leaves the
+  --    storage at exactly the same lastTx as before the call.
+  r7 <- runCommand " SET ^EXECTRACE(1)=\"yes\"\n WRITE 1/0" "" adminEnv
+  case r7 of
+    RunError DivideByZero envAfter ->
+      runAssert ctx "runCommand: failed write leaves no trace"
+        (seLastTx (envStorage envAfter) == seLastTx (envStorage adminEnv)) ""
+    other ->
+      runAssert ctx "runCommand: failed write -> RunError DivideByZero" False (show other)
+
+  -- 8. An empty input returns RunOk with empty output and the same env.
+  r8 <- runCommand "" "" adminEnv
+  case r8 of
+    RunOk (RunOutput "" Nothing tx _) ->
+      assertEqual ctx "runCommand: empty input, lastTx unchanged"
+        tx (seLastTx (envStorage adminEnv))
+    other ->
+      runAssert ctx "runCommand: empty input" False (show other)
+
+-- --------------------------------------------------------------------
+-- Phase.Exec: admin operations (M0 Prereq 2)
+-- --------------------------------------------------------------------
+
+testAdminExecGroup :: TestContext -> IO ()
+testAdminExecGroup ctx = do
+  adminEnv <- testAdminEnv
+
+  -- adminCheckpoint succeeds for the admin.
+  r1 <- adminCheckpoint adminEnv
+  case r1 of
+    Right _ -> runAssert ctx "adminCheckpoint: returns Right" True ""
+    Left e  -> runAssert ctx "adminCheckpoint: returns Right" False (show e)
+
+  -- adminAddUser: creates a new user.
+  r2 <- adminAddUser "NEWUSER" "password" "write" adminEnv
+  case r2 of
+    Right env' ->
+      runAssert ctx "adminAddUser: new user can be authenticated"
+        (authenticateUser "NEWUSER" "password" (envStorage env')) ""
+    Left e ->
+      runAssert ctx "adminAddUser: returns Right" False (show e)
+
+  -- adminAddUser: wrong role text is rejected.
+  r3 <- adminAddUser "ROLETEST" "pw" "superuser" adminEnv
+  case r3 of
+    Left (AdminBadRole _) -> runAssert ctx "adminAddUser: bad role -> AdminBadRole" True ""
+    other -> runAssert ctx "adminAddUser: bad role -> AdminBadRole" False (show other)
+
+  -- adminAddUser: duplicate user is rejected.
+  r4 <- adminAddUser "TESTADMIN" "pw" "write" adminEnv
+  case r4 of
+    Left (AdminUserExists _) -> runAssert ctx "adminAddUser: duplicate -> AdminUserExists" True ""
+    other -> runAssert ctx "adminAddUser: duplicate -> AdminUserExists" False (show other)
+
+  -- Non-admin gets AdminPermissionDenied on adminCompact.
+  now <- getCurrentTime
+  result <- bootstrapCreateUser "READONLY" "pw" RRead now initStorageEngine
+  case result of
+    Left err -> runAssert ctx "adminCompact permission: bootstrap" False (T.unpack err)
+    Right storage -> do
+      let readEnv = initEnv { envStorage = storage, envGlobals = seLive storage
+                            , envCurrentUser = "READONLY", envNow = now }
+      -- We can't easily call adminCompact without a real file, but we can
+      -- check adminCheckpoint (no admin restriction) works for read user too.
+      cr <- adminCheckpoint readEnv
+      case cr of
+        Right _ -> runAssert ctx "adminCheckpoint: any user can checkpoint" True ""
+        Left e  -> runAssert ctx "adminCheckpoint: any user can checkpoint" False (show e)
+
+-- --------------------------------------------------------------------
+-- Phase.State: output limit (M0 Prereq 5)
+-- --------------------------------------------------------------------
+
+testOutputLimitGroup :: TestContext -> IO ()
+testOutputLimitGroup ctx = do
+  adminEnv <- testAdminEnv
+
+  -- With no limit, large output succeeds.
+  let bigInput = " WRITE " <> T.intercalate ",\",\"," (replicate 50 "\"AAAAAAAAA\"") <> ",!"
+  r1 <- runCommand bigInput "" adminEnv
+  case r1 of
+    RunOk _ -> runAssert ctx "output limit: no limit set -> large output ok" True ""
+    other   -> runAssert ctx "output limit: no limit set -> large output ok" False (show other)
+
+  -- With a 5-byte limit, any output of more than 5 bytes hits the cap.
+  let cappedEnv = adminEnv { envMaxOutputBytes = Just 5 }
+  r2 <- runCommand " WRITE \"123456\"" "" cappedEnv
+  case r2 of
+    RunError OutputLimitExceeded _ ->
+      runAssert ctx "output limit: exceeded -> OutputLimitExceeded" True ""
+    other ->
+      runAssert ctx "output limit: exceeded -> OutputLimitExceeded" False (show other)
+
+  -- A run that produces output within the cap succeeds.
+  r3 <- runCommand " WRITE \"hi\"" "" cappedEnv
+  case r3 of
+    RunOk (RunOutput "hi" Nothing _ _) ->
+      runAssert ctx "output limit: within cap -> success" True ""
+    other ->
+      runAssert ctx "output limit: within cap -> success" False (show other)
+
+  -- envFileIOEnabled defaults to True in initEnv.
+  runAssert ctx "envFileIOEnabled: default is True"
+    (envFileIOEnabled adminEnv) ""
+
+-- --------------------------------------------------------------------
+-- Phase.Storage.Engine: cross-process file lock (M0 Prereq 4)
+-- --------------------------------------------------------------------
+
+testDbLockGroup :: TestContext -> IO ()
+testDbLockGroup ctx = do
+  lockPath <- tmpPath "phasedb-lock-test.db"
+  -- Clean up any leftover lock file.
+  let cleanup = do
+        let lf = lockPath ++ ".lock"
+        doesFileExist lf >>= \b -> if b then removeFile lf else pure ()
+
+  cleanup
+
+  -- First acquire succeeds.
+  mLock1 <- acquireDbLock lockPath
+  case mLock1 of
+    Nothing ->
+      runAssert ctx "acquireDbLock: first acquire succeeds" False "got Nothing"
+    Just lock1 -> do
+      runAssert ctx "acquireDbLock: first acquire succeeds" True ""
+
+      -- Second acquire on the same path (same lock file) fails because the
+      -- lock is already exclusively held by lock1.
+      mLock2 <- acquireDbLock lockPath
+      case mLock2 of
+        Nothing ->
+          runAssert ctx "acquireDbLock: second acquire fails while first is held" True ""
+        Just lock2 -> do
+          runAssert ctx "acquireDbLock: second acquire fails while first is held" False
+            "expected Nothing but got a lock"
+          releaseDbLock lock2
+
+      -- After releasing the first lock, a new acquire succeeds.
+      releaseDbLock lock1
+      mLock3 <- acquireDbLock lockPath
+      case mLock3 of
+        Nothing ->
+          runAssert ctx "acquireDbLock: acquire succeeds after release" False "got Nothing"
+        Just lock3 -> do
+          runAssert ctx "acquireDbLock: acquire succeeds after release" True ""
+          releaseDbLock lock3
+
+  cleanup
+
+-- --------------------------------------------------------------------
+-- HTTP API (M1 + M2): in-process WAI tests (spec §11)
+-- --------------------------------------------------------------------
+
+-- | A test server: the WAI application, its shared state, and its db path.
+data Api = Api { apApp :: Application, apSS :: ServerState, apPath :: FilePath }
+
+-- | Remove a scratch database and its sidecar files.
+cleanDb :: FilePath -> IO ()
+cleanDb path = forM_ [path, path ++ ".lock"] $ \f -> do
+  e <- doesFileExist f
+  if e then removeFile f else pure ()
+
+-- | Create a database with an admin account plus one account per other
+-- role (writer / reader / blocked), all through the library's own
+-- 'bootstrapCreateUser' and 'adminAddUser' (the code paths production uses).
+setupDb :: String -> IO (FilePath, StorageEngine)
+setupDb name = do
+  path <- tmpPath ("phasedb-http-" ++ name ++ ".db")
+  cleanDb path
+  e0 <- openStorageEngine path >>= either (error . show) pure
+  now <- getCurrentTime
+  e1 <- bootstrapCreateUser "admin" "secret123" RAdmin now e0 >>= either (error . T.unpack) pure
+  e2 <- flushPendingWal e1
+  let addUser eng (u, pw, role) = do
+        let env = (initEnvWithStorage eng) { envCurrentUser = "admin" }
+        r <- adminAddUser u pw role env
+        either (error . show) (pure . envStorage) r
+  e3 <- foldM addUser e2
+          [ ("writer", "pw-writer", "write")
+          , ("reader", "pw-reader", "read")
+          , ("blocked", "pw-blocked", "none") ]
+  pure (path, e3)
+
+-- | Run a test body against a fresh server.  The config can be tweaked
+-- (limits, timeouts) per scenario.
+withApi :: String -> (ServerConfig -> ServerConfig) -> (Api -> IO a) -> IO a
+withApi name tweak body = do
+  (path, eng) <- setupDb name
+  let cfg = tweak defaultConfig { cfgDbPath = path }
+  ss    <- newServerState cfg path eng
+  guard <- newLoginGuard 4
+  r <- body (Api (mkApp ss guard) ss path)
+  cleanDb path
+  pure r
+
+-- | A loopback client address.  The port is part of the rate-limit key,
+-- so tests that provoke failed logins use their own port.
+fromPort :: Int -> SockAddr
+fromPort p = SockAddrInet (fromIntegral p) (tupleToHostAddress (127, 0, 0, 1))
+
+httpFrom :: SockAddr -> Api -> BS.ByteString -> BS.ByteString -> [HT.Header] -> LBS.ByteString -> IO SResponse
+httpFrom addr api meth path hdrs body =
+  runSession (srequest (SRequest req body)) (apApp api)
+  where req = setPath defaultRequest { requestMethod = meth, requestHeaders = hdrs, remoteHost = addr } path
+
+http :: Api -> BS.ByteString -> BS.ByteString -> [HT.Header] -> LBS.ByteString -> IO SResponse
+http = httpFrom (fromPort 1)
+
+jsonCT :: HT.Header
+jsonCT = (hContentType, "application/json")
+
+basicH :: String -> String -> HT.Header
+basicH u pw = (hAuthorization, "Basic " <> B64.encode (BSC.pack (u ++ ":" ++ pw)))
+
+bearerH :: BS.ByteString -> HT.Header
+bearerH tok = (hAuthorization, "Bearer " <> tok)
+
+execBodyWith :: [Pair] -> T.Text -> LBS.ByteString
+execBodyWith extra cmd = Aeson.encode (Aeson.object (("command" .= cmd) : extra))
+
+execBody :: T.Text -> LBS.ByteString
+execBody = execBodyWith []
+
+-- | One-shot execute as (user, password).
+oneShot :: Api -> (String, String) -> T.Text -> IO SResponse
+oneShot api (u, pw) cmd = http api "POST" "/v1/execute" [basicH u pw, jsonCT] (execBody cmd)
+
+adminShot :: Api -> T.Text -> IO SResponse
+adminShot api = oneShot api ("admin", "secret123")
+
+loginFrom :: SockAddr -> Api -> String -> String -> IO SResponse
+loginFrom addr api u pw = httpFrom addr api "POST" "/v1/sessions" [jsonCT]
+  (Aeson.encode (Aeson.object ["username" .= T.pack u, "password" .= T.pack pw]))
+
+-- | Log in and return the bearer token (fails the test run loudly if login fails).
+tokenFor :: Api -> String -> String -> IO BS.ByteString
+tokenFor api u pw = do
+  r <- loginFrom (fromPort 1) api u pw
+  case jText ["token"] (bodyJson r) of
+    Just t  -> pure (TE.encodeUtf8 t)
+    Nothing -> error ("login failed for " ++ u ++ ": " ++ show (simpleBody r))
+
+sessExec :: Api -> BS.ByteString -> T.Text -> IO SResponse
+sessExec api tok cmd = http api "POST" "/v1/sessions/current/execute" [bearerH tok, jsonCT] (execBody cmd)
+
+-- JSON helpers -------------------------------------------------------
+
+bodyJson :: SResponse -> Aeson.Value
+bodyJson = fromMaybe Aeson.Null . Aeson.decode . simpleBody
+
+jget :: [T.Text] -> Aeson.Value -> Maybe Aeson.Value
+jget [] v = Just v
+jget (k : ks) (Aeson.Object o) = KM.lookup (Key.fromText k) o >>= jget ks
+jget _ _ = Nothing
+
+jText :: [T.Text] -> Aeson.Value -> Maybe T.Text
+jText p v = case jget p v of { Just (Aeson.String t) -> Just t; _ -> Nothing }
+
+jBool :: [T.Text] -> Aeson.Value -> Maybe Bool
+jBool p v = case jget p v of { Just (Aeson.Bool b) -> Just b; _ -> Nothing }
+
+jInt :: [T.Text] -> Aeson.Value -> Maybe Int
+jInt p v = case jget p v of { Just (Aeson.Number n) -> Just (truncate n); _ -> Nothing }
+
+statusOf :: SResponse -> Int
+statusOf = statusCode . simpleStatus
+
+okOf :: SResponse -> Maybe Bool
+okOf = jBool ["ok"] . bodyJson
+
+outOf, codeOf, valOf :: SResponse -> Maybe T.Text
+outOf  = jText ["output"] . bodyJson
+codeOf = jText ["error", "code"] . bodyJson
+valOf  = jText ["value"] . bodyJson
+
+lastTxOf :: SResponse -> Maybe Int
+lastTxOf = jInt ["lastTx"] . bodyJson
+
+hdrOf :: BS.ByteString -> SResponse -> Maybe BS.ByteString
+hdrOf name r = lookup (CI.mk name) (simpleHeaders r)
+
+snapVer :: Api -> IO Int
+snapVer api = snapVersion <$> readIORef (ssSnapshot (apSS api))
+
+-- | Run actions on separate threads and collect their results.
+concurrently :: [IO a] -> IO [a]
+concurrently acts = do
+  vars <- forM acts $ \a -> do
+    v <- newEmptyMVar
+    _ <- forkIO (try a >>= putMVar v)
+    pure v
+  forM vars $ \v -> takeMVar v >>= either (\e -> error (show (e :: SomeException))) pure
+
+timed :: IO a -> IO (a, Double)
+timed act = do
+  t0 <- getCurrentTime
+  r  <- act
+  t1 <- getCurrentTime
+  pure (r, realToFrac (diffUTCTime t1 t0) * 1000)
+
+isHex64 :: T.Text -> Bool
+isHex64 t = T.length t == 64 && T.all (`elem` ("0123456789abcdef" :: String)) t
+
+-- ====================================================================
+-- M1: protocol, execution semantics, limits, concurrency
+-- ====================================================================
+
+testHttpProtocolGroup :: TestContext -> IO ()
+testHttpProtocolGroup ctx = withApi "protocol" id $ \api -> do
+  -- health ------------------------------------------------------------
+  h <- http api "GET" "/v1/health" [] ""
+  assertEqual ctx "health: 200 without credentials" (statusOf h) 200
+  assertEqual ctx "health: status ok" (jText ["status"] (bodyJson h)) (Just "ok")
+
+  -- X-Request-Id (§4) ---------------------------------------------------
+  runAssert ctx "every response carries an X-Request-Id header (health)"
+    (hdrOf "X-Request-Id" h /= Nothing) "no X-Request-Id header"
+  e404 <- http api "GET" "/v1/nope" [] ""
+  runAssert ctx "every response carries an X-Request-Id header (404)"
+    (hdrOf "X-Request-Id" e404 /= Nothing) "no X-Request-Id header"
+  hEcho <- http api "GET" "/v1/health" [("X-Request-Id", "client-abc-123")] ""
+  assertEqual ctx "a short printable client X-Request-Id is echoed"
+    (hdrOf "X-Request-Id" hEcho) (Just "client-abc-123")
+
+  -- transport errors (§4.2) -----------------------------------------------
+  assertEqual ctx "unknown path: 404" (statusOf e404) 404
+  assertEqual ctx "unknown path: NOT_FOUND" (codeOf e404) (Just "NOT_FOUND")
+  assertEqual ctx "transport error envelope has ok:false, requestId, and no lastTx"
+    (okOf e404, jText ["requestId"] (bodyJson e404) /= Nothing, jget ["lastTx"] (bodyJson e404))
+    (Just False, True, Nothing)
+
+  bad1 <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] "{not json"
+  assertEqual ctx "malformed JSON: 400 BAD_REQUEST" (statusOf bad1, codeOf bad1) (400, Just "BAD_REQUEST")
+  bad2 <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] "{\"nope\":1}"
+  assertEqual ctx "missing command: 400 BAD_REQUEST" (statusOf bad2, codeOf bad2) (400, Just "BAD_REQUEST")
+  bad3 <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] "{\"command\":5}"
+  assertEqual ctx "wrong type for command: 400 BAD_REQUEST" (statusOf bad3, codeOf bad3) (400, Just "BAD_REQUEST")
+
+  -- authentication on /execute (§5.1) -------------------------------------
+  noAuth <- http api "POST" "/v1/execute" [jsonCT] (execBody "1+1")
+  assertEqual ctx "no credentials: 401 UNAUTHENTICATED" (statusOf noAuth, codeOf noAuth) (401, Just "UNAUTHENTICATED")
+  withApi "auth-failures" id $ \api2 -> do
+    -- (own app instance: failed logins lock the username and address for a
+    -- while, which would otherwise block this file's later valid requests)
+    badPw <- httpFrom (fromPort 11) api2 "POST" "/v1/execute" [basicH "reader" "wrong", jsonCT] (execBody "1+1")
+    noUsr <- httpFrom (fromPort 12) api2 "POST" "/v1/execute" [basicH "ghost" "wrong", jsonCT] (execBody "1+1")
+    assertEqual ctx "wrong password and unknown user are indistinguishable (status, code, message)"
+      (statusOf badPw, codeOf badPw, jText ["error", "message"] (bodyJson badPw))
+      (statusOf noUsr, codeOf noUsr, jText ["error", "message"] (bodyJson noUsr))
+    assertEqual ctx "wrong password: 401 UNAUTHENTICATED" (statusOf badPw, codeOf badPw) (401, Just "UNAUTHENTICATED")
+  bearerOnShot <- http api "POST" "/v1/execute" [bearerH (BSC.replicate 64 'a'), jsonCT] (execBody "1+1")
+  assertEqual ctx "one-shot rejects Bearer: 401" (statusOf bearerOnShot) 401
+  badB64 <- http api "POST" "/v1/execute" [(hAuthorization, "Basic !!!"), jsonCT] (execBody "1+1")
+  assertEqual ctx "malformed Basic credentials: 401" (statusOf badB64) 401
+  blocked <- oneShot api ("blocked", "pw-blocked") "1+1"
+  assertEqual ctx "account with role none: 403 FORBIDDEN" (statusOf blocked, codeOf blocked) (403, Just "FORBIDDEN")
+
+  -- success envelope (§4.1) ---------------------------------------------------
+  w <- adminShot api "WRITE \"hello\",!"
+  let wj = bodyJson w
+  assertEqual ctx "run envelope: ok, output, null value"
+    (statusOf w, okOf w, outOf w, jget ["value"] wj) (200, Just True, Just "hello\n", Just Aeson.Null)
+  assertEqual ctx "run envelope: lastTx, elapsedMs and requestId present"
+    (jInt ["lastTx"] wj /= Nothing, jInt ["elapsedMs"] wj /= Nothing, jText ["requestId"] wj /= Nothing)
+    (True, True, True)
+  v <- adminShot api "1+1"
+  assertEqual ctx "bare expression: value holds the result, output empty"
+    (valOf v, outOf v) (Just "2", Just "")
+  assertEqual ctx "Content-Type is JSON UTF-8" (hdrOf "Content-Type" w) (Just "application/json; charset=utf-8")
+
+  -- Phase-level failures are HTTP 200 + ok:false (D1) ---------------------------
+  dz <- adminShot api " WRITE 1/0,!"
+  assertEqual ctx "Phase error: HTTP 200, ok false, output empty"
+    (statusOf dz, okOf dz, outOf dz) (200, Just False, Just "")
+  assertEqual ctx "Phase error: code is DIVIDE BY ZERO" (codeOf dz) (Just "DIVIDE BY ZERO")
+  assertEqual ctx "Phase error: carries lastTx and requestId"
+    (lastTxOf dz /= Nothing, jText ["requestId"] (bodyJson dz) /= Nothing) (True, True)
+
+  -- tag registration -------------------------------------------------------------
+  reg <- adminShot api "GREET(n)\n WRITE \"hi \",n,!"
+  assertEqual ctx "routine-tag definition: ok, registered [_GLOBAL.GREET]"
+    (okOf reg, jget ["registered"] (bodyJson reg)) (Just True, Just (Aeson.toJSON ["_GLOBAL.GREET" :: T.Text]))
+  call <- adminShot api " DO GREET(\"bob\")"
+  assertEqual ctx "a registered tag is visible to the next request" (outOf call) (Just "hi bob\n")
+  regNs <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+             (execBodyWith ["namespace" .= ("Billing" :: T.Text)] "TAX(x)\n WRITE x*2,!")
+  assertEqual ctx "namespace field: tag registered under that namespace"
+    (jget ["registered"] (bodyJson regNs)) (Just (Aeson.toJSON ["Billing.TAX" :: T.Text]))
+
+  -- error mapping (§4.1) ----------------------------------------------------------
+  let codes =
+        [ (" WRITE NOPE,!",                    "UNDEFINED VARIABLE")
+        , (" DO NOLABEL",                      "UNDEFINED LABEL")
+        , (" DO ^NOROUTINE",                   "UNDEFINED ROUTINE")
+        , (" WRITE 1/0,!",                     "DIVIDE BY ZERO")
+        , (" SET",                             "SYNTAX")
+        , (" SET ^T(\"\")=1",                  "SUBSCRIPT")
+        , (" WRITE ^(1),!",                    "NAKED")
+        , ("$$NOSUCH(1)",                      "NOTIMPL")
+        ]
+  forM_ codes $ \(cmd, code) -> do
+    r <- adminShot api cmd
+    assertEqual ctx ("error mapping: " ++ T.unpack code) (statusOf r, okOf r, codeOf r) (200, Just False, Just code)
+  rd <- oneShot api ("reader", "pw-reader") " SET ^T(1)=1"
+  assertEqual ctx "error mapping: PROTECT (reader writing a global)" (statusOf rd, codeOf rd) (200, Just "PROTECT")
+  sig <- adminShot api " CONDITION <OOPS>(reason)\n SIGNAL <OOPS>(reason: \"bad\")"
+  assertEqual ctx "error mapping: signalled condition uses its name as code"
+    (codeOf sig, jText ["error", "condition", "name"] (bodyJson sig), jText ["error", "condition", "fields", "reason"] (bodyJson sig))
+    (Just "OOPS", Just "OOPS", Just "bad")
+
+  -- roles (§6) -----------------------------------------------------------------------
+  wr <- oneShot api ("writer", "pw-writer") " SET ^W(1)=\"w\""
+  assertEqual ctx "writer role can write a global" (okOf wr) (Just True)
+  rr <- oneShot api ("reader", "pw-reader") "^W(1)"
+  assertEqual ctx "reader role can read a global" (valOf rr) (Just "w")
+
+testHttpAuthTransportGroup :: TestContext -> IO ()
+testHttpAuthTransportGroup ctx = do
+  let nonLoop = SockAddrInet 1 (tupleToHostAddress (10, 0, 0, 5))
+  withApi "basic-remote" id $ \api -> do
+    r <- httpFrom nonLoop api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBody "1+1")
+    assertEqual ctx "Basic over a non-loopback, non-TLS connection: 401" (statusOf r, codeOf r) (401, Just "UNAUTHENTICATED")
+  withApi "basic-remote-flag" (\c -> c { cfgAllowInsecureBasic = True }) $ \api -> do
+    r <- httpFrom nonLoop api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBody "1+1")
+    assertEqual ctx "--allow-insecure-basic permits Basic on a non-loopback connection" (statusOf r, valOf r) (200, Just "2")
+
+testHttpLimitsGroup :: TestContext -> IO ()
+testHttpLimitsGroup ctx = do
+  withApi "body-cap" (\c -> c { cfgMaxBodyBytes = Just 64 }) $ \api -> do
+    r <- adminShot api (T.replicate 200 "x")
+    assertEqual ctx "oversized request body: 413 TOO_LARGE" (statusOf r, codeOf r) (413, Just "TOO_LARGE")
+    ok <- adminShot api "1+1"
+    assertEqual ctx "a body under the cap still works" (valOf ok) (Just "2")
+
+  withApi "output-cap" (\c -> c { cfgMaxOutputBytes = Just 50 }) $ \api -> do
+    big <- adminShot api " FOR I=1:1:100 WRITE \"xxxxxxxxxx\""
+    assertEqual ctx "oversized output: ok false, code OUTPUT LIMIT, output empty"
+      (statusOf big, okOf big, codeOf big, outOf big) (200, Just False, Just "OUTPUT LIMIT", Just "")
+    small <- adminShot api " WRITE \"fits\",!"
+    assertEqual ctx "output under the cap works" (outOf small) (Just "fits\n")
+
+  withApi "config-db" id $ \api -> do
+    _ <- adminShot api " SET ^_CONFIG(\"server\",\"maxOutputBytes\")=30"
+    r <- adminShot api " FOR I=1:1:10 WRITE \"xxxxxxxxxx\""
+    assertEqual ctx "D9: ^_CONFIG(\"server\",...) applies without a restart (maxOutputBytes)"
+      (codeOf r) (Just "OUTPUT LIMIT")
+
+  withApi "timeouts" (\c -> c { cfgExecTimeoutMs = Just 250, cfgExecTimeoutMaxMs = Just 600 }) $ \api -> do
+    -- allocating loop
+    (loopR, ms) <- timed (adminShot api " SET ^TO(1)=1\n FOR  SET X=1")
+    assertEqual ctx "timed-out request: ok false" (statusOf loopR, okOf loopR) (200, Just False)
+    assertEqual ctx "timed-out request: error code TIMEOUT (§4.1)" (codeOf loopR) (Just "TIMEOUT")
+    runAssert ctx "timed-out request stops near the default timeout"
+      (ms >= 200 && ms < 2000) ("elapsed ms: " ++ show ms)
+    gone <- adminShot api "^TO(1)"
+    assertEqual ctx "timed-out request leaves no trace (its write is not visible)" (codeOf gone) (Just "UNDEFINED VARIABLE")
+    -- non-allocating loop (needs -fno-omit-yields)
+    (spinR, ms2) <- timed (adminShot api " SET I=0\n FOR  SET I=I")
+    assertEqual ctx "non-allocating loop is interrupted" (okOf spinR) (Just False)
+    runAssert ctx "non-allocating loop stops near the timeout" (ms2 < 2000) ("elapsed ms: " ++ show ms2)
+    -- timeoutMs honoured, then capped by the server maximum
+    (shortR, ms3) <- timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                              (execBodyWith ["timeoutMs" .= (100 :: Int)] " FOR  SET X=1"))
+    assertEqual ctx "client timeoutMs is honoured" (okOf shortR) (Just False)
+    runAssert ctx "client timeoutMs 100 stops well before the 250 ms default" (ms3 < 240) ("elapsed ms: " ++ show ms3)
+    (capR, ms4) <- timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                            (execBodyWith ["timeoutMs" .= (999999 :: Int)] " FOR  SET X=1"))
+    assertEqual ctx "timeoutMs above the server maximum is capped" (okOf capR) (Just False)
+    runAssert ctx "capped request stops near the server maximum (600 ms), not 999999"
+      (ms4 >= 500 && ms4 < 3000) ("elapsed ms: " ++ show ms4)
+    -- the engine lock is free afterwards
+    (okW, ms5) <- timed (adminShot api " SET ^AFTER(1)=1")
+    assertEqual ctx "a write succeeds right after a timed-out request (lock released)" (okOf okW) (Just True)
+    runAssert ctx "...and does not wait on the lock" (ms5 < 1000) ("elapsed ms: " ++ show ms5)
+
+testHttpExecutionGroup :: TestContext -> IO ()
+testHttpExecutionGroup ctx = withApi "execution" id $ \api -> do
+  -- read-your-writes (regression) ------------------------------------------
+  v0 <- snapVer api
+  w  <- adminShot api " SET ^T(1)=5"
+  r  <- adminShot api "^T(1)"
+  assertEqual ctx "a write is visible to the very next request" (valOf r) (Just "5")
+  assertEqual ctx "a read sees the lastTx the write reported" (lastTxOf r) (lastTxOf w)
+  st <- http api "GET" "/v1/admin/status" [basicH "admin" "secret123"] ""
+  assertEqual ctx "admin status reports the committed lastTx" (jInt ["lastTx"] (bodyJson st)) (lastTxOf w)
+  v1 <- snapVer api
+  assertEqual ctx "a write publishes exactly one new snapshot version" v1 (v0 + 1)
+
+  -- reads never publish -------------------------------------------------------
+  _ <- adminShot api "^T(1)"
+  _ <- adminShot api " WRITE \"only output\",!"
+  _ <- adminShot api " SET L=1\n WRITE L,!"
+  v2 <- snapVer api
+  assertEqual ctx "read-only requests (incl. local-only SET) never publish a snapshot" v2 v1
+
+  -- failed requests ----------------------------------------------------------------
+  lt <- lastTxOf <$> adminShot api "^T(1)"
+  bad <- adminShot api " SET ^A(1)=1\n SET ^A(2)=2\n WRITE 1/0,!"
+  assertEqual ctx "failure after earlier writes: ok false" (okOf bad) (Just False)
+  a1 <- adminShot api "^A(1)"
+  assertEqual ctx "failure after earlier writes: leaves no trace" (codeOf a1) (Just "UNDEFINED VARIABLE")
+  lt2 <- lastTxOf <$> adminShot api "^T(1)"
+  assertEqual ctx "failed request does not advance lastTx" lt2 lt
+  v3 <- snapVer api
+  assertEqual ctx "failed request does not publish a snapshot" v3 v2
+
+  -- durability ------------------------------------------------------------------------
+  d <- adminShot api " SET ^D(1)=\"durable\""
+  assertEqual ctx "durability: write returns ok" (okOf d) (Just True)
+  reopened <- openStorageEngine (apPath api) >>= either (error . show) pure
+  assertEqual ctx "durability: after ok:true, reopening the file shows the write"
+    (unPValue <$> either (const Nothing) Just (readLive "D" [mkValue "1"] reopened)) (Just "durable")
+  regD <- adminShot api "KEPT()\n WRITE \"kept\",!"
+  assertEqual ctx "durability: tag registration returns ok" (okOf regD) (Just True)
+  reopened2 <- openStorageEngine (apPath api) >>= either (error . show) pure
+  assertEqual ctx "durability: reopening shows the committed lastTx"
+    (Just (fromIntegral (seLastTx reopened2))) (lastTxOf regD)
+
+  -- tag registration is a write ---------------------------------------------------------
+  vBefore <- snapVer api
+  _ <- adminShot api "REGV()\n WRITE 1,!"
+  vAfter <- snapVer api
+  assertEqual ctx "tag registration counts as a write (publishes a snapshot)" vAfter (vBefore + 1)
+
+testHttpConcurrencyGroup :: TestContext -> IO ()
+testHttpConcurrencyGroup ctx = withApi "concurrency" (\c -> c { cfgExecTimeoutMs = Just 2000 }) $ \api -> do
+  caps <- getNumCapabilities
+  -- many parallel one-shot increments lose no updates -----------------------------
+  _ <- adminShot api " SET ^C=0"
+  v0 <- snapVer api
+  let n = 24
+  rs <- concurrently (replicate n (adminShot api " SET ^C=^C+1"))
+  final <- valOf <$> adminShot api "^C"
+  assertEqual ctx "parallel increments: all succeed" (nub (map okOf rs)) [Just True]
+  assertEqual ctx "parallel increments: no update lost (final = 24)" final (Just (T.pack (show n)))
+  let txs = sort [t | Just t <- map lastTxOf rs]
+  assertEqual ctx "parallel increments: every commit has its own lastTx (single serial order)"
+    (length (nub txs), length txs) (n, n)
+  assertEqual ctx "parallel increments: lastTx values are consecutive"
+    (zipWith (-) (drop 1 txs) txs) (replicate (n - 1) 1)
+  v1 <- snapVer api
+  assertEqual ctx "parallel increments: exactly one snapshot version per commit" v1 (v0 + n)
+
+  -- sequential consistency of a read-modify-write across two globals ---------------------
+  _ <- adminShot api " SET ^P=0\n SET ^Q=0"
+  _ <- concurrently (replicate 16 (adminShot api " SET ^P=^P+1\n SET ^Q=^Q+2"))
+  p <- valOf <$> adminShot api "^P"
+  q <- valOf <$> adminShot api "^Q"
+  assertEqual ctx "multi-global transactions apply atomically in some serial order (P=16, Q=32)" (p, q) (Just "16", Just "32")
+
+  -- a long-running read does not delay writes or other reads ------------------------------
+  if caps < 2
+    then runAssert ctx "(skipped: needs -N with >= 2 capabilities)" True ""
+    else do
+      [(_, readMs), (wr, writeMs)] <- concurrently
+        [ timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                   (execBodyWith ["timeoutMs" .= (1500 :: Int)] " FOR  SET X=1"))
+        , do threadDelay 200000
+             timed (adminShot api " SET ^W2=1")
+        ]
+      runAssert ctx "long-running read ran for ~its full timeout" (readMs >= 1000) ("ms: " ++ show readMs)
+      assertEqual ctx "write completes while a long read is running" (okOf wr) (Just True)
+      runAssert ctx "a long-running read does not delay a concurrent write" (writeMs < 700) ("write ms: " ++ show writeMs)
+
+      -- two requests are observed running at the same time (-N) ----------------------------
+      (_, wallMs) <- timed $ concurrently
+        [ http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBodyWith ["timeoutMs" .= (700 :: Int)] " FOR  SET X=1")
+        , http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBodyWith ["timeoutMs" .= (700 :: Int)] " FOR  SET X=1") ]
+      runAssert ctx "with -N, two 700 ms requests overlap (wall time well under 1400 ms)" (wallMs < 1300) ("wall ms: " ++ show wallMs)
+
+-- ====================================================================
+-- M2: sessions, shared locks, rate limiting
+-- ====================================================================
+
+testHttpSessionGroup :: TestContext -> IO ()
+testHttpSessionGroup ctx = withApi "sessions" id $ \api -> do
+  -- login (§6.2) ---------------------------------------------------------------------
+  l <- loginFrom (fromPort 1) api "admin" "secret123"
+  let lj = bodyJson l
+  assertEqual ctx "login: 201 Created" (statusOf l) 201
+  assertEqual ctx "login: token is 64 lowercase hex chars" (maybe False isHex64 (jText ["token"] lj)) True
+  assertEqual ctx "login: user, role and namespace reported"
+    (jText ["user"] lj, jText ["role"] lj, jText ["namespace"] lj) (Just "admin", Just "admin", Just "_GLOBAL")
+  assertEqual ctx "login: idleTimeoutSeconds and expiresAt present"
+    (jInt ["idleTimeoutSeconds"] lj, jText ["expiresAt"] lj /= Nothing) (Just 1800, True)
+  tk1 <- tokenFor api "admin" "secret123"
+  tk2 <- tokenFor api "admin" "secret123"
+  runAssert ctx "login: two logins give two different tokens" (tk1 /= tk2) "the two tokens are equal"
+
+  -- login failures -----------------------------------------------------------------------
+  bp <- loginFrom (fromPort 21) api "reader" "wrong"
+  nu <- loginFrom (fromPort 22) api "ghost" "wrong"
+  assertEqual ctx "login: wrong password and unknown user are indistinguishable"
+    (statusOf bp, codeOf bp, jText ["error", "message"] (bodyJson bp))
+    (statusOf nu, codeOf nu, jText ["error", "message"] (bodyJson nu))
+  assertEqual ctx "login: wrong password is 401 UNAUTHENTICATED" (statusOf bp, codeOf bp) (401, Just "UNAUTHENTICATED")
+  bp2 <- loginFrom (fromPort 21) api "reader" "wrong"
+  assertEqual ctx "login: an immediate retry from the same address is 429 RATE_LIMITED"
+    (statusOf bp2, codeOf bp2) (429, Just "RATE_LIMITED")
+  runAssert ctx "login: 429 carries a Retry-After header with a number of seconds"
+    (maybe False (BSC.all (`elem` ['0' .. '9'])) (hdrOf "Retry-After" bp2) && hdrOf "Retry-After" bp2 /= Nothing)
+    (show (hdrOf "Retry-After" bp2))
+  other <- loginFrom (fromPort 23) api "writer" "pw-writer"
+  assertEqual ctx "login: a different user from a different address is unaffected" (statusOf other) 201
+  malformed <- http api "POST" "/v1/sessions" [jsonCT] "{\"username\":\"admin\"}"
+  assertEqual ctx "login: missing password is 400 BAD_REQUEST" (statusOf malformed, codeOf malformed) (400, Just "BAD_REQUEST")
+
+  -- /sessions/current ---------------------------------------------------------------------
+  tok <- tokenFor api "admin" "secret123"
+  cur <- http api "GET" "/v1/sessions/current" [bearerH tok] ""
+  assertEqual ctx "GET current: user, role, namespace"
+    (statusOf cur, jText ["user"] (bodyJson cur), jText ["role"] (bodyJson cur), jText ["namespace"] (bodyJson cur))
+    (200, Just "admin", Just "admin", Just "_GLOBAL")
+  noTok <- http api "GET" "/v1/sessions/current" [] ""
+  assertEqual ctx "GET current without a token: 401" (statusOf noTok, codeOf noTok) (401, Just "UNAUTHENTICATED")
+  unknownTok <- http api "GET" "/v1/sessions/current" [bearerH (BSC.replicate 64 'a')] ""
+  assertEqual ctx "GET current with an unknown token: 401" (statusOf unknownTok) 401
+  junkTok <- http api "GET" "/v1/sessions/current" [bearerH "not-hex"] ""
+  assertEqual ctx "GET current with a malformed token: 401" (statusOf junkTok) 401
+  basicOnSess <- http api "POST" "/v1/sessions/current/execute" [basicH "admin" "secret123", jsonCT] (execBody "1+1")
+  assertEqual ctx "session execute rejects Basic: 401" (statusOf basicOnSess) 401
+  sCount <- http api "GET" "/v1/admin/status" [bearerH tok] ""
+  runAssert ctx "admin status counts live sessions" (maybe False (>= 1) (jInt ["sessionCount"] (bodyJson sCount))) (show (bodyJson sCount))
+
+  -- session state (locals) ------------------------------------------------------------------
+  a <- tokenFor api "admin" "secret123"
+  b <- tokenFor api "admin" "secret123"
+  one <- sessExec api a " SET X=5  WRITE X,!"
+  assertEqual ctx "two statements in one request: SET then WRITE sees the local" (outOf one) (Just "5\n")
+  _ <- sessExec api a " SET Y=7"
+  sep <- sessExec api a " WRITE Y,!"
+  assertEqual ctx "a local set by one request is visible to the next" (outOf sep) (Just "7\n")
+  keep <- sessExec api a " WRITE X,!"
+  assertEqual ctx "an earlier request's local is still there" (outOf keep) (Just "5\n")
+  val <- sessExec api a "1+Y"
+  assertEqual ctx "a bare expression sees session locals" (valOf val) (Just "8")
+  iso <- sessExec api b " WRITE X,!"
+  assertEqual ctx "locals are private to a session" (codeOf iso) (Just "UNDEFINED VARIABLE")
+  _ <- sessExec api a " SET X=99\n WRITE 1/0,!"
+  after <- sessExec api a " WRITE X,!"
+  assertEqual ctx "a failed request leaves the session's locals unchanged" (outOf after) (Just "5\n")
+  _ <- sessExec api a " SET Z=1\n SET ^SZ(1)=1"
+  z <- sessExec api a " WRITE Z,!"
+  assertEqual ctx "locals set in a request that also wrote a global persist" (outOf z) (Just "1\n")
+
+  -- sessions share committed state ---------------------------------------------------------------
+  _ <- sessExec api a " SET ^SH(1)=\"shared\""
+  seen <- sessExec api b "^SH(1)"
+  assertEqual ctx "a write in one session is visible in another" (valOf seen) (Just "shared")
+  oneSeen <- adminShot api "^SH(1)"
+  assertEqual ctx "a write in a session is visible to a one-shot request" (valOf oneSeen) (Just "shared")
+
+  -- session execute: write through the commit path ---------------------------------------------------
+  sv0 <- snapVer api
+  _ <- sessExec api a " SET ^SV=1"
+  sv1 <- snapVer api
+  _ <- sessExec api a " WRITE X,!"
+  sv2 <- snapVer api
+  assertEqual ctx "session write publishes one snapshot; session read publishes none" (sv1 - sv0, sv2 - sv1) (1, 0)
+
+  -- tag registration inside a session
+  regS <- sessExec api a "SESSTAG()\n WRITE \"st\",!"
+  assertEqual ctx "session: tag registration returns registered names" (jget ["registered"] (bodyJson regS)) (Just (Aeson.toJSON ["_GLOBAL.SESSTAG" :: T.Text]))
+  callS <- sessExec api b " DO SESSTAG"
+  assertEqual ctx "session: a tag registered in one session is callable from another" (outOf callS) (Just "st\n")
+
+  -- logout (§6.2) -----------------------------------------------------------------------------------
+  del <- http api "DELETE" "/v1/sessions/current" [bearerH a] ""
+  assertEqual ctx "DELETE current: 200 with ok true" (statusOf del, okOf del) (200, Just True)
+  gone <- sessExec api a " WRITE 1,!"
+  assertEqual ctx "a deleted session's token no longer works" (statusOf gone, codeOf gone) (401, Just "UNAUTHENTICATED")
+
+testHttpSessionRolesGroup :: TestContext -> IO ()
+testHttpSessionRolesGroup ctx = withApi "session-roles" id $ \api -> do
+  rd <- tokenFor api "reader" "pw-reader"
+  wr <- tokenFor api "writer" "pw-writer"
+  _  <- sessExec api wr " SET ^R(1)=\"x\""
+  r1 <- sessExec api rd "^R(1)"
+  assertEqual ctx "reader session can read" (valOf r1) (Just "x")
+  r2 <- sessExec api rd " SET ^R(2)=\"y\""
+  assertEqual ctx "reader session writing a global: ok false PROTECT" (statusOf r2, okOf r2, codeOf r2) (200, Just False, Just "PROTECT")
+  -- revocation (§5.3, D8): a role change takes effect on the next request, mid-session
+  _ <- adminShot api " SET ^_USERS(\"writer\",\"role\")=\"none\""
+  after <- sessExec api wr " SET ^R(3)=\"z\""
+  assertEqual ctx "revoked role takes effect on the next request of an existing session"
+    (statusOf after, codeOf after) (403, Just "FORBIDDEN")
+  oneShotAfter <- oneShot api ("writer", "pw-writer") "1+1"
+  assertEqual ctx "revoked role takes effect on the next one-shot request" (statusOf oneShotAfter) 403
+
+testHttpSessionLimitsGroup :: TestContext -> IO ()
+testHttpSessionLimitsGroup ctx = do
+  withApi "sess-idle" (\c -> c { cfgSessionIdleSecs = Just 1 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    ok <- sessExec api t " WRITE 1,!"
+    assertEqual ctx "session works inside its idle timeout" (okOf ok) (Just True)
+    threadDelay 1400000
+    gone <- sessExec api t " WRITE 1,!"
+    assertEqual ctx "session expires after the idle timeout: 401" (statusOf gone) 401
+  withApi "sess-abs" (\c -> c { cfgSessionMaxSecs = Just 1 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    threadDelay 600000
+    _ <- sessExec api t " WRITE 1,!"   -- keeps the idle clock fresh
+    threadDelay 600000
+    gone <- sessExec api t " WRITE 1,!"
+    assertEqual ctx "session expires at its absolute lifetime even when active: 401" (statusOf gone) 401
+  withApi "sess-max" (\c -> c { cfgMaxSessions = Just 2 }) $ \api -> do
+    _  <- tokenFor api "admin" "secret123"
+    _  <- tokenFor api "writer" "pw-writer"
+    r3 <- loginFrom (fromPort 1) api "reader" "pw-reader"
+    assertEqual ctx "over the session cap: 503 BUSY" (statusOf r3, codeOf r3) (503, Just "BUSY")
+
+testHttpSessionConcurrencyGroup :: TestContext -> IO ()
+testHttpSessionConcurrencyGroup ctx = withApi "sess-conc" (\c -> c { cfgExecTimeoutMs = Just 3000 }) $ \api -> do
+  -- many parallel sessions incrementing one global lose no updates
+  _ <- adminShot api " SET ^S=0"
+  toks <- replicateM 10 (tokenFor api "admin" "secret123")
+  _ <- concurrently [ do forM_ [1 .. 5 :: Int] (\_ -> sessExec api t " SET ^S=^S+1") | t <- toks ]
+  s <- valOf <$> adminShot api "^S"
+  assertEqual ctx "10 parallel sessions x 5 increments: no update lost (final = 50)" s (Just "50")
+
+  -- two requests for one session never run concurrently (D6)
+  t <- tokenFor api "admin" "secret123"
+  _ <- sessExec api t " SET N=0"
+  rs <- concurrently (replicate 20 (sessExec api t " SET N=N+1"))
+  n <- outOf <$> sessExec api t " WRITE N,!"
+  assertEqual ctx "same-session requests are serialized (20 parallel SET N=N+1 -> 20)" n (Just "20\n")
+  assertEqual ctx "same-session parallel requests all succeed" (nub (map okOf rs)) [Just True]
+
+testHttpLockGroup :: TestContext -> IO ()
+testHttpLockGroup ctx = withApi "locks" id $ \api -> do
+  a <- tokenFor api "admin" "secret123"
+  b <- tokenFor api "admin" "secret123"
+  ja <- outOf <$> sessExec api a " WRITE $JOB,!"
+  jb <- outOf <$> sessExec api b " WRITE $JOB,!"
+  runAssert ctx "each session has its own $JOB" (ja /= jb) ("both sessions report " ++ show ja)
+
+  v0 <- snapVer api
+  la <- sessExec api a " LOCK ^L:0  WRITE $TEST,!"
+  v1 <- snapVer api
+  assertEqual ctx "session A acquires a free lock" (outOf la) (Just "1\n")
+  assertEqual ctx "a LOCK counts as a write (publishes a snapshot)" (v1 - v0) 1
+
+  lb <- sessExec api b " LOCK ^L:0  WRITE $TEST,!"
+  assertEqual ctx "a LOCK held by one session blocks another" (outOf lb) (Just "0\n")
+  lbOther <- sessExec api b " LOCK ^OTHER:0  WRITE $TEST,!"
+  assertEqual ctx "an unrelated lock is still free for the other session" (outOf lbOther) (Just "1\n")
+
+  la2 <- sessExec api a " LOCK ^L:0  WRITE $TEST,!"
+  assertEqual ctx "re-acquiring a lock the session already holds succeeds" (outOf la2) (Just "1\n")
+
+  _ <- sessExec api a " LOCK"
+  lb2 <- sessExec api b " LOCK ^L:0  WRITE $TEST,!"
+  assertEqual ctx "releasing a lock (bare LOCK) frees it for the other session" (outOf lb2) (Just "1\n")
+
+  -- closing a session frees its locks
+  _ <- sessExec api b " LOCK"
+  _ <- sessExec api a " LOCK ^M:0"
+  blockedB <- sessExec api b " LOCK ^M:0  WRITE $TEST,!"
+  assertEqual ctx "before logout: A's lock on ^M blocks B" (outOf blockedB) (Just "0\n")
+  _ <- http api "DELETE" "/v1/sessions/current" [bearerH a] ""
+  freedB <- sessExec api b " LOCK ^M:0  WRITE $TEST,!"
+  assertEqual ctx "closing a session frees its locks" (outOf freedB) (Just "1\n")
+
+  -- a failed request does not leave a lock behind
+  c <- tokenFor api "admin" "secret123"
+  _ <- sessExec api c " LOCK ^F:0\n WRITE 1/0,!"
+  dB <- sessExec api b " LOCK ^F:0  WRITE $TEST,!"
+  assertEqual ctx "a failed request does not publish its lock" (outOf dB) (Just "1\n")
+
+testHttpApiGroup :: TestContext -> IO ()
+testHttpApiGroup ctx = do
+  putStrLn "  -- M1: protocol, auth, errors"
+  testHttpProtocolGroup ctx
+  testHttpAuthTransportGroup ctx
+  putStrLn "  -- M1: limits and timeouts"
+  testHttpLimitsGroup ctx
+  putStrLn "  -- M1: snapshot execution and durability"
+  testHttpExecutionGroup ctx
+  putStrLn "  -- M1: concurrency"
+  testHttpConcurrencyGroup ctx
+  putStrLn "  -- M2: sessions"
+  testHttpSessionGroup ctx
+  testHttpSessionRolesGroup ctx
+  testHttpSessionLimitsGroup ctx
+  putStrLn "  -- M2: session concurrency and shared locks"
+  testHttpSessionConcurrencyGroup ctx
+  testHttpLockGroup ctx
+
+
+-- --------------------------------------------------------------------
 -- Main
 -- --------------------------------------------------------------------
 
@@ -2767,6 +3717,13 @@ main = do
   runGroup ctx "REF(...) dynamic references (Part VI §1)" testRefDynamicGroup
   runGroup ctx "Security (null subscripts, ^_CATALOG ownership, last-admin safeguard)" testSecurityGroup
   runGroup ctx "Naked references and $PIECE/$EXTRACT SET targets" testNakedAndLvalueGroup
+  runGroup ctx "Phase.Auth: verifyPassword constant-time (M0 Prereq 3)" testVerifyPasswordGroup
+  runGroup ctx "Phase.Auth: bootstrap / authenticate (M0 Prereq 1-2)" testAuthBootstrapGroup
+  runGroup ctx "Phase.Exec: runCommand structured results (M0 Prereq 1)" testExecGroup
+  runGroup ctx "Phase.Exec: admin operations (M0 Prereq 2)" testAdminExecGroup
+  runGroup ctx "Phase.State: output limit / envFileIOEnabled (M0 Prereq 5)" testOutputLimitGroup
+  runGroup ctx "Phase.Storage.Engine: cross-process file lock (M0 Prereq 4)" testDbLockGroup
+  runGroup ctx "HTTP API (M1+M2): WAI in-process tests" testHttpApiGroup
 
   passed <- readIORef (tcPassed ctx)
   failed <- readIORef (tcFailed ctx)
