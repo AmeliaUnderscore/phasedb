@@ -780,7 +780,12 @@ evalIntrinsic "$TRANSLATE" _ = throwError (NotImplemented "$TRANSLATE" "$TRANSLA
 evalIntrinsic "$JUSTIFY" _ = throwError (NotImplemented "$JUSTIFY" "$JUSTIFY is not implemented")
 evalIntrinsic "$SELECT" _ = throwError (NotImplemented "$SELECT" "$SELECT is not implemented")
 
-evalIntrinsic unknown _ = throwError (UndefinedFunction unknown)
+evalIntrinsic unknown _ = do
+  env <- getEnv
+  let u = T.toUpper unknown
+  if not (envFileIOEnabled env) && (u == "$BLOBWRITE" || u == "BLOBSAVE")
+    then throwError FileAccessDisabled
+    else throwError (UndefinedFunction unknown)
 
 -- --------------------------------------------------------------------
 -- Statement & Control Flow
@@ -1196,8 +1201,13 @@ evalStmt (SGoto (CallTarget mTag mRoutine _)) _ _ = do
       | otherwise ->
           gotoOtherNamespace tag routine env
 
-evalStmt (SUnsupported token fullText) _ _ =
-  throwError (NotImplemented token fullText)
+evalStmt (SUnsupported token fullText) _ _ = do
+  env <- getEnv
+  let tokU = T.toUpper token
+      fullU = T.toUpper fullText
+  if not (envFileIOEnabled env) && (tokU == "BLOBSAVE" || tokU == "$BLOBWRITE" || "BLOBSAVE" `T.isInfixOf` fullU || "$BLOBWRITE" `T.isInfixOf` fullU)
+    then throwError FileAccessDisabled
+    else throwError (NotImplemented token fullText)
 
 -- | Invoke a function or routine, returning its returned values.
 invokeTarget :: CallTarget -> Eval [PValue]

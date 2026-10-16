@@ -21,6 +21,7 @@ module Phase.Storage.Types
   , formatStorageError
   ) where
 
+import Data.ByteString (ByteString)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime)
@@ -86,6 +87,7 @@ data WalOp
     -- available approximation, consistent with history before a
     -- compaction being gone by design.
     --
+    --
     -- Deliberately carries ONLY live state, not historical revisions
     --, time-travel to any point at or after this checkpoint is
     -- served by loading this state and replaying the ordinary records
@@ -97,6 +99,17 @@ data WalOp
     -- time-travel to a point before this checkpoint still works by
     -- falling back to an earlier checkpoint (or the start of the
     -- file). Only compaction ever removes old records.
+  | WalBlob !Text !ByteString
+    -- ^ A content-addressed blob (§6.5 / Part XI).  'Text' is the
+    -- lower-case hex SHA-256 of the raw bytes; 'ByteString' is the
+    -- raw blob content.  Blobs are stored in @^_BLOBS@ metadata
+    -- (admin-only) and referenced from other globals as the string
+    -- value @\"blob:\<hash\>\"@.  Blobs cannot be written via ordinary
+    -- SET/KILL commands, only through the blob upload API, and they
+    -- survive checkpoints unchanged: 'takeCheckpoint' re-emits them
+    -- before the checkpoint record so they are never lost; 'compactTo'
+    -- GCs unreferenced ones (those not reachable from the baseline
+    -- live state OR from any future SET record in the kept tail).
   deriving (Eq, Show)
 
 -- | A discrete record stored in the write-ahead log.

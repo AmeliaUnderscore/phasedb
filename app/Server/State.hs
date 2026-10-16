@@ -47,6 +47,7 @@ module Server.State
   , effSessionMaxSecs
   , effMaxSessions
   , effQueueTimeoutMs
+  , effMaxBlobBytes
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
@@ -70,7 +71,7 @@ import Server.Config
   ( ServerConfig (..)
   , defaultExecTimeoutMaxMs, defaultExecTimeoutMs, defaultMaxBodyBytes
   , defaultMaxOutputBytes, defaultMaxSessions, defaultQueueTimeoutMs
-  , defaultSessionIdleSecs, defaultSessionMaxSecs
+  , defaultSessionIdleSecs, defaultSessionMaxSecs, defaultMaxBlobBytes
   )
 import Server.Session (SessionMap)
 
@@ -169,7 +170,8 @@ configValueText key def mFlag snap =
 -- the snapshot means a committed @SET@ applies from the next request.
 
 effMaxBodyBytes, effExecTimeoutMs, effExecTimeoutMaxMs, effMaxOutputBytes,
-  effSessionIdleSecs, effSessionMaxSecs, effMaxSessions, effQueueTimeoutMs
+  effSessionIdleSecs, effSessionMaxSecs, effMaxSessions, effQueueTimeoutMs,
+  effMaxBlobBytes
   :: ServerConfig -> Snapshot -> Int
 effMaxBodyBytes      cfg = configValueInt "maxBodyBytes"       defaultMaxBodyBytes      (cfgMaxBodyBytes cfg)
 effExecTimeoutMs     cfg = configValueInt "execTimeoutMs"      defaultExecTimeoutMs     (cfgExecTimeoutMs cfg)
@@ -179,6 +181,7 @@ effSessionIdleSecs   cfg = configValueInt "sessionIdleSeconds" defaultSessionIdl
 effSessionMaxSecs    cfg = configValueInt "sessionMaxSeconds"  defaultSessionMaxSecs    (cfgSessionMaxSecs cfg)
 effMaxSessions       cfg = configValueInt "maxSessions"        defaultMaxSessions       (cfgMaxSessions cfg)
 effQueueTimeoutMs    cfg = configValueInt "queueTimeoutMs"     defaultQueueTimeoutMs    (cfgQueueTimeoutMs cfg)
+effMaxBlobBytes      cfg = configValueInt "maxBlobBytes"       defaultMaxBlobBytes      (cfgMaxBlobBytes cfg)
 
 -- --------------------------------------------------------------------
 -- Config-source resolution (M3 §6.3 status)

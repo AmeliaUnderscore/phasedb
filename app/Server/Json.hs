@@ -19,6 +19,7 @@ module Server.Json
   , adminErrorBody
   , statusBody
   , buildAccessLogEntry
+  , blobUploadBody
 
     -- * Error code extraction
   , evalErrorCode
@@ -200,6 +201,17 @@ buildAccessLogEntry reqId mUser method path status elapsed bytes = object
   , "elapsedMs" .= elapsed
   , "bytes"     .= bytes
   ]
+
+-- | @PUT /v1/blobs@ response body (§6.5).
+blobUploadBody :: Text -> Text -> Int -> Text -> ByteString
+blobUploadBody pointer hash size reqId =
+  encode $ object
+    [ "ok"        .= True
+    , "pointer"   .= pointer
+    , "hash"      .= hash
+    , "size"      .= size
+    , "requestId" .= reqId
+    ]
 
 -- --------------------------------------------------------------------
 -- Error code extraction

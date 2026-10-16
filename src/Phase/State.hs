@@ -146,6 +146,12 @@ data EvalError
   -- equalled or exceeded 'envMaxOutputBytes'.  Raised instead of the
   -- @OUTPUT LIMIT@ error code described in the HTTP spec (§4.1); the
   -- server maps this constructor to that code.
+  | FileAccessDisabled
+  -- ^ A Phase statement that touches the server's host filesystem
+  -- (e.g. @BLOBSAVE@, @$BLOBWRITE@ with a path) was executed inside
+  -- an API session, where 'envFileIOEnabled' is @False@.  The HTTP
+  -- spec §6.5 requires these to raise @FILE ACCESS DISABLED@ for API
+  -- sessions.
   deriving (Eq, Show)
 
 -- | A raised condition (Part III §1): its name, upper-cased and without
@@ -210,6 +216,8 @@ formatError (Signaled c) =
     Nothing -> conditionMessage c
 formatError OutputLimitExceeded =
   "<OUTPUT LIMIT> maximum output size exceeded"
+formatError FileAccessDisabled =
+  "<FILE ACCESS DISABLED> filesystem I/O is not permitted in API sessions"
 
 -- --------------------------------------------------------------------
 -- Call Frames

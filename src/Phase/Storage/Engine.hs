@@ -40,6 +40,10 @@ module Phase.Storage.Engine
     -- * WAL Flushing
   , flushPendingWal
 
+    -- * Blob Store (§6.5 / Part XI)
+  , readBlob
+  , writeBlob
+
     -- * Checkpointing & Compaction
   , takeCheckpoint
   , compactTo
@@ -50,6 +54,8 @@ import Data.List (find, foldl', group)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime, getCurrentTime)
@@ -99,6 +105,7 @@ data StorageEngine = StorageEngine
   , sePendingWal   :: ![WalRecord]                                -- ^ WAL records queued for IO flush
   , seCommitsSinceCheckpoint :: !Int                              -- ^ Commits since the last checkpoint (manual or automatic); see 'maybeAutoCheckpoint'
   , seBytesSinceCheckpoint   :: !Int64                            -- ^ Bytes of encoded WAL records appended since the last checkpoint
+  , seBlobs        :: !(Map Text ByteString)                      -- ^ Content-addressed blob store: lower-case hex SHA-256 hash -> raw bytes (§6.5 / Part XI)
   } deriving (Eq, Show)
 
 -- | Initialize a fresh in-memory storage engine.
@@ -112,6 +119,7 @@ initStorageEngine = StorageEngine
   , sePendingWal   = []
   , seCommitsSinceCheckpoint = 0
   , seBytesSinceCheckpoint   = 0
+  , seBlobs        = Map.empty
   }
 
 -- --------------------------------------------------------------------
@@ -190,9 +198,11 @@ openStorageEngine walPath = do
           let (baseEngine, afterCheckpoint) = case findLastCheckpoint records of
                 Nothing -> (initStorageEngine { seWalPath = Just walPath }, records)
                 Just (idx, tx, ts, entries) ->
-                  ( (loadCheckpointEntries ts entries initStorageEngine) { seLastTx = tx, seWalPath = Just walPath }
-                  , drop (idx + 1) records
-                  )
+                  let priorBlobs = Map.fromList [ (h, b) | WalRecord _ (WalBlob h b) <- take (idx + 1) records ]
+                  in ( (loadCheckpointEntries ts entries initStorageEngine)
+                         { seLastTx = tx, seWalPath = Just walPath, seBlobs = priorBlobs }
+                     , drop (idx + 1) records
+                     )
           pure (Right (replayFrom baseEngine afterCheckpoint))
 
 -- | Find the LAST 'WalCheckpoint' record in a record list, with no
@@ -352,6 +362,9 @@ replayFrom baseEngine records = foldl replayRecord baseEngine records
           -- every entry it carries is exactly what the ordinary
           -- records up to that point would have produced anyway.
           (loadCheckpointEntries cpTs entries eng) { seLastTx = max cpTx (seLastTx eng) }
+
+        WalBlob hash bytes ->
+          eng { seBlobs = Map.insert hash bytes (seBlobs eng) }
 
 -- | Read a value from the live global storage.
 readLive :: Text -> [PValue] -> StorageEngine -> Either StorageError PValue
@@ -753,6 +766,37 @@ commitKillSubtree actingUser global subs commitTime eng =
        Right res -> res
        Left _    -> (seLastTx eng, eng)
 
+-- --------------------------------------------------------------------
+-- Blob Store (§6.5 / Part XI)
+-- --------------------------------------------------------------------
+
+-- | Look up a blob by its lower-case hex SHA-256 hash.  Returns
+-- 'Nothing' when no blob with that hash is in the current engine.
+readBlob :: Text -> StorageEngine -> Maybe ByteString
+readBlob hash eng = Map.lookup hash (seBlobs eng)
+
+-- | Store a new blob.  The blob is added to 'seBlobs' immediately
+-- (for reads within the same session), AND a 'WalBlob' record is
+-- queued in 'sePendingWal' so the blob is persisted on the next
+-- 'flushPendingWal'.  The caller is expected to call
+-- 'flushPendingWal' (through the normal commit path) before
+-- returning a success response.
+--
+-- If a blob with the same hash already exists this is a no-op: the
+-- content-addressed store is idempotent.
+writeBlob :: TxId -> Text -> ByteString -> StorageEngine -> StorageEngine
+writeBlob tx hash bytes eng
+  | Map.member hash (seBlobs eng) = eng  -- idempotent
+  | otherwise =
+      let blobRec = WalRecord tx (WalBlob hash bytes)
+      in eng { seBlobs     = Map.insert hash bytes (seBlobs eng)
+             , sePendingWal = sePendingWal eng ++ [blobRec]
+             }
+
+-- --------------------------------------------------------------------
+-- Transactional Commit & Optimistic Concurrency
+-- --------------------------------------------------------------------
+
 -- | Flush any pending WAL records to disk, clearing the pending queue.
 -- Should be called from the IO layer (REPL or transaction commit hook) after
 -- every operation that may have staged writes.
@@ -855,7 +899,11 @@ takeCheckpoint eng0 = do
       -- think a live path was never written).
       let lastTxFor g subs = Map.findWithDefault (seLastTx eng) (g, map toSubKey subs) (seLastTxMap eng)
           entries = [ (g, subs, val, lastTxFor g subs) | (g, node) <- Map.toList (seLive eng), (subs, val) <- dumpTree node ]
-      appendWalRecord path (WalRecord (seLastTx eng) (WalCheckpoint (seLastTx eng) now entries))
+          -- Re-emit all live blobs as WalBlob records BEFORE the checkpoint
+          -- so that a reader starting from this checkpoint can still load them.
+          blobRecs = [ WalRecord (seLastTx eng) (WalBlob h b) | (h, b) <- Map.toList (seBlobs eng) ]
+          cpRec = WalRecord (seLastTx eng) (WalCheckpoint (seLastTx eng) now entries)
+      appendWalRecords path (blobRecs ++ [cpRec])
       pure eng { seCommitsSinceCheckpoint = 0, seBytesSinceCheckpoint = 0 }
 
 -- | Compact (vacuum) a @.db@ file: permanently discard every record
@@ -900,9 +948,11 @@ compactTo path targetTx = do
       let (baseEngine, afterCheckpoint) = case findCheckpointBeforeTx targetTx records of
             Nothing -> (initStorageEngine, records)
             Just (idx, cpTx, cpTs, cpEntries) ->
-              ( (loadCheckpointEntries cpTs cpEntries initStorageEngine) { seLastTx = cpTx }
-              , drop (idx + 1) records
-              )
+              let priorBlobs = Map.fromList [ (h, b) | WalRecord _ (WalBlob h b) <- take (idx + 1) records ]
+              in ( (loadCheckpointEntries cpTs cpEntries initStorageEngine)
+                     { seLastTx = cpTx, seBlobs = priorBlobs }
+                 , drop (idx + 1) records
+                 )
           upToTarget = takeWhileUpToTx targetTx afterCheckpoint
           engineAtTarget = replayFrom baseEngine upToTarget
           keptRecords = filter (\(WalRecord tx _) -> tx > targetTx) records
@@ -915,10 +965,28 @@ compactTo path targetTx = do
           baselineEntries = [ (g, subs, val, lastTxFor g subs) | (g, node) <- Map.toList (seLive engineAtTarget), (subs, val) <- dumpTree node ]
           baselineCheckpoint = WalRecord targetTx (WalCheckpoint targetTx now baselineEntries)
 
+          -- Blob GC: keep only blobs referenced in the baseline live
+          -- state OR by any WalSet in the kept tail (a future SET
+          -- might reference a blob uploaded before the compaction point).
+          extractBlobHash v =
+            let (pfx, rest) = T.splitAt 5 (unPValue v)
+            in if T.toLower pfx == "blob:"
+               then Just (T.toLower rest)
+               else Nothing
+          liveHashes = Set.fromList
+            [ h | (_, _, val, _) <- baselineEntries, Just h <- [extractBlobHash val] ]
+          futureHashes = Set.fromList
+            [ h | WalRecord _ (WalSet _ _ val _) <- keptRecords, Just h <- [extractBlobHash val] ]
+          liveBlobs = liveHashes `Set.union` futureHashes
+          -- Emit WalBlob records only for the live set
+          blobRecs = [ WalRecord targetTx (WalBlob h b)
+                     | (h, b) <- Map.toList (seBlobs engineAtTarget)
+                     , Set.member h liveBlobs ]
+
       let tmpPath = path ++ ".compact-tmp"
       tmpExists <- doesFileExist tmpPath
       if tmpExists then removeFileIfExists tmpPath else pure ()
-      appendWalRecords tmpPath (baselineCheckpoint : keptRecords)
+      appendWalRecords tmpPath (blobRecs ++ [baselineCheckpoint] ++ keptRecords)
       renameFile tmpPath path
       pure (Right backupPath)
   where

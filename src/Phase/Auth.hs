@@ -300,14 +300,22 @@ authenticateUser username password eng =
 -- Permission checks
 -- --------------------------------------------------------------------
 
--- | Is @^_USERS@ or @^_CONFIG@, hardcoded admin-only for BOTH read
+-- | Is @^_USERS@, @^_CONFIG@, or @^_BLOBS@, hardcoded admin-only for BOTH read
 -- and write, unconditionally, regardless of role or the per-global
 -- denylist (which could otherwise, in principle, be misconfigured by
 -- an admin to loosen access to credential material). See the module
 -- header for why this is a hardcoded special case rather than
 -- expressed through the general mechanism.
 isHardcodedAdminOnlyGlobal :: Text -> Bool
-isHardcodedAdminOnlyGlobal g = g == "_USERS" || g == "_CONFIG"
+isHardcodedAdminOnlyGlobal g = g == "_USERS" || g == "_CONFIG" || g == "_BLOBS" || g == "_BLOB"
+
+-- | Is this global managed exclusively by its own API, so that even
+-- admins cannot write to it via ordinary SET/KILL?  Currently only
+-- @^_BLOBS@ / @^_BLOB@: blob content must be stored through the blob upload API
+-- (or the BLOB* built-ins), not through arbitrary Phase SET commands,
+-- so that hashes always match content and metadata stays consistent.
+isApiManagedGlobal :: Text -> Bool
+isApiManagedGlobal g = g == "_BLOBS" || g == "_BLOB"
 
 -- | Check whether a user may READ a given global. Returns 'Nothing'
 -- on success, or 'Just' a human-readable reason on denial (the caller
@@ -328,9 +336,12 @@ checkReadAccess username globalName eng
 
 -- | Check whether a user may WRITE (SET/KILL/MERGE) a given global.
 -- Same shape as 'checkReadAccess', requiring 'RWrite' instead of
--- 'RRead'.
+-- 'RRead'.  API-managed globals (@^_BLOBS@) are additionally blocked
+-- for direct writes even by admin, use the blob API instead.
 checkWriteAccess :: Text -> Text -> StorageEngine -> Maybe Text
 checkWriteAccess username globalName eng
+  | isApiManagedGlobal globalName =
+      Just (globalName <> " is managed by the blob API; use PUT /v1/blobs to add blobs")
   | isHardcodedAdminOnlyGlobal globalName && lookupUserRole username eng < RAdmin =
       Just ("only admin accounts may modify " <> globalName)
   | lookupUserRole username eng < RWrite =

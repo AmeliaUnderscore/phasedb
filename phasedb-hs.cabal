@@ -190,6 +190,7 @@ executable phasedb-server
                  , case-insensitive
                  , scientific
                  , warp-tls
+                 , parsec
 
     -- Directories containing source files.
     hs-source-dirs:   app
@@ -253,4 +254,5 @@ test-suite phasedb-hs-test
         base64-bytestring,
         clock,
         case-insensitive,
-        optparse-applicative
+        optparse-applicative,
+        warp-tls

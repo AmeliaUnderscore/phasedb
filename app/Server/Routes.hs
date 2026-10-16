@@ -40,23 +40,32 @@ import Network.HTTP.Types
   , status413, status429, status503, statusCode
   )
 import qualified Data.CaseInsensitive as CI
+import qualified Crypto.Hash as Hash
+import Data.ByteArray.Encoding (Base (Base16), convertToBase)
+import qualified Data.Set as Set
+import Text.Parsec (parse, eof)
+
 import Network.Wai
   ( Application, Request, Response
   , pathInfo, requestHeaders, requestMethod, responseLBS, getRequestBodyChunk
   , isSecure, mapResponseHeaders, remoteHost, rawPathInfo
-  , responseHeaders, responseStatus
+  , responseHeaders, responseStatus, queryString
   )
 import Data.Aeson (object, encode, (.=))
 import System.Clock (Clock (Monotonic), TimeSpec (..), getTime)
 
-import Phase.Auth (Role (..), lookupUserRole, roleToText)
+import Phase.AST (Expr (..), Ref (..), VarKind (..), PValue (..), mkValue, unPValue, UnOp (..), BinOp (..))
+import Phase.Auth (Role (..), lookupUserRole, roleToText, checkReadAccess, checkWriteAccess)
 import Phase.Exec (AdminError (..), applyAddUser, prepareNewUser)
+import Phase.Parser (pRef)
 import Phase.State (Env (..), EvalError (..), initEnvWithStorage)
 import Phase.Storage.Engine
   ( StorageEngine (..), compactTo, flushPendingWal, openStorageEngine
-  , seLastTx, takeCheckpoint
+  , seLastTx, takeCheckpoint, readBlob, writeBlob, commitTransaction, readLive
   )
-import Phase.Storage.Types (StorageError (..), TxId)
+import Phase.Storage.Transaction (TxHandle (..))
+import Phase.Storage.Types (StorageError (..), TxId, formatStorageError)
+import Phase.Tree (toSubKey)
 
 import Server.Auth
   ( Credential (..), CredError (..)
@@ -75,7 +84,7 @@ import Server.State
   ( ServerState (..), Snapshot (..), configSourceInt, withBoundedEngineLock
   , effExecTimeoutMaxMs, effExecTimeoutMs, effMaxBodyBytes, effMaxOutputBytes
   , effMaxSessions, effQueueTimeoutMs, effSessionIdleSecs, effSessionMaxSecs
-  , ssLogger
+  , effMaxBlobBytes, ssLogger
   )
 
 -- --------------------------------------------------------------------
@@ -203,6 +212,21 @@ dispatch ss guard  uRef reqId "POST"   ["v1","admin","compact"]         req resp
 
 dispatch ss guard  uRef reqId "POST"   ["v1","admin","users"]           req respond =
   handleAdminAddUser ss guard uRef reqId req respond
+
+dispatch ss guard  uRef reqId "PUT"    ["v1","blobs"]                   req respond =
+  handlePutBlob ss guard uRef reqId req respond
+
+dispatch ss guard  uRef reqId "GET"    ["v1","blobs"]                   req respond =
+  handleGetBlobRef False ss guard uRef reqId req respond
+
+dispatch ss guard  uRef reqId "HEAD"   ["v1","blobs"]                   req respond =
+  handleGetBlobRef True ss guard uRef reqId req respond
+
+dispatch ss guard  uRef reqId "GET"    ["v1","blobs",hash]              req respond =
+  handleGetBlobHash False ss guard uRef reqId hash req respond
+
+dispatch ss guard  uRef reqId "HEAD"   ["v1","blobs",hash]              req respond =
+  handleGetBlobHash True ss guard uRef reqId hash req respond
 
 dispatch _ss _guard _uRef reqId _method _path _req respond =
   respond (jsonErr status404 (transportError "NOT_FOUND" "unknown path" reqId))
@@ -618,18 +642,17 @@ withBearerSession ss uRef cfg reqId req respond action = do
           writeIORef uRef (Just (sessUser sess))
           action sess digest
 
--- | Run a handler only if the request carries valid admin credentials
--- (either Basic or Bearer) and the user has the admin role.
-withAdminAuth :: ServerState
-              -> LoginGuard
-              -> IORef (Maybe Text)
-              -> ServerConfig
-              -> Text
-              -> Request
-              -> (Response -> IO a)
-              -> (Text -> IO a)  -- ^ username
-              -> IO a
-withAdminAuth ss guard uRef cfg reqId req respond action = do
+-- | Authenticate a user via Basic or Bearer and return (username, role).
+withUserAuth :: ServerState
+             -> LoginGuard
+             -> IORef (Maybe Text)
+             -> ServerConfig
+             -> Text
+             -> Request
+             -> (Response -> IO a)
+             -> (Text -> Role -> IO a)  -- ^ username and role
+             -> IO a
+withUserAuth ss guard uRef cfg reqId req respond action = do
   snap <- readIORef (ssSnapshot ss)
   let eng        = snapEngine snap
       authHdrVal = lookupHeader hAuthorization req
@@ -647,9 +670,7 @@ withAdminAuth ss guard uRef cfg reqId req respond action = do
           let user = sessUser sess
           writeIORef uRef (Just user)
           let role = lookupUserRole user eng
-          if role < RAdmin
-            then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
-            else action user
+          action user role
     Right (BasicCred user password) -> do
       writeIORef uRef (Just user)
       let hasTls   = isSecure req
@@ -665,11 +686,208 @@ withAdminAuth ss guard uRef cfg reqId req respond action = do
                 (transportError "RATE_LIMITED" "too many login attempts" reqId))
             LoginFailed ->
               respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid credentials" reqId))
-            LoginOk ->
+            LoginOk -> do
               let role = lookupUserRole user eng
-              in if role < RAdmin
-                   then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
-                   else action user
+              action user role
+
+-- | Run a handler only if the request carries valid admin credentials
+-- (either Basic or Bearer) and the user has the admin role.
+withAdminAuth :: ServerState
+              -> LoginGuard
+              -> IORef (Maybe Text)
+              -> ServerConfig
+              -> Text
+              -> Request
+              -> (Response -> IO a)
+              -> (Text -> IO a)  -- ^ username
+              -> IO a
+withAdminAuth ss guard uRef cfg reqId req respond action =
+  withUserAuth ss guard uRef cfg reqId req respond $ \user role ->
+    if role < RAdmin
+      then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
+      else action user
+
+-- --------------------------------------------------------------------
+-- Blob Handlers (§6.5)
+-- --------------------------------------------------------------------
+
+-- | Parse a client ref query parameter, e.g. @^GLOBAL(1)@ or @GLOBAL(1)@.
+parseRefQueryParam :: Text -> Either Text (Text, [PValue])
+parseRefQueryParam raw =
+  let t = T.strip raw
+      withCaret = if "^" `T.isPrefixOf` t then t else "^" <> t
+  in case parse (pRef <* eof) "ref" withCaret of
+       Left _ -> Left "malformed ref parameter"
+       Right (Ref Global _ name subExprs _) ->
+         case mapM exprToPValue subExprs of
+           Just subs -> Right (name, subs)
+           Nothing   -> Left "subscripts in ref parameter must be literals"
+       Right _ -> Left "ref must target a global variable"
+  where
+    exprToPValue (Lit v) = Just v
+    exprToPValue (UnExpr Neg (Lit v)) = Just (mkValue ("-" <> unPValue v))
+    exprToPValue (UnExpr Pos (Lit v)) = Just v
+    exprToPValue (BinExpr Concat l r) = do
+      vl <- exprToPValue l
+      vr <- exprToPValue r
+      pure (mkValue (unPValue vl <> unPValue vr))
+    exprToPValue _ = Nothing
+
+-- | Check whether a value string is a blob pointer (@blob:<hash>@ or @BLOB:<hash>@).
+isBlobPointer :: Text -> Maybe Text
+isBlobPointer t
+  | "blob:" `T.isPrefixOf` t = Just (T.toLower (T.drop 5 t))
+  | "BLOB:" `T.isPrefixOf` t = Just (T.toLower (T.drop 5 t))
+  | otherwise                = Nothing
+
+-- | @PUT /v1/blobs@ handler (§6.5).
+handlePutBlob :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handlePutBlob ss guard uRef reqId req respond = do
+  snapB <- readIORef (ssSnapshot ss)
+  let cfg = ssConfig ss
+      maxBlob = effMaxBlobBytes cfg snapB
+  mBody <- readBodyCapped maxBlob req
+  case mBody of
+    Nothing ->
+      respond (jsonErr status413 (transportError "TOO_LARGE" "blob size exceeds maximum allowed" reqId))
+    Just bs -> do
+      let mRefParam = do
+            pair <- lookup "ref" (queryString req)
+            rawBytes <- pair
+            pure (TE.decodeUtf8 rawBytes)
+      case mapM parseRefQueryParam mRefParam of
+        Left err ->
+          respond (jsonErr status400 (transportError "BAD_REQUEST" err reqId))
+        Right mRef ->
+          withUserAuth ss guard uRef cfg reqId req respond $ \user role -> do
+            if role < RWrite
+              then respond (jsonErr status403 (transportError "FORBIDDEN" "write role required" reqId))
+              else do
+                let mDenied = case mRef of
+                      Nothing -> Nothing
+                      Just (g, _) -> checkWriteAccess user g (snapEngine snapB)
+                case mDenied of
+                  Just denial ->
+                    respond (jsonErr status403 (transportError "FORBIDDEN" denial reqId))
+                  Nothing -> do
+                    let digest = Hash.hashWith Hash.SHA256 bs :: Hash.Digest Hash.SHA256
+                        hexHash = T.toLower (TE.decodeUtf8 (convertToBase Base16 digest))
+                        pointer = "blob:" <> hexHash
+                        contentType = fromMaybe "application/octet-stream"
+                                        (lookup (CI.mk "Content-Type") (requestHeaders req))
+                        mFilename = lookup (CI.mk "X-Phase-Filename") (requestHeaders req)
+
+                    snapQ <- readIORef (ssSnapshot ss)
+                    let waitMs = effQueueTimeoutMs cfg snapQ
+                    mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked -> do
+                      let eng = snapEngine locked
+                          mDeniedLock = case mRef of
+                            Nothing -> Nothing
+                            Just (g, _) -> checkWriteAccess user g eng
+                      case mDeniedLock of
+                        Just denial -> pure (locked, Left (status403, transportError "FORBIDDEN" denial reqId))
+                        Nothing -> do
+                          now <- getCurrentTime
+                          let metaWrites =
+                                [ (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "size")]), (mkValue (T.pack (show (BS.length bs))), Nothing))
+                                , (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "contentType")]), (mkValue (TE.decodeUtf8 contentType), Nothing))
+                                ] ++
+                                [ (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "filename")]), (mkValue (TE.decodeUtf8 fn), Nothing))
+                                | Just fn <- [mFilename]
+                                ]
+                              refWrites = case mRef of
+                                Nothing -> []
+                                Just (g, subs) ->
+                                  [ ((g, map toSubKey subs), (mkValue pointer, Nothing)) ]
+                              allWrites = Map.fromList (metaWrites ++ refWrites)
+                              txH = TxHandle 0 now allWrites Set.empty Set.empty
+
+                          case commitTransaction user txH now eng of
+                            Left sErr ->
+                              pure (locked, Left (status400, transportError "BAD_REQUEST" (formatStorageError sErr) reqId))
+                            Right (newTx, engCommit) -> do
+                              let engWithBlob = writeBlob newTx hexHash bs engCommit
+                              storage' <- mask_ (flushPendingWal engWithBlob)
+                              let snap' = Snapshot
+                                    { snapEngine  = storage'
+                                    , snapLocks   = snapLocks locked
+                                    , snapVersion = snapVersion locked + 1
+                                    }
+                              writeIORef (ssSnapshot ss) snap'
+                              pure (snap', Right ())
+                    case mResult of
+                      Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
+                      Just (Left (st, b)) -> respond (jsonErr st b)
+                      Just (Right ()) ->
+                        respond (jsonOk (blobUploadBody pointer hexHash (BS.length bs) reqId))
+
+-- | @GET/HEAD /v1/blobs?ref=^GLOBAL(subs)@ handler (§6.5).
+handleGetBlobRef :: Bool -> ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleGetBlobRef isHead ss guard uRef reqId req respond = do
+  let mRefParam = do
+        pair <- lookup "ref" (queryString req)
+        rawBytes <- pair
+        pure (TE.decodeUtf8 rawBytes)
+  case mRefParam of
+    Nothing ->
+      respond (jsonErr status400 (transportError "BAD_REQUEST" "missing ref query parameter" reqId))
+    Just refTxt ->
+      case parseRefQueryParam refTxt of
+        Left err ->
+          respond (jsonErr status400 (transportError "BAD_REQUEST" err reqId))
+        Right (global, subs) ->
+          withUserAuth ss guard uRef (ssConfig ss) reqId req respond $ \user role -> do
+            snap <- readIORef (ssSnapshot ss)
+            let eng = snapEngine snap
+            if role < RRead
+              then respond (jsonErr status403 (transportError "FORBIDDEN" "read role required" reqId))
+              else case checkReadAccess user global eng of
+                Just denial ->
+                  respond (jsonErr status403 (transportError "FORBIDDEN" denial reqId))
+                Nothing ->
+                  case readLive global subs eng of
+                    Left _ ->
+                      respond (jsonErr status404 (transportError "NOT_FOUND" "node not found" reqId))
+                    Right pVal ->
+                      case isBlobPointer (unPValue pVal) of
+                        Nothing ->
+                          respond (jsonErr status400 (transportError "BAD_REQUEST" "node is not a blob pointer" reqId))
+                        Just hexHash ->
+                          case readBlob hexHash eng of
+                            Nothing ->
+                              respond (jsonErr status404 (transportError "NOT_FOUND" "blob data not found" reqId))
+                            Just bs -> do
+                              let ctype = case readLive "_BLOBS" [mkValue hexHash, mkValue "contentType"] eng of
+                                    Right ct -> TE.encodeUtf8 (unPValue ct)
+                                    Left _   -> "application/octet-stream"
+                                  hdrs = [ (hContentType, ctype)
+                                         , (CI.mk "Content-Length", BSC.pack (show (BS.length bs)))
+                                         ]
+                                  body = if isHead then "" else LBS.fromStrict bs
+                              respond (responseLBS status200 hdrs body)
+
+-- | @GET/HEAD /v1/blobs/{hash}@ bare-hash handler (§6.5, admin only).
+handleGetBlobHash :: Bool -> ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Text -> Request -> (Response -> IO a) -> IO a
+handleGetBlobHash isHead ss guard uRef reqId rawHash req respond =
+  withUserAuth ss guard uRef (ssConfig ss) reqId req respond $ \_user role -> do
+    if role < RAdmin
+      then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
+      else do
+        snap <- readIORef (ssSnapshot ss)
+        let eng = snapEngine snap
+            hexHash = T.toLower rawHash
+        case readBlob hexHash eng of
+          Nothing ->
+            respond (jsonErr status404 (transportError "NOT_FOUND" "blob not found" reqId))
+          Just bs -> do
+            let ctype = case readLive "_BLOBS" [mkValue hexHash, mkValue "contentType"] eng of
+                  Right ct -> TE.encodeUtf8 (unPValue ct)
+                  Left _   -> "application/octet-stream"
+                hdrs = [ (hContentType, ctype)
+                       , (CI.mk "Content-Length", BSC.pack (show (BS.length bs)))
+                       ]
+                body = if isHead then "" else LBS.fromStrict bs
+            respond (responseLBS status200 hdrs body)
 
 -- --------------------------------------------------------------------
 -- Response helpers

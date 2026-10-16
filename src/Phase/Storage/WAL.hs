@@ -87,7 +87,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Int (Int64)
-import Data.Word (Word8, Word32, Word64)
+import Data.Word (Word8, Word32)
 import System.Directory (doesFileExist, getFileSize)
 import System.IO (IOMode (..), hSetFileSize, withBinaryFile)
 
@@ -114,11 +114,13 @@ import Phase.Storage.Types (StorageError (..), TxId, WalOp (..), WalRecord (..))
 --        (test-only) databases across this bump is fine, so there is
 --        no dual-format reader, a v1 file simply won't have this
 --        version byte and will be treated as unreadable.
+--   3 -- 'WalBlob' (tag 6) added for content-addressed blob storage
+--        (§6.5 / Part XI); v2 files are unreadable with this version.
 dbFileHeader :: BS.ByteString
 dbFileHeader = BS.pack ([0x50, 0x48, 0x44, 0x42] ++ [formatVersion])
   where
     formatVersion :: Word8
-    formatVersion = 2
+    formatVersion = 3
 
 -- --------------------------------------------------------------------
 -- Primitive field encoders/decoders
@@ -233,6 +235,11 @@ encodeWalOp (WalCheckpoint tx ts entries) = do
       putPValueList subs
       putText (unPValue val)
       P.putWord64be lastTx
+encodeWalOp (WalBlob hash bytes) = do
+  P.putWord8 6
+  putText hash
+  P.putWord64be (fromIntegral (BS.length bytes))
+  P.putByteString bytes
 
 -- | Decode a 'WalOp' from its binary representation.
 decodeWalOp :: G.Get WalOp
@@ -255,6 +262,11 @@ decodeWalOp = do
       n <- G.getWord64be
       entries <- mapM (const getEntry) [1 .. n]
       pure (WalCheckpoint tx ts entries)
+    6 -> do
+      hash <- getText
+      len <- G.getWord64be
+      bytes <- G.getByteString (fromIntegral len)
+      pure (WalBlob hash bytes)
     _ -> fail ("invalid WalOp tag: " ++ show tag)
   where
     getEntry = do

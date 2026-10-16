@@ -19,6 +19,7 @@ module Server.Config
   , resolveSessionMaxSecs
   , resolveMaxSessions
   , resolveQueueTimeoutMs
+  , resolveMaxBlobBytes
     -- * Built-in defaults (the last tier of the D9 resolution order)
   , defaultMaxBodyBytes
   , defaultExecTimeoutMs
@@ -28,6 +29,7 @@ module Server.Config
   , defaultSessionMaxSecs
   , defaultMaxSessions
   , defaultQueueTimeoutMs
+  , defaultMaxBlobBytes
   ) where
 
 import Options.Applicative
@@ -54,6 +56,7 @@ data ServerConfig = ServerConfig
   , cfgQueueTimeoutMs    :: !(Maybe Int) -- ^ --queue-timeout-ms
   , cfgCorsOrigin        :: !(Maybe String) -- ^ --cors-origin
   , cfgAllowInsecureBasic :: !Bool       -- ^ --allow-insecure-basic
+  , cfgMaxBlobBytes      :: !(Maybe Int) -- ^ --max-blob-bytes (max single-blob upload size)
   } deriving (Show)
 
 -- | Hard-coded defaults used when neither a flag nor the database
@@ -75,6 +78,7 @@ defaultConfig = ServerConfig
   , cfgQueueTimeoutMs    = Nothing
   , cfgCorsOrigin        = Nothing
   , cfgAllowInsecureBasic = False
+  , cfgMaxBlobBytes      = Nothing
   }
 
 -- | Built-in defaults used when a 'Nothing' flag value needs a concrete
@@ -104,6 +108,11 @@ defaultMaxSessions = 256
 defaultQueueTimeoutMs :: Int
 defaultQueueTimeoutMs = 5000
 
+-- | Default max blob upload size (10 MiB). Blobs larger than this are
+-- rejected with HTTP 413 unless @--max-blob-bytes@ overrides it.
+defaultMaxBlobBytes :: Int
+defaultMaxBlobBytes = 10 * 1024 * 1024  -- 10 MiB
+
 -- Re-export so Routes/Execute can use them without importing this module twice.
 resolveMaxBodyBytes :: ServerConfig -> Int
 resolveMaxBodyBytes cfg = maybe defaultMaxBodyBytes id (cfgMaxBodyBytes cfg)
@@ -128,6 +137,9 @@ resolveMaxSessions cfg = maybe defaultMaxSessions id (cfgMaxSessions cfg)
 
 resolveQueueTimeoutMs :: ServerConfig -> Int
 resolveQueueTimeoutMs cfg = maybe defaultQueueTimeoutMs id (cfgQueueTimeoutMs cfg)
+
+resolveMaxBlobBytes :: ServerConfig -> Int
+resolveMaxBlobBytes cfg = maybe defaultMaxBlobBytes id (cfgMaxBlobBytes cfg)
 
 -- | Parse command-line arguments into 'ServerConfig'.
 parseArgs :: IO ServerConfig
@@ -161,6 +173,7 @@ configParser = ServerConfig
   <*> optional (option auto ( long "queue-timeout-ms" <> metavar "N" <> help "Engine-lock wait timeout (default 5000)" ))
   <*> optional (strOption ( long "cors-origin" <> metavar "ORIGIN" <> help "Allowed CORS origin (off by default)" ))
   <*> switch ( long "allow-insecure-basic" <> help "Allow Basic auth on non-TLS, non-loopback connections" )
+  <*> optional (option auto ( long "max-blob-bytes" <> metavar "N" <> help "Max blob upload size in bytes (default 10 MiB)" ))
 
 -- | Validate TLS certificate and private key configuration (§9.1, §10).
 -- Returns 'Right Nothing' if TLS is disabled (neither cert nor key given),

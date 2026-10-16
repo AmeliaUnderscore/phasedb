@@ -358,6 +358,7 @@ isCommandKeyword kw =
     , "QUIT", "RETURN", "NEW", "MERGE", "LOCK", "UNLOCK", "END", "NAMESPACE"
     , "EVALUATE", "WHEN"
     , "CONDITION", "SIGNAL", "HANDLE", "CATCH", "RETRY"
+    , "BLOBSAVE", "BLOBMETA"
     ]
 
 -- | Does the current accumulated text need more input before it can

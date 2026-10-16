@@ -4222,6 +4222,194 @@ testHttpM4Group ctx = do
   testCorsGroup ctx
   testAccessLogGroup ctx
 
+-- | M5: Blob storage and HTTP endpoints (§6.5).
+testHttpM5Group :: TestContext -> IO ()
+testHttpM5Group ctx = do
+  -- 1. PUT /v1/blobs basics & auth
+  withApi "m5-put-auth" id $ \api -> do
+    r1 <- http api "PUT" "/v1/blobs" [] "data"
+    assertEqual ctx "PUT /v1/blobs unauthenticated -> 401" (statusOf r1) 401
+
+    r2 <- http api "PUT" "/v1/blobs" [basicH "reader" "pw-reader"] "data"
+    assertEqual ctx "PUT /v1/blobs reader role -> 403" (statusOf r2) 403
+
+    r3 <- http api "PUT" "/v1/blobs" [basicH "writer" "pw-writer"] "hello world blob"
+    assertEqual ctx "PUT /v1/blobs writer role -> 200" (statusOf r3) 200
+    assertEqual ctx "PUT /v1/blobs ok is true" (okOf r3) (Just True)
+    assertEqual ctx "PUT /v1/blobs size is 16" (jInt ["size"] (bodyJson r3)) (Just 16)
+    case jText ["hash"] (bodyJson r3) of
+      Just h -> do
+        assertEqual ctx "PUT /v1/blobs pointer matches hash"
+          (jText ["pointer"] (bodyJson r3)) (Just ("blob:" <> h))
+      _ -> runAssert ctx "PUT /v1/blobs hash returned" False (show (simpleBody r3))
+
+  -- 2. PUT with ?ref=^GLOBAL(subs) and GET / HEAD by reference
+  withApi "m5-ref-roundtrip" id $ \api -> do
+    let uploadHdrs = [ basicH "writer" "pw-writer"
+                     , (hContentType, "text/plain")
+                     , (CI.mk "X-Phase-Filename", "test.txt")
+                     ]
+    rPut <- http api "PUT" "/v1/blobs?ref=^DOCS(1)" uploadHdrs "my document content"
+    assertEqual ctx "PUT with ref -> 200" (statusOf rPut) 200
+
+    let hash = fromMaybe "" (jText ["hash"] (bodyJson rPut))
+
+    -- GET by ref (unauthenticated -> 401)
+    rGetNoAuth <- http api "GET" "/v1/blobs?ref=^DOCS(1)" [] ""
+    assertEqual ctx "GET by ref unauthenticated -> 401" (statusOf rGetNoAuth) 401
+
+    -- GET by ref as reader -> 200
+    rGetReader <- http api "GET" "/v1/blobs?ref=^DOCS(1)" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET by ref reader -> 200" (statusOf rGetReader) 200
+    assertEqual ctx "GET by ref returns body" (simpleBody rGetReader) "my document content"
+    assertEqual ctx "GET by ref content-type header"
+      (hdrOf "Content-Type" rGetReader) (Just "text/plain")
+    assertEqual ctx "GET by ref content-length header"
+      (hdrOf "Content-Length" rGetReader) (Just "19")
+
+    -- HEAD by ref as reader -> 200 with empty body
+    rHeadReader <- http api "HEAD" "/v1/blobs?ref=^DOCS(1)" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "HEAD by ref reader -> 200" (statusOf rHeadReader) 200
+    assertEqual ctx "HEAD by ref empty body" (simpleBody rHeadReader) ""
+    assertEqual ctx "HEAD by ref content-length header"
+      (hdrOf "Content-Length" rHeadReader) (Just "19")
+
+    -- Missing ref query parameter -> 400
+    rNoRef <- http api "GET" "/v1/blobs" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET without ref param -> 400" (statusOf rNoRef) 400
+
+    -- Malformed ref -> 400
+    rBadRef <- http api "GET" "/v1/blobs?ref=123bad" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET with malformed ref -> 400" (statusOf rBadRef) 400
+
+    -- Non-existent ref -> 404
+    rNotFoundRef <- http api "GET" "/v1/blobs?ref=^MISSING(999)" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET with missing node -> 404" (statusOf rNotFoundRef) 404
+
+    -- Node that exists but is not a blob pointer -> 400
+    _ <- http api "POST" "/v1/execute" [basicH "writer" "pw-writer", jsonCT]
+           "{\"command\":\"SET ^NOTBLOB(1)=\\\"just a string\\\"\"}"
+    rNotBlob <- http api "GET" "/v1/blobs?ref=^NOTBLOB(1)" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET on non-blob node -> 400" (statusOf rNotBlob) 400
+
+    -- 3. Bare-hash access GET /v1/blobs/{hash} (admin only)
+    let hashPath = BSC.pack ("/v1/blobs/" ++ T.unpack hash)
+    -- Reader forbidden
+    rHashReader <- http api "GET" hashPath [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "GET by hash reader -> 403" (statusOf rHashReader) 403
+
+    -- Writer forbidden
+    rHashWriter <- http api "GET" hashPath [basicH "writer" "pw-writer"] ""
+    assertEqual ctx "GET by hash writer -> 403" (statusOf rHashWriter) 403
+
+    -- Admin success
+    rHashAdmin <- http api "GET" hashPath [basicH "admin" "secret123"] ""
+    assertEqual ctx "GET by hash admin -> 200" (statusOf rHashAdmin) 200
+    assertEqual ctx "GET by hash admin body" (simpleBody rHashAdmin) "my document content"
+
+    -- Admin HEAD by hash
+    rHeadAdmin <- http api "HEAD" hashPath [basicH "admin" "secret123"] ""
+    assertEqual ctx "HEAD by hash admin -> 200" (statusOf rHeadAdmin) 200
+    assertEqual ctx "HEAD by hash admin empty body" (simpleBody rHeadAdmin) ""
+    assertEqual ctx "HEAD by hash admin length"
+      (hdrOf "Content-Length" rHeadAdmin) (Just "19")
+
+    -- Unknown hash -> 404
+    rHashUnknown <- http api "GET" "/v1/blobs/0000000000000000000000000000000000000000000000000000000000000000"
+                      [basicH "admin" "secret123"] ""
+    assertEqual ctx "GET unknown hash -> 404" (statusOf rHashUnknown) 404
+
+  -- 4. Max blob size limit (--max-blob-bytes)
+  withApi "m5-max-blob-bytes" (\c -> c { cfgMaxBlobBytes = Just 10 }) $ \api -> do
+    -- 10 bytes -> OK
+    r10 <- http api "PUT" "/v1/blobs" [basicH "writer" "pw-writer"] "0123456789"
+    assertEqual ctx "PUT blob <= max-blob-bytes -> 200" (statusOf r10) 200
+
+    -- 11 bytes -> 413
+    r11 <- http api "PUT" "/v1/blobs" [basicH "writer" "pw-writer"] "0123456789A"
+    assertEqual ctx "PUT blob > max-blob-bytes -> 413" (statusOf r11) 413
+
+  -- 5. Protection of ^_BLOBS / ^_BLOB array
+  withApi "m5-blob-protection" id $ \api -> do
+    -- Admin cannot SET ^_BLOBS directly
+    rSetBlobsAdmin <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                        "{\"command\":\"SET ^_BLOBS(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^_BLOBS by admin fails" (okOf rSetBlobsAdmin) (Just False)
+
+    -- Admin cannot SET ^_BLOB directly
+    rSetBlobAdmin <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                       "{\"command\":\"SET ^_BLOB(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^_BLOB by admin fails" (okOf rSetBlobAdmin) (Just False)
+
+    -- Writer cannot SET ^_BLOBS
+    rSetBlobsWriter <- http api "POST" "/v1/execute" [basicH "writer" "pw-writer", jsonCT]
+                         "{\"command\":\"SET ^_BLOBS(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^_BLOBS by writer fails" (okOf rSetBlobsWriter) (Just False)
+
+    -- Reader cannot read ^_BLOBS
+    rReadBlobsReader <- http api "POST" "/v1/execute" [basicH "reader" "pw-reader", jsonCT]
+                          "{\"command\":\"WRITE ^_BLOBS(1)\"}"
+    assertEqual ctx "Read ^_BLOBS by reader fails" (okOf rReadBlobsReader) (Just False)
+
+  -- 6. Disabling host filesystem I/O statements in API sessions
+  withApi "m5-file-io-disabled" id $ \api -> do
+    -- BLOBSAVE raises <FILE ACCESS DISABLED>
+    rBlobSave <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                   "{\"command\":\"BLOBSAVE \\\"foo\\\"\"}"
+    assertEqual ctx "BLOBSAVE in API session ok is false" (okOf rBlobSave) (Just False)
+    assertEqual ctx "BLOBSAVE error code is FILE ACCESS DISABLED"
+      (codeOf rBlobSave) (Just "FILE ACCESS DISABLED")
+
+    -- $BLOBWRITE with path raises <FILE ACCESS DISABLED>
+    rBlobWrite <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
+                    "{\"command\":\"WRITE $BLOBWRITE(\\\"/tmp/test\\\")\"}"
+    assertEqual ctx "$BLOBWRITE in API session ok is false" (okOf rBlobWrite) (Just False)
+    assertEqual ctx "$BLOBWRITE error code is FILE ACCESS DISABLED"
+      (codeOf rBlobWrite) (Just "FILE ACCESS DISABLED")
+
+  -- 7. Durability across database reopen, Checkpoint, and Compaction GC
+  withApi "m5-durability-and-gc" id $ \api -> do
+    -- Upload blob 1 with reference
+    rBlob1 <- http api "PUT" "/v1/blobs?ref=^SAVED(1)" [basicH "writer" "pw-writer"] "blob one to keep"
+    assertEqual ctx "Upload blob 1 -> 200" (statusOf rBlob1) 200
+    let hash1 = fromMaybe "" (jText ["hash"] (bodyJson rBlob1))
+
+    -- Upload blob 2 without reference (orphan blob)
+    rBlob2 <- http api "PUT" "/v1/blobs" [basicH "writer" "pw-writer"] "blob two orphan"
+    assertEqual ctx "Upload blob 2 -> 200" (statusOf rBlob2) 200
+    let hash2 = fromMaybe "" (jText ["hash"] (bodyJson rBlob2))
+
+    -- Checkpoint
+    rCp <- http api "POST" "/v1/admin/checkpoint" [basicH "admin" "secret123", jsonCT] "{}"
+    assertEqual ctx "Checkpoint -> 200" (statusOf rCp) 200
+
+    -- Both blobs readable by admin before compaction
+    rGet1Before <- http api "GET" (BSC.pack ("/v1/blobs/" ++ T.unpack hash1)) [basicH "admin" "secret123"] ""
+    assertEqual ctx "Blob 1 readable before compaction" (statusOf rGet1Before) 200
+    rGet2Before <- http api "GET" (BSC.pack ("/v1/blobs/" ++ T.unpack hash2)) [basicH "admin" "secret123"] ""
+    assertEqual ctx "Blob 2 readable before compaction" (statusOf rGet2Before) 200
+
+    -- Compact database: discard history up to current lastTx
+    snap <- readIORef (ssSnapshot (apSS api))
+    let curTx = seLastTx (snapEngine snap)
+    let compactBody = Aeson.encode (Aeson.object ["beforeTx" .= curTx])
+    rCompact <- http api "POST" "/v1/admin/compact" [basicH "admin" "secret123", jsonCT] compactBody
+    assertEqual ctx "Compact -> 200" (statusOf rCompact) 200
+
+    -- Referenced blob 1 survived compaction
+    rGet1After <- http api "GET" (BSC.pack ("/v1/blobs/" ++ T.unpack hash1)) [basicH "admin" "secret123"] ""
+    assertEqual ctx "Referenced blob 1 survived compaction" (statusOf rGet1After) 200
+    assertEqual ctx "Referenced blob 1 content intact" (simpleBody rGet1After) "blob one to keep"
+
+    -- Also readable by reference
+    rGet1RefAfter <- http api "GET" "/v1/blobs?ref=^SAVED(1)" [basicH "reader" "pw-reader"] ""
+    assertEqual ctx "Referenced blob 1 readable via ref after compaction" (statusOf rGet1RefAfter) 200
+    assertEqual ctx "Referenced blob 1 ref content intact" (simpleBody rGet1RefAfter) "blob one to keep"
+
+    -- Orphan blob 2 was garbage-collected by compaction!
+    rGet2After <- http api "GET" (BSC.pack ("/v1/blobs/" ++ T.unpack hash2)) [basicH "admin" "secret123"] ""
+    assertEqual ctx "Unreferenced blob 2 was garbage collected" (statusOf rGet2After) 404
+
 testHttpApiGroup :: TestContext -> IO ()
 testHttpApiGroup ctx = do
   putStrLn "  -- M1: protocol, auth, errors"
@@ -4246,6 +4434,8 @@ testHttpApiGroup ctx = do
   testHttpAdminGroup ctx
   putStrLn "  -- M4: TLS validation, access log, CORS"
   testHttpM4Group ctx
+  putStrLn "  -- M5: blob upload/download, ref addressing, hash access, GC"
+  testHttpM5Group ctx
 
 
 -- --------------------------------------------------------------------

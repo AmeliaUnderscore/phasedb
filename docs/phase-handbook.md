@@ -23,6 +23,9 @@ The handbook has these parts:
 - **Part XIII**, intrinsic function reference.
 - **Part XIV**, using the REPL.
 - **Part XV**, what Phase does not implement yet.
+- **Part XVI**, the HTTP server: running the server, TLS, auth, sessions,
+  execute endpoints, admin endpoints, blob endpoints, configuration,
+  graceful shutdown.
 - Appendices: error reference, operator precedence quick reference.
 
 ---
@@ -1787,3 +1790,515 @@ _                              string concatenation
 
 `s[start:end]` slice syntax binds tighter than every operator above, as a
 postfix wrap directly on the value that comes before it.
+
+---
+
+# Part XVI, The HTTP Server
+
+PhaseDB ships a standalone HTTP server, `phasedb-server`, that exposes
+the database over a JSON/REST API. All data access goes through Phase
+commands, so there is one authorization path. The server owns the
+database file exclusively while it runs: neither the REPL nor another
+server instance may open the same file at the same time.
+
+## 1. Starting the server
+
+```
+phasedb-server --db phase.db --port 8484
+```
+
+The server binds `127.0.0.1` by default. Change the address with
+`--listen`:
+
+```
+phasedb-server --db phase.db --listen 0.0.0.0 --port 8484
+```
+
+Binding to a non-loopback address without TLS requires
+`--allow-insecure-basic` (see §2). The server will refuse to start
+without it.
+
+The database file is created on first run if it does not exist. On
+startup the server takes an exclusive lock on `<db>.lock` for its
+lifetime. If another process already holds that lock the server exits
+immediately. The REPL takes the same lock, so the two cannot race on
+the same file.
+
+## 2. TLS
+
+TLS is built in via `warp-tls`. Provide PEM files at startup:
+
+```
+phasedb-server --db phase.db \
+               --tls-cert /etc/phasedb/server.crt \
+               --tls-key  /etc/phasedb/server.key
+```
+
+TLS 1.2 or newer is required. Without `--tls-cert`/`--tls-key` the
+server speaks plain HTTP and will only accept `Basic` authentication
+from a loopback connection, unless `--allow-insecure-basic` is given
+(not recommended for production).
+
+A reverse-proxy setup is also valid: terminate TLS at the proxy, pass
+plain HTTP to `127.0.0.1:8484`, and set `--allow-insecure-basic` so
+that the server accepts credentials from the proxy.
+
+## 3. CORS
+
+CORS is off by default. Enable it for a specific origin:
+
+```
+phasedb-server --db phase.db --cors-origin https://app.example.com
+```
+
+Wildcard origins with credentials are never permitted.
+
+## 4. Authentication
+
+### 4.1 Roles
+
+Every user account has a role: `none`, `read`, `write`, or `admin`.
+`none` cannot make any API calls. `admin` is the highest role; `read`
+is the lowest useful one. Per-global denylists work exactly as in the
+REPL.
+
+The server re-reads the caller's role and denylist on every request
+(decision D8 in the spec). A role change or account deletion takes
+effect on the very next request, even inside a running session.
+
+### 4.2 Basic authentication (one-shot)
+
+Send `Authorization: Basic base64(username:password)` with the
+request. The request runs with fresh locals in the `_GLOBAL` namespace
+and leaves no session behind. Locks taken during the request are
+released when it finishes. PBKDF2-SHA256 runs on every one-shot call;
+clients that call frequently should log in once and use a session
+token.
+
+### 4.3 Session tokens (Bearer)
+
+Log in once:
+
+```
+POST /v1/sessions
+Content-Type: application/json
+
+{ "username": "alice", "password": "secret" }
+```
+
+Response (HTTP 201):
+
+```json
+{
+  "token": "3f8a…",
+  "expiresAt": "2026-10-14T08:00:00Z",
+  "idleTimeoutSeconds": 1800,
+  "user": "alice",
+  "role": "write",
+  "namespace": "_GLOBAL"
+}
+```
+
+Use the token for subsequent requests:
+
+```
+Authorization: Bearer 3f8a…
+```
+
+A session keeps local variables, the current namespace, held `LOCK`s,
+and a unique `$JOB` id between requests. Two concurrent requests for
+the same session queue; the second waits at most `queueTimeoutMs`
+before getting `503 BUSY`.
+
+Sessions expire after 30 minutes of inactivity (`--session-idle-seconds`,
+default 1800) or 12 hours absolute (`--session-max-seconds`, default
+43200). Sessions do not survive a server restart.
+
+Inspect the current session:
+
+```
+GET /v1/sessions/current
+Authorization: Bearer 3f8a…
+```
+
+Log out:
+
+```
+DELETE /v1/sessions/current
+Authorization: Bearer 3f8a…
+```
+
+Logout waits for any request already running in that session, then
+removes the session and releases its `LOCK`s.
+
+### 4.4 Rate limiting
+
+Repeated login failures trigger per-username and per-source-address
+backoff with exponential delay. A `429` response carries a
+`Retry-After` header. At most four PBKDF2 verifications run concurrently;
+further attempts receive `503`.
+
+## 5. Execute endpoints
+
+### 5.1 One-shot execute
+
+```
+POST /v1/execute
+Authorization: Basic base64(alice:secret)
+Content-Type: application/json
+
+{ "command": "WRITE \"hello\",!" }
+```
+
+### 5.2 Session execute
+
+```
+POST /v1/sessions/current/execute
+Authorization: Bearer 3f8a…
+Content-Type: application/json
+
+{ "command": "SET x=x+1\nWRITE x,!" }
+```
+
+Both endpoints accept the same request body:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `command` | yes | Phase source, one or more lines. Processed the same way as REPL input. |
+| `namespace` | no | Overrides the session namespace for this request. Defaults to session namespace or `_GLOBAL`. |
+| `timeoutMs` | no | Per-request timeout, capped by the server maximum (default 10 000 ms). |
+
+REPL dot-commands (`.save`, `.compact`, …) are not accepted. Use the
+admin endpoints instead.
+
+**Success response:**
+
+```json
+{
+  "ok": true,
+  "output": "hello\n",
+  "value": null,
+  "lastTx": 42,
+  "elapsedMs": 2,
+  "requestId": "b1c2d3e4"
+}
+```
+
+- `output` is everything `WRITE` printed.
+- `value` holds the result of a bare expression (`WRITE` sets it to
+  `null`); the REPL's `- : value` echo.
+- If `command` registers column-0 routine tags the response includes
+  `"registered": ["NS.ROUTINE"]` instead of `output`/`value`.
+
+**Phase-level failure (HTTP 200, `ok: false`):**
+
+```json
+{
+  "ok": false,
+  "output": "",
+  "error": {
+    "code": "DIVIDE BY ZERO",
+    "message": "<DIVIDE BY ZERO>",
+    "condition": null
+  },
+  "lastTx": 42,
+  "elapsedMs": 1,
+  "requestId": "b1c2d3e4"
+}
+```
+
+Phase errors are `ok: false` at HTTP 200, they are language-level
+results, not transport errors (decision D1).
+
+**Transport-level errors** (the request never ran):
+
+| HTTP | `code` | Cause |
+| --- | --- | --- |
+| 400 | `BAD_REQUEST` | Malformed JSON, missing field, wrong type |
+| 401 | `UNAUTHENTICATED` | Unknown user or wrong password (indistinguishable) |
+| 403 | `FORBIDDEN` | Role too low for this endpoint |
+| 408 | `REQUEST_TIMEOUT` | Client too slow sending the body |
+| 413 | `TOO_LARGE` | Body over the limit |
+| 429 | `RATE_LIMITED` | Too many login failures |
+| 503 | `BUSY` | Session lock or engine lock timeout |
+
+**Server-added error codes** (returned as Phase-level `ok: false`):
+
+| Code | Meaning |
+| --- | --- |
+| `TIMEOUT` | `timeoutMs` exceeded |
+| `OUTPUT LIMIT` | Output exceeded `--max-output-bytes` |
+| `FILE ACCESS DISABLED` | Phase code called `BLOBSAVE`/`$BLOBWRITE` with a filesystem path inside an API session |
+
+## 6. Admin endpoints
+
+All admin endpoints require admin role (Bearer or Basic). A non-admin
+gets `403 FORBIDDEN`. A well-formed request that the engine refuses
+returns HTTP 200 with `ok: false`.
+
+Every successful write operation (`checkpoint`, `compact`, `users`)
+follows the same commit protocol as an execute request: it takes the
+engine lock, applies its change against the latest committed state,
+flushes to the WAL, and publishes the new state before responding.
+
+### 6.1 Status
+
+```
+GET /v1/admin/status
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "lastTx": 1234,
+  "sessionCount": 3,
+  "fileSizeBytes": 20480,
+  "version": "0.1.0.0",
+  "config": {
+    "maxBodyBytes":       { "value": 1048576, "source": "default" },
+    "execTimeoutMs":      { "value": 5000,    "source": "flag"    },
+    "sessionIdleSeconds": { "value": 1800,    "source": "config"  }
+  },
+  "requestId": "b1c2d3e4"
+}
+```
+
+`source` is `flag`, `config` (from `^_CONFIG("server", …)`), or
+`default`. `status` reads the committed snapshot and never waits for
+the engine lock.
+
+### 6.2 Checkpoint
+
+```
+POST /v1/admin/checkpoint
+```
+
+Appends a WAL checkpoint record. Non-destructive: no data is removed
+and `lastTx` is unchanged. Use this to bound recovery time on a busy
+database. Failure code: `CHECKPOINT FAILED`.
+
+### 6.3 Compact
+
+```
+POST /v1/admin/compact
+Content-Type: application/json
+
+{ "beforeTx": 500 }
+```
+
+The state as of transaction 500 becomes the new baseline. Individual
+transactions up to 500 are discarded; time travel to before 500 is
+permanently gone from the database file. Transactions after 500 are
+kept verbatim.
+
+The engine lock is held for the entire compaction. Reads continue on
+the previous snapshot; writers queue, and those waiting longer than
+`queueTimeoutMs` receive `503 BUSY`.
+
+Before touching the file the server writes a full backup to
+`<db>.backup-<timestamp>`. The backup path is logged but never returned
+to clients and is never deleted automatically.
+
+Success: `{ "ok": true, "lastTx": 500, "requestId": "…" }`.
+Failure (e.g. `beforeTx` exceeds `lastTx`): `{ "ok": false, "error": { "code": "COMPACT FAILED", … } }`.
+
+### 6.4 Add user
+
+```
+POST /v1/admin/users
+Content-Type: application/json
+
+{ "username": "bob", "password": "hunter2", "role": "write" }
+```
+
+Valid roles are `none`, `read`, `write`, `admin`. Any other value is
+`400 BAD_REQUEST`. The password is hashed with PBKDF2-SHA256 and a
+fresh random salt before the engine lock is taken, so hashing does not
+block writers. Under the lock the server checks that the username does
+not already exist; two concurrent requests for the same name give one
+success and one `USER EXISTS`. Passwords are never logged or echoed.
+
+## 7. Blob endpoints
+
+Blobs are binary objects stored inside the database file and
+content-addressed by their SHA-256 hash. They are immutable once
+written. The blob store is accessible through HTTP only; the globals
+`^_BLOBS` and `^_BLOB` cannot be modified with `SET` or `KILL`, even
+by an admin.
+
+### 7.1 Upload
+
+```
+PUT /v1/blobs
+Authorization: Bearer 3f8a…          (write role required)
+Content-Type: image/png
+X-Phase-Filename: photo.png           (optional)
+
+<raw bytes>
+```
+
+Optional query parameter: `?ref=^GLOBAL(sub1,sub2)`. When present, the
+server sets that node to the blob pointer in the same WAL transaction
+as the blob write. The caller must have write access to `ref`'s global.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "pointer": "blob:d5adb33ff…",
+  "hash": "d5adb33ff…",
+  "size": 4096,
+  "requestId": "b1c2d3e4"
+}
+```
+
+The server hashes the body incrementally, so memory usage is bounded
+by the streaming window, not the blob size. Uploading the same bytes
+twice is idempotent.
+
+Limit: `--max-blob-bytes` (default 10 MiB). Bodies exceeding this
+receive `413 TOO_LARGE`.
+
+### 7.2 Download by reference
+
+```
+GET /v1/blobs?ref=^MYDATA("avatar")
+Authorization: Bearer 3f8a…          (read role required)
+```
+
+The server reads `^MYDATA("avatar")` with the caller's credentials.
+The value must be a `blob:` pointer (e.g. `blob:d5adb33ff…`); otherwise
+`400 BAD_REQUEST`. The node must be readable by the caller, a node
+on the caller's denylist is `403 FORBIDDEN`, a missing node is `404`.
+
+Response body is the raw bytes. `Content-Type` and `Content-Length`
+are set from the stored metadata.
+
+`HEAD /v1/blobs?ref=…` returns the same headers with an empty body.
+
+### 7.3 Download by hash (admin only)
+
+```
+GET /v1/blobs/{hash}
+Authorization: Bearer admin-token…
+```
+
+Direct lookup by hex SHA-256 hash. Requires admin role (`403` otherwise).
+Returns `404` if the hash is not in the store.
+
+`HEAD /v1/blobs/{hash}` returns headers only.
+
+### 7.4 Blob references in Phase code
+
+A blob pointer is a string of the form `blob:<hex-sha256>`. Store one
+in an array node:
+
+```
+SET ^PROFILE("alice","avatar") = "blob:d5adb33ff…"
+```
+
+Retrieve the blob via `GET /v1/blobs?ref=^PROFILE("alice","avatar")`.
+
+The `^_BLOBS` global holds server-managed metadata (size, content
+type, filename) for every stored blob. It is readable and writable by
+admins through the admin status endpoint only; `SET`/`KILL` against
+`^_BLOBS` or `^_BLOB` is rejected at the language level with
+`<PROTECT>`.
+
+### 7.5 Blob GC
+
+Compaction (`POST /v1/admin/compact`) garbage-collects blobs. A blob
+is kept if:
+
+1. Its hash appears as the value of any live global node at the
+   compaction baseline, **or**
+2. Any WAL record after the baseline references its hash (a blob
+   uploaded before compaction but referenced by a future write).
+
+Blobs that satisfy neither condition are permanently deleted from the
+compacted file. The backup taken before compaction retains them.
+
+### 7.6 File I/O disabled in API sessions
+
+Phase statements that read or write the server's filesystem
+(`BLOBSAVE`, `$BLOBWRITE` with a path argument) are disabled in API
+sessions. Calling them returns `ok: false` with code
+`FILE ACCESS DISABLED`. Use the `PUT /v1/blobs` endpoint to upload
+files instead.
+
+## 8. Configuration reference
+
+Settings are resolved in this order (decision D9):
+
+1. Command-line flag or its `PHASEDB_*` environment variable.
+2. `^_CONFIG("server", name)` in the database.
+3. Built-in default.
+
+A flag overrides the database value. Database values are re-read on
+each request, so an admin can change a limit with `SET` and it applies
+from the next request without a restart, unless a flag pins it.
+
+`GET /v1/admin/status` reports each effective value and its source.
+
+| Flag | Config key | Default | Notes |
+| --- | --- | --- | --- |
+| `--db PATH` | - | `phase.db` | Startup only |
+| `--listen ADDR` | - | `127.0.0.1` | Startup only |
+| `--port N` | - | `8484` | Startup only |
+| `--tls-cert PATH` | - | off | Startup only |
+| `--tls-key PATH` | - | off | Startup only |
+| `--cors-origin ORIGIN` | - | none | Startup only |
+| `--allow-insecure-basic` | - | off | Startup only |
+| `--max-body-bytes N` | `maxBodyBytes` | 1 048 576 | Max JSON body |
+| `--exec-timeout-ms N` | `execTimeoutMs` | 10 000 | Default timeout per execute request |
+| `--exec-timeout-max-ms N` | `execTimeoutMaxMs` | 60 000 | Hard ceiling a client can request |
+| `--max-output-bytes N` | `maxOutputBytes` | 1 048 576 | WRITE output cap |
+| `--session-idle-seconds N` | `sessionIdleSeconds` | 1 800 | Idle session timeout |
+| `--session-max-seconds N` | `sessionMaxSeconds` | 43 200 | Absolute session lifetime |
+| `--max-sessions N` | `maxSessions` | 256 | Concurrent session cap |
+| `--queue-timeout-ms N` | `queueTimeoutMs` | 5 000 | Max wait for engine/session lock |
+| `--max-blob-bytes N` | - | 10 485 760 | Max blob upload size |
+
+Settings in the first group (`--db`, `--listen`, `--port`, etc.) are
+read before the database opens and cannot come from `^_CONFIG`.
+
+## 9. Request tracing
+
+Every response carries `X-Request-Id`. If the client supplies this
+header (1–64 visible ASCII characters, no spaces) it is echoed back;
+otherwise the server generates one. The request id also appears in the
+response body (`"requestId"`) and in the access log.
+
+The access log is JSON lines written to stderr:
+
+```json
+{
+  "requestId": "b1c2d3e4",
+  "user": "alice",
+  "method": "POST",
+  "path": "/v1/sessions/current/execute",
+  "status": 200,
+  "elapsedMs": 4,
+  "bytes": 128
+}
+```
+
+Passwords, tokens and `Authorization` headers are never logged.
+Command text is logged only at debug level.
+
+## 10. Graceful shutdown
+
+The server catches `SIGTERM` (Linux/macOS) and `Ctrl-C`
+(`UserInterrupt`, works on Windows too). On shutdown:
+
+1. The server stops accepting new connections.
+2. In-flight requests are given a bounded window to finish.
+3. The file lock is released.
+
+A hard kill (`SIGKILL`) skips the shutdown sequence but leaves the
+database file intact. On next startup the WAL recovery routine trims
+any torn trailing record and any transaction whose commit never
+reached disk.
