@@ -61,9 +61,10 @@ import Phase.Storage.Engine (acquireDbLock, flushPendingWal, openStorageEngine, 
 import Phase.Storage.Lock (acquireLocks, emptyLockTable)
 
 import Server.Auth (newLoginGuard)
-import Server.Config (ServerConfig (..), defaultConfig)
+import Server.Config (ServerConfig (..), defaultConfig, validateTlsConfig)
+import Server.Json (buildAccessLogEntry)
 import Server.Routes (mkApp)
-import Server.State (ServerState (..), Snapshot (..), newServerState, withBoundedEngineLock)
+import Server.State (ServerState (..), Snapshot (..), newServerState, setLogger, withBoundedEngineLock)
 import Phase.Tree
 import Phase.Value
 
@@ -3095,8 +3096,9 @@ withApi name tweak body = do
   (path, eng) <- setupDb name
   let cfg = tweak defaultConfig { cfgDbPath = path }
   ss    <- newServerState cfg path eng
+  let ss' = setLogger (\_ -> pure ()) ss
   guard <- newLoginGuard 4
-  r <- body (Api (mkApp ss guard) ss path)
+  r <- body (Api (mkApp ss' guard) ss' path)
   cleanDb path
   pure r
 
@@ -3973,6 +3975,253 @@ testHttpAdminGroup ctx = do
     wAfter <- sessExec api t " SET ^FREED=1"
     assertEqual ctx "writer succeeds after engine lock is released" (okOf wAfter) (Just True)
 
+-- --------------------------------------------------------------------
+-- M4: TLS validation, access log, CORS
+-- --------------------------------------------------------------------
+
+testTlsValidation :: TestContext -> IO ()
+testTlsValidation ctx = do
+  -- Neither cert nor key: valid (TLS disabled)
+  r1 <- validateTlsConfig defaultConfig
+  assertEqual ctx "TLS config: neither cert nor key -> Right Nothing" r1 (Right Nothing)
+
+  -- Only cert provided
+  let cfgCertOnly = defaultConfig { cfgTlsCert = Just "cert.pem", cfgTlsKey = Nothing }
+  r2 <- validateTlsConfig cfgCertOnly
+  assertEqual ctx "TLS config: only cert provided -> error"
+    r2 (Left "phasedb-server: both --tls-cert and --tls-key must be provided to enable TLS")
+
+  -- Only key provided
+  let cfgKeyOnly = defaultConfig { cfgTlsCert = Nothing, cfgTlsKey = Just "key.pem" }
+  r3 <- validateTlsConfig cfgKeyOnly
+  assertEqual ctx "TLS config: only key provided -> error"
+    r3 (Left "phasedb-server: both --tls-cert and --tls-key must be provided to enable TLS")
+
+  -- Non-existent cert
+  cPath <- tmpPath "phasedb-test-nonexistent-cert.pem"
+  kPath <- tmpPath "phasedb-test-nonexistent-key.pem"
+  let cfgMissingCert = defaultConfig { cfgTlsCert = Just cPath, cfgTlsKey = Just kPath }
+  r4 <- validateTlsConfig cfgMissingCert
+  assertEqual ctx "TLS config: missing cert file -> error"
+    r4 (Left ("phasedb-server: TLS certificate file does not exist: " ++ cPath))
+
+  -- Cert exists but key missing
+  realCertPath <- tmpPath "phasedb-test-real-cert.pem"
+  writeFile realCertPath "dummy cert"
+  let cfgMissingKey = defaultConfig { cfgTlsCert = Just realCertPath, cfgTlsKey = Just kPath }
+  r5 <- validateTlsConfig cfgMissingKey
+  assertEqual ctx "TLS config: missing key file -> error"
+    r5 (Left ("phasedb-server: TLS key file does not exist: " ++ kPath))
+
+  -- Both exist
+  realKeyPath <- tmpPath "phasedb-test-real-key.pem"
+  writeFile realKeyPath "dummy key"
+  let cfgBoth = defaultConfig { cfgTlsCert = Just realCertPath, cfgTlsKey = Just realKeyPath }
+  r6 <- validateTlsConfig cfgBoth
+  assertEqual ctx "TLS config: both exist -> Right (Just (cert, key))"
+    r6 (Right (Just (realCertPath, realKeyPath)))
+
+  -- Clean up dummy files
+  removeFile realCertPath
+  removeFile realKeyPath
+
+testCorsGroup :: TestContext -> IO ()
+testCorsGroup ctx = do
+  -- CORS off by default: no CORS headers, OPTIONS -> 404
+  withApi "cors-off" id $ \api -> do
+    -- Preflight OPTIONS without CORS enabled -> 404
+    optResp <- http api "OPTIONS" "/v1/execute" [] ""
+    assertEqual ctx "CORS off: OPTIONS -> 404" (statusOf optResp) 404
+    runAssert ctx "CORS off: no Access-Control-Allow-Origin header on OPTIONS"
+      (lookup "Access-Control-Allow-Origin" (simpleHeaders optResp) == Nothing) ""
+
+    -- GET /v1/health -> 200, no CORS headers
+    hResp <- http api "GET" "/v1/health" [] ""
+    assertEqual ctx "CORS off: GET /v1/health -> 200" (statusOf hResp) 200
+    runAssert ctx "CORS off: no Access-Control-Allow-Origin header on GET"
+      (lookup "Access-Control-Allow-Origin" (simpleHeaders hResp) == Nothing) ""
+
+  -- CORS with specific origin: https://app.example.com
+  let origin = "https://app.example.com"
+  withApi "cors-origin" (\c -> c { cfgCorsOrigin = Just origin }) $ \api -> do
+    -- Preflight OPTIONS -> 200 with all preflight headers
+    optResp <- http api "OPTIONS" "/v1/execute" [] ""
+    assertEqual ctx "CORS on: preflight OPTIONS -> 200" (statusOf optResp) 200
+    let hdrs = simpleHeaders optResp
+    assertEqual ctx "CORS on: Access-Control-Allow-Origin matches origin"
+      (lookup "Access-Control-Allow-Origin" hdrs) (Just (BSC.pack origin))
+    assertEqual ctx "CORS on: Access-Control-Allow-Credentials is true"
+      (lookup "Access-Control-Allow-Credentials" hdrs) (Just "true")
+    runAssert ctx "CORS on: Access-Control-Allow-Methods present"
+      (lookup "Access-Control-Allow-Methods" hdrs /= Nothing) ""
+    runAssert ctx "CORS on: Access-Control-Allow-Headers present"
+      (lookup "Access-Control-Allow-Headers" hdrs /= Nothing) ""
+    assertEqual ctx "CORS on: Access-Control-Max-Age is 86400"
+      (lookup "Access-Control-Max-Age" hdrs) (Just "86400")
+
+    -- Regular request GET /v1/health carries CORS headers
+    hResp <- http api "GET" "/v1/health" [] ""
+    assertEqual ctx "CORS on: GET /v1/health -> 200" (statusOf hResp) 200
+    let hHdrs = simpleHeaders hResp
+    assertEqual ctx "CORS on: GET carries Access-Control-Allow-Origin"
+      (lookup "Access-Control-Allow-Origin" hHdrs) (Just (BSC.pack origin))
+    assertEqual ctx "CORS on: GET carries Access-Control-Allow-Credentials"
+      (lookup "Access-Control-Allow-Credentials" hHdrs) (Just "true")
+    assertEqual ctx "CORS on: GET carries Access-Control-Expose-Headers"
+      (lookup "Access-Control-Expose-Headers" hHdrs) (Just "X-Request-Id")
+
+  -- CORS with wildcard origin "*": no wildcard with credentials (§9.4)
+  withApi "cors-wildcard" (\c -> c { cfgCorsOrigin = Just "*" }) $ \api -> do
+    -- Preflight OPTIONS -> 200, origin is "*", NO credentials
+    optResp <- http api "OPTIONS" "/v1/execute" [] ""
+    assertEqual ctx "CORS wildcard: preflight OPTIONS -> 200" (statusOf optResp) 200
+    let hdrs = simpleHeaders optResp
+    assertEqual ctx "CORS wildcard: Access-Control-Allow-Origin is *"
+      (lookup "Access-Control-Allow-Origin" hdrs) (Just "*")
+    assertEqual ctx "CORS wildcard: NO Access-Control-Allow-Credentials header"
+      (lookup "Access-Control-Allow-Credentials" hdrs) Nothing
+
+    -- Regular request GET /v1/health carries origin *, NO credentials
+    hResp <- http api "GET" "/v1/health" [] ""
+    assertEqual ctx "CORS wildcard: GET /v1/health -> 200" (statusOf hResp) 200
+    let hHdrs = simpleHeaders hResp
+    assertEqual ctx "CORS wildcard: GET carries Access-Control-Allow-Origin *"
+      (lookup "Access-Control-Allow-Origin" hHdrs) (Just "*")
+    assertEqual ctx "CORS wildcard: GET has NO Access-Control-Allow-Credentials"
+      (lookup "Access-Control-Allow-Credentials" hHdrs) Nothing
+
+testAccessLogGroup :: TestContext -> IO ()
+testAccessLogGroup ctx = do
+  -- 1. Unit test of buildAccessLogEntry JSON structure
+  let entryVal = buildAccessLogEntry "req-123" (Just "alice") "POST" "/v1/execute" 200 15 42
+      entryBytes = LBS.toStrict (Aeson.encode entryVal)
+  case Aeson.decodeStrict entryBytes of
+    Just (Aeson.Object km) -> do
+      runAssert ctx "buildAccessLogEntry: valid JSON" True ""
+      assertEqual ctx "buildAccessLogEntry: requestId"
+        (KM.lookup (Key.fromString "requestId") km) (Just (Aeson.String "req-123"))
+      assertEqual ctx "buildAccessLogEntry: user"
+        (KM.lookup (Key.fromString "user") km) (Just (Aeson.String "alice"))
+      assertEqual ctx "buildAccessLogEntry: method"
+        (KM.lookup (Key.fromString "method") km) (Just (Aeson.String "POST"))
+      assertEqual ctx "buildAccessLogEntry: path"
+        (KM.lookup (Key.fromString "path") km) (Just (Aeson.String "/v1/execute"))
+      assertEqual ctx "buildAccessLogEntry: status"
+        (KM.lookup (Key.fromString "status") km) (Just (Aeson.Number 200))
+      assertEqual ctx "buildAccessLogEntry: elapsedMs"
+        (KM.lookup (Key.fromString "elapsedMs") km) (Just (Aeson.Number 15))
+      assertEqual ctx "buildAccessLogEntry: bytes"
+        (KM.lookup (Key.fromString "bytes") km) (Just (Aeson.Number 42))
+    _ -> runAssert ctx "buildAccessLogEntry: valid JSON" False ""
+
+  -- Unauthenticated user produces null
+  let unauthVal = buildAccessLogEntry "req-456" Nothing "GET" "/v1/health" 200 2 10
+      unauthBytes = LBS.toStrict (Aeson.encode unauthVal)
+  case Aeson.decodeStrict unauthBytes of
+    Just (Aeson.Object km) ->
+      assertEqual ctx "buildAccessLogEntry: user is null"
+        (KM.lookup (Key.fromString "user") km) (Just Aeson.Null)
+    _ -> runAssert ctx "buildAccessLogEntry: unauthenticated user -> null" False ""
+
+  -- 2. Integration test: capture log lines from mkApp
+  (path, eng) <- setupDb "access-log"
+  let cfg = defaultConfig { cfgDbPath = path }
+  ss <- newServerState cfg path eng
+  logsRef <- newIORef []
+  let ssWithLog = setLogger (\line -> modifyIORef logsRef (line :)) ss
+  guard <- newLoginGuard 4
+  let app = mkApp ssWithLog guard
+      runReqFrom port meth p hdrs body =
+        let req0 = setPath defaultRequest p
+            req  = req0 { requestMethod = meth, requestHeaders = hdrs, remoteHost = port }
+        in runSession (srequest (SRequest req body)) app
+
+  -- (a) Unauthenticated GET /v1/health
+  _ <- runReqFrom (fromPort 9201) "GET" "/v1/health" [] ""
+  logsA <- readIORef logsRef
+  writeIORef logsRef []
+  case logsA of
+    [line] -> case Aeson.decodeStrict line of
+      Just (Aeson.Object km) -> do
+        assertEqual ctx "access log: health status is 200"
+          (KM.lookup (Key.fromString "status") km) (Just (Aeson.Number 200))
+        assertEqual ctx "access log: health method is GET"
+          (KM.lookup (Key.fromString "method") km) (Just (Aeson.String "GET"))
+        assertEqual ctx "access log: health path is /v1/health"
+          (KM.lookup (Key.fromString "path") km) (Just (Aeson.String "/v1/health"))
+        assertEqual ctx "access log: health user is null"
+          (KM.lookup (Key.fromString "user") km) (Just Aeson.Null)
+      _ -> runAssert ctx "access log: health logged entry parsed" False (show line)
+    other -> runAssert ctx "access log: exactly one line logged for health" False (show other)
+
+  -- (b) Authenticated POST /v1/execute with Basic auth
+  let basicAuth = "Basic " <> B64.encode "writer:pw-writer"
+      execBodyStr = "{\"command\":\"WRITE 42,!\"}"
+  _ <- runReqFrom (fromPort 9202) "POST" "/v1/execute" [(hAuthorization, basicAuth), (hContentType, "application/json")] execBodyStr
+  logsB <- readIORef logsRef
+  writeIORef logsRef []
+  case logsB of
+    [line] -> case Aeson.decodeStrict line of
+      Just (Aeson.Object km) -> do
+        assertEqual ctx "access log: execute status is 200"
+          (KM.lookup (Key.fromString "status") km) (Just (Aeson.Number 200))
+        assertEqual ctx "access log: execute user is writer"
+          (KM.lookup (Key.fromString "user") km) (Just (Aeson.String "writer"))
+        assertEqual ctx "access log: execute method is POST"
+          (KM.lookup (Key.fromString "method") km) (Just (Aeson.String "POST"))
+        assertEqual ctx "access log: execute path is /v1/execute"
+          (KM.lookup (Key.fromString "path") km) (Just (Aeson.String "/v1/execute"))
+        runAssert ctx "access log: no password in log entry"
+          (not ("pw-writer" `BS.isInfixOf` line)) ""
+        runAssert ctx "access log: no Authorization header in log entry"
+          (not ("Basic" `BS.isInfixOf` line)) ""
+      _ -> runAssert ctx "access log: execute logged entry parsed" False (show line)
+    other -> runAssert ctx "access log: exactly one line logged for execute" False (show other)
+
+  -- (c) Failed login POST /v1/sessions
+  let badLoginBody = "{\"username\":\"writer\",\"password\":\"wrong-password\"}"
+  _ <- runReqFrom (fromPort 9203) "POST" "/v1/sessions" [(hContentType, "application/json")] badLoginBody
+  logsC <- readIORef logsRef
+  writeIORef logsRef []
+  case logsC of
+    [line] -> case Aeson.decodeStrict line of
+      Just (Aeson.Object km) -> do
+        assertEqual ctx "access log: failed login status is 401"
+          (KM.lookup (Key.fromString "status") km) (Just (Aeson.Number 401))
+        assertEqual ctx "access log: failed login user is writer"
+          (KM.lookup (Key.fromString "user") km) (Just (Aeson.String "writer"))
+        runAssert ctx "access log: failed login password NOT in log"
+          (not ("wrong-password" `BS.isInfixOf` line)) ""
+      _ -> runAssert ctx "access log: failed login entry parsed" False (show line)
+    other -> runAssert ctx "access log: exactly one line logged for failed login" False (show other)
+
+  -- (d) Admin action POST /v1/admin/checkpoint
+  let adminAuth = "Basic " <> B64.encode "admin:secret123"
+  _ <- runReqFrom (fromPort 9204) "POST" "/v1/admin/checkpoint" [(hAuthorization, adminAuth), (hContentType, "application/json")] "{}"
+  logsD <- readIORef logsRef
+  writeIORef logsRef []
+  case logsD of
+    [line] -> case Aeson.decodeStrict line of
+      Just (Aeson.Object km) -> do
+        assertEqual ctx "access log: admin action status is 200"
+          (KM.lookup (Key.fromString "status") km) (Just (Aeson.Number 200))
+        assertEqual ctx "access log: admin action user is admin"
+          (KM.lookup (Key.fromString "user") km) (Just (Aeson.String "admin"))
+        assertEqual ctx "access log: admin action path is /v1/admin/checkpoint"
+          (KM.lookup (Key.fromString "path") km) (Just (Aeson.String "/v1/admin/checkpoint"))
+        runAssert ctx "access log: admin password NOT in log"
+          (not ("secret123" `BS.isInfixOf` line)) ""
+      _ -> runAssert ctx "access log: admin action entry parsed" False (show line)
+    other -> runAssert ctx "access log: exactly one line logged for admin checkpoint" False (show other)
+
+  cleanDb path
+
+testHttpM4Group :: TestContext -> IO ()
+testHttpM4Group ctx = do
+  testTlsValidation ctx
+  testCorsGroup ctx
+  testAccessLogGroup ctx
+
 testHttpApiGroup :: TestContext -> IO ()
 testHttpApiGroup ctx = do
   putStrLn "  -- M1: protocol, auth, errors"
@@ -3995,6 +4244,8 @@ testHttpApiGroup ctx = do
   testHttpSessionLifecycleGroup ctx
   putStrLn "  -- M3: admin endpoints, bounded waits, try-lock sweep"
   testHttpAdminGroup ctx
+  putStrLn "  -- M4: TLS validation, access log, CORS"
+  testHttpM4Group ctx
 
 
 -- --------------------------------------------------------------------

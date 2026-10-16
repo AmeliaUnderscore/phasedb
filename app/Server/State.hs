@@ -27,6 +27,7 @@ module Server.State
     -- * Full server state
   , ServerState (..)
   , newServerState
+  , setLogger
 
     -- * Config-value resolution (D9)
   , configValueInt
@@ -51,10 +52,13 @@ module Server.State
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM (TVar, newTVarIO)
 import Control.Exception (SomeException, catch, mask, throwIO)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BSC
 import Data.IORef (IORef, newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.IO (hFlush, stderr)
 import System.Timeout (timeout)
 
 import Phase.AST (mkValue, unPValue)
@@ -81,6 +85,7 @@ data Snapshot = Snapshot
 
 -- | An 'IORef' cell holding the latest committed snapshot.
 -- Written only while holding 'EngineLock'; readable by anyone at any time.
+-- Engine lock (commit path)
 type SnapshotRef = IORef Snapshot
 
 -- | Exclusive commit lock: whoever holds this 'MVar' may append to the WAL
@@ -96,7 +101,12 @@ data ServerState = ServerState
   , ssSnapshot    :: !SnapshotRef    -- ^ Lock-free read snapshot.
   , ssSessions    :: !(TVar SessionMap) -- ^ Active session table (M2).
   , ssDbPath      :: !FilePath       -- ^ Path to the .db file (for compaction).
+  , ssLogger      :: !(ByteString -> IO ()) -- ^ Access logger (§9.3, default writes to stderr).
   }
+
+-- | Set a custom logger action for the server state.
+setLogger :: (ByteString -> IO ()) -> ServerState -> ServerState
+setLogger logger ss = ss { ssLogger = logger }
 
 -- | Build 'ServerState' from the initial storage engine after startup.
 newServerState :: ServerConfig -> FilePath -> StorageEngine -> IO ServerState
@@ -111,6 +121,7 @@ newServerState cfg dbPath eng = do
     , ssSnapshot   = ref
     , ssSessions   = sessions
     , ssDbPath     = dbPath
+    , ssLogger     = \bs -> BSC.hPutStrLn stderr bs >> hFlush stderr
     }
 
 -- --------------------------------------------------------------------

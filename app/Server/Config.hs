@@ -10,6 +10,7 @@ module Server.Config
   ( ServerConfig (..)
   , parseArgs
   , defaultConfig
+  , validateTlsConfig
   , resolveMaxBodyBytes
   , resolveExecTimeoutMs
   , resolveExecTimeoutMaxMs
@@ -30,6 +31,7 @@ module Server.Config
   ) where
 
 import Options.Applicative
+import System.Directory (doesFileExist)
 
 -- | All configuration knobs for the server.
 --
@@ -159,3 +161,25 @@ configParser = ServerConfig
   <*> optional (option auto ( long "queue-timeout-ms" <> metavar "N" <> help "Engine-lock wait timeout (default 5000)" ))
   <*> optional (strOption ( long "cors-origin" <> metavar "ORIGIN" <> help "Allowed CORS origin (off by default)" ))
   <*> switch ( long "allow-insecure-basic" <> help "Allow Basic auth on non-TLS, non-loopback connections" )
+
+-- | Validate TLS certificate and private key configuration (§9.1, §10).
+-- Returns 'Right Nothing' if TLS is disabled (neither cert nor key given),
+-- 'Right (Just (cert, key))' if both files exist, or 'Left errorMessage'
+-- if the configuration is invalid.
+validateTlsConfig :: ServerConfig -> IO (Either String (Maybe (FilePath, FilePath)))
+validateTlsConfig cfg = case (cfgTlsCert cfg, cfgTlsKey cfg) of
+  (Just _, Nothing) ->
+    pure (Left "phasedb-server: both --tls-cert and --tls-key must be provided to enable TLS")
+  (Nothing, Just _) ->
+    pure (Left "phasedb-server: both --tls-cert and --tls-key must be provided to enable TLS")
+  (Just cert, Just key) -> do
+    certExists <- doesFileExist cert
+    if not certExists
+      then pure (Left ("phasedb-server: TLS certificate file does not exist: " ++ cert))
+      else do
+        keyExists <- doesFileExist key
+        if not keyExists
+          then pure (Left ("phasedb-server: TLS key file does not exist: " ++ key))
+          else pure (Right (Just (cert, key)))
+  (Nothing, Nothing) ->
+    pure (Right Nothing)

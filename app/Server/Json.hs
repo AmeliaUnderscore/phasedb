@@ -18,6 +18,7 @@ module Server.Json
   , adminOkBody
   , adminErrorBody
   , statusBody
+  , buildAccessLogEntry
 
     -- * Error code extraction
   , evalErrorCode
@@ -180,6 +181,25 @@ statusBody lastTx sessCount fileSize ver configObj reqId =
     , "config"        .= configObj
     , "requestId"     .= reqId
     ]
+
+-- | Build an access log entry as an Aeson Value (§9.3).
+buildAccessLogEntry :: Text        -- ^ requestId
+                    -> Maybe Text  -- ^ user (null if unauthenticated)
+                    -> Text        -- ^ method
+                    -> Text        -- ^ path
+                    -> Int         -- ^ HTTP status code
+                    -> Int         -- ^ elapsedMs
+                    -> Int         -- ^ response bytes
+                    -> Value
+buildAccessLogEntry reqId mUser method path status elapsed bytes = object
+  [ "requestId" .= reqId
+  , "user"      .= maybe Null String mUser
+  , "method"    .= method
+  , "path"      .= path
+  , "status"    .= status
+  , "elapsedMs" .= elapsed
+  , "bytes"     .= bytes
+  ]
 
 -- --------------------------------------------------------------------
 -- Error code extraction

@@ -189,6 +189,7 @@ executable phasedb-server
                  , clock
                  , case-insensitive
                  , scientific
+                 , warp-tls
 
     -- Directories containing source files.
     hs-source-dirs:   app

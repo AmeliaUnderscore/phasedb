@@ -14,23 +14,21 @@ module Server.Routes
   ( mkApp
   ) where
 
-import Control.Concurrent.MVar (withMVar)
-import Control.Concurrent.STM (atomically, readTVar, modifyTVar')
+import Control.Concurrent.STM (atomically, readTVar)
 import Control.Exception (SomeException, mask_, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
 import Control.Monad (unless)
-import Data.IORef (readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
-import Data.Map.Strict (Map)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Time (addUTCTime, getCurrentTime)
-import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Version (showVersion)
 import System.Directory (doesFileExist, getFileSize)
 import System.IO (hPutStrLn, stderr)
@@ -39,21 +37,19 @@ import Network.HTTP.Types
   ( Status, HeaderName
   , hAuthorization, hContentType
   , status200, status201, status400, status401, status403, status404
-  , status408, status413, status429, status503
+  , status413, status429, status503, statusCode
   )
 import qualified Data.CaseInsensitive as CI
 import Network.Wai
   ( Application, Request, Response
   , pathInfo, requestHeaders, requestMethod, responseLBS, getRequestBodyChunk
-  , isSecure, mapResponseHeaders, remoteHost
+  , isSecure, mapResponseHeaders, remoteHost, rawPathInfo
+  , responseHeaders, responseStatus
   )
 import Data.Aeson (object, encode, (.=))
 import System.Clock (Clock (Monotonic), TimeSpec (..), getTime)
 
-import Phase.Auth
-  ( Role (..), checkAdminAccess, lookupUserRole, roleToText
-  , authenticateUser, userExists
-  )
+import Phase.Auth (Role (..), lookupUserRole, roleToText)
 import Phase.Exec (AdminError (..), applyAddUser, prepareNewUser)
 import Phase.State (Env (..), EvalError (..), initEnvWithStorage)
 import Phase.Storage.Engine
@@ -67,20 +63,47 @@ import Server.Auth
   , LoginGuard, LoginResult (..)
   , extractCredential, isLoopback, tryLogin
   )
-import Server.Config (ServerConfig (..), resolveExecTimeoutMs, resolveExecTimeoutMaxMs, resolveMaxBodyBytes, resolveMaxOutputBytes, resolveQueueTimeoutMs, resolveSessionIdleSecs, resolveSessionMaxSecs, resolveMaxSessions)
-import Server.Execute (ExecOutcome (..), closeSession, executeOneShot, executeSession, sweepExpiredSessions, withSessionLock)
+import Server.Config (ServerConfig (..))
+import Server.Execute
+  ( ExecOutcome (..), closeSession, executeOneShot, executeSession
+  , sweepExpiredSessions, withSessionLock
+  )
 import Server.Json
 import Server.Session
-  ( Session (..), deleteSession, lookupSession, newSession, touchSession, tokenDigest )
+  ( Session (..), lookupSession, newSession, touchSession, tokenDigest )
 import Server.State
-  ( ServerState (..), Snapshot (..), EngineLock
-  , configSourceInt, withBoundedEngineLock
+  ( ServerState (..), Snapshot (..), configSourceInt, withBoundedEngineLock
   , effExecTimeoutMaxMs, effExecTimeoutMs, effMaxBodyBytes, effMaxOutputBytes
   , effMaxSessions, effQueueTimeoutMs, effSessionIdleSecs, effSessionMaxSecs
+  , ssLogger
   )
 
--- Import just for the config resolution:
-import qualified Server.Config as Cfg
+-- --------------------------------------------------------------------
+-- CORS helpers (§9.4)
+-- --------------------------------------------------------------------
+
+-- | Headers added to all responses when CORS is enabled (§9.4).
+corsHeadersFor :: ServerConfig -> [(HeaderName, ByteString)]
+corsHeadersFor cfg =
+  case cfgCorsOrigin cfg of
+    Nothing -> []
+    Just orig ->
+      let origBs = BSC.pack orig
+          base = [ (CI.mk "Access-Control-Allow-Origin", origBs)
+                 , (CI.mk "Access-Control-Expose-Headers", "X-Request-Id")
+                 ]
+      in if orig == "*"
+           then base
+           else (CI.mk "Access-Control-Allow-Credentials", "true") : base
+
+-- | Headers specific to preflight OPTIONS response (§9.4).
+corsPreflightHeaders :: [(HeaderName, ByteString)]
+corsPreflightHeaders =
+  [ (CI.mk "Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, HEAD, OPTIONS")
+  , (CI.mk "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
+  , (CI.mk "Access-Control-Max-Age", "86400")
+  , (CI.mk "Content-Length", "0")
+  ]
 
 -- --------------------------------------------------------------------
 -- Application entry point
@@ -89,16 +112,44 @@ import qualified Server.Config as Cfg
 -- | Build the WAI 'Application'.
 mkApp :: ServerState -> LoginGuard -> Application
 mkApp ss guard req respond = do
+  t0 <- getTime Monotonic
+  userRef <- newIORef Nothing
   generated <- generateRequestId
-  let reqId    = fromMaybe generated (clientRequestId req)
-      method   = requestMethod req
-      path     = pathInfo req
-      -- every response carries the id, in a header as well as the body (§4)
-      respond' = respond . mapResponseHeaders ((CI.mk "X-Request-Id", TE.encodeUtf8 reqId) :)
-  -- Expired sessions are removed, and their locks released, before this
-  -- request takes its snapshot.  Health stays lock-free.
-  unless (method == "GET" && path == ["v1", "health"]) (sweepExpiredSessions ss)
-  dispatch ss guard reqId method path req respond'
+  let reqId     = fromMaybe generated (clientRequestId req)
+      method    = requestMethod req
+      path      = pathInfo req
+      cfg       = ssConfig ss
+      corsHdrs  = corsHeadersFor cfg
+
+      respond' resp = do
+        let st = statusCode (responseStatus resp)
+        t1 <- getTime Monotonic
+        let elapsed = elapsedMs t0 t1
+            respH = responseHeaders resp
+            respBytes = fromMaybe 0 $ do
+              bs <- lookup (CI.mk "Content-Length") respH
+              case BSC.readInt bs of
+                Just (n, _) -> Just n
+                Nothing     -> Nothing
+        mUser <- readIORef userRef
+        let logVal = buildAccessLogEntry
+                       reqId
+                       mUser
+                       (TE.decodeUtf8With lenientDecode method)
+                       (TE.decodeUtf8With lenientDecode (rawPathInfo req))
+                       st
+                       elapsed
+                       respBytes
+        ssLogger ss (LBS.toStrict (encode logVal))
+        respond (mapResponseHeaders (\hdrs -> (CI.mk "X-Request-Id", TE.encodeUtf8 reqId) : (hdrs ++ corsHdrs)) resp)
+
+  if method == "OPTIONS" && isJust (cfgCorsOrigin cfg)
+    then respond' (responseLBS status200 corsPreflightHeaders "")
+    else do
+      -- Expired sessions are removed, and their locks released, before this
+      -- request takes its snapshot.  Health stays lock-free.
+      unless (method == "GET" && path == ["v1", "health"]) (sweepExpiredSessions ss)
+      dispatch ss guard userRef reqId method path req respond'
 
 -- | A client-supplied @X-Request-Id@, if it is short and printable (1 to 64
 -- visible ASCII characters, no spaces); anything else is ignored and the
@@ -116,51 +167,52 @@ clientRequestId req = do
 
 dispatch :: ServerState
          -> LoginGuard
+         -> IORef (Maybe Text)
          -> Text             -- ^ request-id
          -> ByteString       -- ^ method
          -> [Text]           -- ^ path segments
          -> Request
          -> (Response -> IO a)
          -> IO a
-dispatch ss _guard reqId "GET"    ["v1","health"]                  req respond =
+dispatch _ss _guard _uRef reqId "GET"    ["v1","health"]                  _req respond =
   respond (jsonOk (healthBody reqId))
 
-dispatch ss guard  reqId "POST"   ["v1","execute"]                 req respond =
-  handleExecuteOneShot ss guard reqId req respond
+dispatch ss guard  uRef reqId "POST"   ["v1","execute"]                 req respond =
+  handleExecuteOneShot ss guard uRef reqId req respond
 
-dispatch ss guard  reqId "POST"   ["v1","sessions"]                req respond =
-  handleCreateSession ss guard reqId req respond
+dispatch ss guard  uRef reqId "POST"   ["v1","sessions"]                req respond =
+  handleCreateSession ss guard uRef reqId req respond
 
-dispatch ss _guard reqId "GET"    ["v1","sessions","current"]      req respond =
-  handleGetSession ss reqId req respond
+dispatch ss _guard uRef reqId "GET"    ["v1","sessions","current"]      req respond =
+  handleGetSession ss uRef reqId req respond
 
-dispatch ss _guard reqId "DELETE" ["v1","sessions","current"]      req respond =
-  handleDeleteSession ss reqId req respond
+dispatch ss _guard uRef reqId "DELETE" ["v1","sessions","current"]      req respond =
+  handleDeleteSession ss uRef reqId req respond
 
-dispatch ss guard  reqId "POST"   ["v1","sessions","current","execute"] req respond =
-  handleSessionExecute ss guard reqId req respond
+dispatch ss _guard uRef reqId "POST"   ["v1","sessions","current","execute"] req respond =
+  handleSessionExecute ss uRef reqId req respond
 
-dispatch ss guard  reqId "GET"    ["v1","admin","status"]          req respond =
-  handleAdminStatus ss guard reqId req respond
+dispatch ss guard  uRef reqId "GET"    ["v1","admin","status"]          req respond =
+  handleAdminStatus ss guard uRef reqId req respond
 
-dispatch ss guard  reqId "POST"   ["v1","admin","checkpoint"]      req respond =
-  handleAdminCheckpoint ss guard reqId req respond
+dispatch ss guard  uRef reqId "POST"   ["v1","admin","checkpoint"]      req respond =
+  handleAdminCheckpoint ss guard uRef reqId req respond
 
-dispatch ss guard  reqId "POST"   ["v1","admin","compact"]         req respond =
-  handleAdminCompact ss guard reqId req respond
+dispatch ss guard  uRef reqId "POST"   ["v1","admin","compact"]         req respond =
+  handleAdminCompact ss guard uRef reqId req respond
 
-dispatch ss guard  reqId "POST"   ["v1","admin","users"]           req respond =
-  handleAdminAddUser ss guard reqId req respond
+dispatch ss guard  uRef reqId "POST"   ["v1","admin","users"]           req respond =
+  handleAdminAddUser ss guard uRef reqId req respond
 
-dispatch _ss _guard reqId _method _path _req respond =
+dispatch _ss _guard _uRef reqId _method _path _req respond =
   respond (jsonErr status404 (transportError "NOT_FOUND" "unknown path" reqId))
 
 -- --------------------------------------------------------------------
 -- POST /v1/execute  (M1 one-shot)
 -- --------------------------------------------------------------------
 
-handleExecuteOneShot :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleExecuteOneShot ss guard reqId req respond = do
+handleExecuteOneShot :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleExecuteOneShot ss guard uRef reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg     = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
@@ -178,6 +230,7 @@ handleExecuteOneShot ss guard reqId req respond = do
         Right (BearerCred _) ->
           respond (jsonErr status401 (transportError "UNAUTHENTICATED" "one-shot requires Basic auth" reqId))
         Right (BasicCred user password) -> do
+          writeIORef uRef (Just user)
           -- Enforce Basic-over-loopback rule (§5.1).
           let hasTls     = isSecure req
               loopback   = isLoopback (remoteHost req)
@@ -218,8 +271,8 @@ handleExecuteOneShot ss guard reqId req respond = do
 -- POST /v1/sessions  (M2 login)
 -- --------------------------------------------------------------------
 
-handleCreateSession :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleCreateSession ss guard reqId req respond = do
+handleCreateSession :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleCreateSession ss guard uRef reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg     = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
@@ -234,6 +287,7 @@ handleCreateSession ss guard reqId req respond = do
           let eng  = snapEngine snap
               user = srUsername sr
               pass = srPassword sr
+          writeIORef uRef (Just user)
           -- Check max-sessions cap.
           smap <- atomically (readTVar (ssSessions ss))
           let maxSess = effMaxSessions cfg snap
@@ -265,16 +319,16 @@ handleCreateSession ss guard reqId req respond = do
 -- GET /v1/sessions/current  (M2)
 -- --------------------------------------------------------------------
 
-handleGetSession :: ServerState -> Text -> Request -> (Response -> IO a) -> IO a
-handleGetSession ss reqId req respond = do
+handleGetSession :: ServerState -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleGetSession ss uRef reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg = ssConfig ss
-  withBearerSession ss cfg reqId req respond $ \sess _digest -> do
-    let eng      = snapEngine snap
-        user     = sessUser sess
-        role     = lookupUserRole user eng
-        idleS    = effSessionIdleSecs cfg snap
-        maxS     = effSessionMaxSecs cfg snap
+  withBearerSession ss uRef cfg reqId req respond $ \sess _digest -> do
+    let eng       = snapEngine snap
+        user      = sessUser sess
+        role      = lookupUserRole user eng
+        idleS     = effSessionIdleSecs cfg snap
+        maxS      = effSessionMaxSecs cfg snap
         expiresAt = addUTCTime (fromIntegral maxS) (sessCreatedAt sess)
     respond (jsonOk (sessionInfoBody user (roleToText role) (sessNamespace sess) expiresAt idleS reqId))
 
@@ -282,11 +336,11 @@ handleGetSession ss reqId req respond = do
 -- DELETE /v1/sessions/current  (M2 logout)
 -- --------------------------------------------------------------------
 
-handleDeleteSession :: ServerState -> Text -> Request -> (Response -> IO a) -> IO a
-handleDeleteSession ss reqId req respond = do
+handleDeleteSession :: ServerState -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleDeleteSession ss uRef reqId req respond = do
   let cfg = ssConfig ss
   snapQ <- readIORef (ssSnapshot ss)
-  withBearerSession ss cfg reqId req respond $ \sess digest -> do
+  withBearerSession ss uRef cfg reqId req respond $ \sess digest -> do
     -- Wait for any request still running in this session, then remove it and
     -- release its LOCKs.  Same bounded wait as a second request on the session.
     r <- withSessionLock (effQueueTimeoutMs cfg snapQ) sess (closeSession ss digest sess)
@@ -304,19 +358,19 @@ handleDeleteSessionOk reqId = LBS.fromStrict $ TE.encodeUtf8 $
 -- POST /v1/sessions/current/execute  (M2 session execute)
 -- --------------------------------------------------------------------
 
-handleSessionExecute :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleSessionExecute ss guard reqId req respond = do
-  let cfg     = ssConfig ss
+handleSessionExecute :: ServerState -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleSessionExecute ss uRef reqId req respond = do
+  let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
     Just bs ->
-      withBearerSession ss cfg reqId req respond $ \sess0 digest ->
-        case parseExecuteBody (LBS.fromStrict bs) of
-          Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
-          Right er -> do
+      case parseExecuteBody (LBS.fromStrict bs) of
+        Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
+        Right er ->
+          withBearerSession ss uRef cfg reqId req respond $ \sess0 digest -> do
             -- Two requests for one session never run at the same time (D6):
             -- wait for the session lock, but no longer than the queue timeout.
             snapQ <- readIORef (ssSnapshot ss)
@@ -364,11 +418,11 @@ runInSession ss cfg reqId digest er = do
 -- GET /v1/admin/status  (M3)
 -- --------------------------------------------------------------------
 
-handleAdminStatus :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleAdminStatus ss guard reqId req respond = do
+handleAdminStatus :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleAdminStatus ss guard uRef reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg = ssConfig ss
-  withAdminAuth ss guard cfg reqId req respond $ \_user -> do
+  withAdminAuth ss guard uRef cfg reqId req respond $ \_user -> do
     smap <- atomically (readTVar (ssSessions ss))
     let lastTx    = seLastTx (snapEngine snap)
         sessCount = Map.size smap
@@ -393,8 +447,8 @@ handleAdminStatus ss guard reqId req respond = do
 -- POST /v1/admin/checkpoint  (M3)
 -- --------------------------------------------------------------------
 
-handleAdminCheckpoint :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleAdminCheckpoint ss guard reqId req respond = do
+handleAdminCheckpoint :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleAdminCheckpoint ss guard uRef reqId req respond = do
   let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
@@ -405,7 +459,7 @@ handleAdminCheckpoint ss guard reqId req respond = do
       case parseCheckpointBody (LBS.fromStrict bs) of
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
         Right () ->
-          withAdminAuth ss guard cfg reqId req respond $ \user -> do
+          withAdminAuth ss guard uRef cfg reqId req respond $ \user -> do
             snapQ <- readIORef (ssSnapshot ss)
             let waitMs = effQueueTimeoutMs cfg snapQ
             mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
@@ -426,15 +480,15 @@ handleAdminCheckpoint ss guard reqId req respond = do
                       pure (snap', Right (seLastTx storage'))
             case mResult of
               Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
-              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Left (st, b)) -> respond (jsonErr st b)
               Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/compact  (M3)
 -- --------------------------------------------------------------------
 
-handleAdminCompact :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleAdminCompact ss guard reqId req respond = do
+handleAdminCompact :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleAdminCompact ss guard uRef reqId req respond = do
   let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
@@ -445,7 +499,7 @@ handleAdminCompact ss guard reqId req respond = do
       case parseCompactBody (LBS.fromStrict bs) of
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
         Right beforeTx ->
-          withAdminAuth ss guard cfg reqId req respond $ \user -> do
+          withAdminAuth ss guard uRef cfg reqId req respond $ \user -> do
             snapQ <- readIORef (ssSnapshot ss)
             let waitMs = effQueueTimeoutMs cfg snapQ
             mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
@@ -477,15 +531,15 @@ handleAdminCompact ss guard reqId req respond = do
                             pure (snap', Right (seLastTx storage'))
             case mResult of
               Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
-              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Left (st, b)) -> respond (jsonErr st b)
               Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/users  (M3)
 -- --------------------------------------------------------------------
 
-handleAdminAddUser :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
-handleAdminAddUser ss guard reqId req respond = do
+handleAdminAddUser :: ServerState -> LoginGuard -> IORef (Maybe Text) -> Text -> Request -> (Response -> IO a) -> IO a
+handleAdminAddUser ss guard uRef reqId req respond = do
   let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
@@ -496,7 +550,7 @@ handleAdminAddUser ss guard reqId req respond = do
       case parseAddUserBody (LBS.fromStrict bs) of
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
         Right (uname, pass, role) ->
-          withAdminAuth ss guard cfg reqId req respond $ \user -> do
+          withAdminAuth ss guard uRef cfg reqId req respond $ \user -> do
             -- D15: Hash password outside the engine lock
             (salt, hash) <- prepareNewUser pass
             snapQ <- readIORef (ssSnapshot ss)
@@ -507,28 +561,28 @@ handleAdminAddUser ss guard reqId req respond = do
                 else
                   let envL = (initEnvWithStorage (snapEngine locked)) { envCurrentUser = user }
                   in case applyAddUser uname salt hash role envL of
-                       Left (AdminUserExists _) ->
-                         pure (locked, Left (status200, adminErrorBody "USER EXISTS" ("<USER EXISTS> user already exists: " <> uname) (seLastTx (snapEngine locked)) reqId))
-                       Left (AdminBadRole _) ->
-                         pure (locked, Left (status400, transportError "BAD_REQUEST" "unknown role" reqId))
-                       Left (AdminPermissionDenied r) ->
-                         pure (locked, Left (status403, transportError "FORBIDDEN" r reqId))
-                       Left (AdminStorageError err) ->
-                         pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
-                       Left (AdminOther err) ->
-                         pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
-                       Right env' -> do
-                         storage' <- mask_ (flushPendingWal (envStorage env'))
-                         let snap' = Snapshot
-                               { snapEngine  = storage'
-                               , snapLocks   = snapLocks locked
-                               , snapVersion = snapVersion locked + 1
-                               }
-                         writeIORef (ssSnapshot ss) snap'
-                         pure (snap', Right (seLastTx storage'))
+                        Left (AdminUserExists _) ->
+                          pure (locked, Left (status200, adminErrorBody "USER EXISTS" ("<USER EXISTS> user already exists: " <> uname) (seLastTx (snapEngine locked)) reqId))
+                        Left (AdminBadRole _) ->
+                          pure (locked, Left (status400, transportError "BAD_REQUEST" "unknown role" reqId))
+                        Left (AdminPermissionDenied r) ->
+                          pure (locked, Left (status403, transportError "FORBIDDEN" r reqId))
+                        Left (AdminStorageError err) ->
+                          pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
+                        Left (AdminOther err) ->
+                          pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
+                        Right env' -> do
+                          storage' <- mask_ (flushPendingWal (envStorage env'))
+                          let snap' = Snapshot
+                                { snapEngine  = storage'
+                                , snapLocks   = snapLocks locked
+                                , snapVersion = snapVersion locked + 1
+                                }
+                          writeIORef (ssSnapshot ss) snap'
+                          pure (snap', Right (seLastTx storage'))
             case mResult of
               Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
-              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Left (st, b)) -> respond (jsonErr st b)
               Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
@@ -537,19 +591,21 @@ handleAdminAddUser ss guard reqId req respond = do
 
 -- | Run a handler only if a valid Bearer session is found.
 withBearerSession :: ServerState
+                  -> IORef (Maybe Text)
                   -> ServerConfig
                   -> Text        -- ^ requestId
                   -> Request
                   -> (Response -> IO a)
                   -> (Session -> Text -> IO a)  -- ^ (session, digest)
                   -> IO a
-withBearerSession ss cfg reqId req respond action = do
+withBearerSession ss uRef cfg reqId req respond action = do
   snap <- readIORef (ssSnapshot ss)
   let authHdrVal = lookupHeader hAuthorization req
   case extractCredential (maybe "" id authHdrVal) of
     Left _ ->
       respond (jsonErr status401 (transportError "UNAUTHENTICATED" "Bearer token required" reqId))
-    Right (BasicCred _ _) ->
+    Right (BasicCred user _) -> do
+      writeIORef uRef (Just user)
       respond (jsonErr status401 (transportError "UNAUTHENTICATED" "Bearer token required" reqId))
     Right (BearerCred raw) -> do
       let digest  = tokenDigest raw
@@ -558,19 +614,22 @@ withBearerSession ss cfg reqId req respond action = do
       mSess <- lookupSession digest idleS maxS (ssSessions ss)
       case mSess of
         Nothing -> respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid or expired token" reqId))
-        Just sess -> action sess digest
+        Just sess -> do
+          writeIORef uRef (Just (sessUser sess))
+          action sess digest
 
 -- | Run a handler only if the request carries valid admin credentials
 -- (either Basic or Bearer) and the user has the admin role.
 withAdminAuth :: ServerState
               -> LoginGuard
+              -> IORef (Maybe Text)
               -> ServerConfig
               -> Text
               -> Request
               -> (Response -> IO a)
               -> (Text -> IO a)  -- ^ username
               -> IO a
-withAdminAuth ss guard cfg reqId req respond action = do
+withAdminAuth ss guard uRef cfg reqId req respond action = do
   snap <- readIORef (ssSnapshot ss)
   let eng        = snapEngine snap
       authHdrVal = lookupHeader hAuthorization req
@@ -584,13 +643,15 @@ withAdminAuth ss guard cfg reqId req respond action = do
       mSess <- lookupSession digest idleS maxS (ssSessions ss)
       case mSess of
         Nothing -> respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid or expired token" reqId))
-        Just sess ->
+        Just sess -> do
           let user = sessUser sess
-              role = lookupUserRole user eng
-          in if role < RAdmin
-               then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
-               else action user
+          writeIORef uRef (Just user)
+          let role = lookupUserRole user eng
+          if role < RAdmin
+            then respond (jsonErr status403 (transportError "FORBIDDEN" "admin role required" reqId))
+            else action user
     Right (BasicCred user password) -> do
+      writeIORef uRef (Just user)
       let hasTls   = isSecure req
           loopback = isLoopback (remoteHost req)
           allow    = hasTls || loopback || cfgAllowInsecureBasic cfg
@@ -628,20 +689,23 @@ outcomeResponse reqId elapsed lastTx = \case
   ExecBusy ->
     jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId)
 
+jsonHeadersFor :: LBS.ByteString -> [(HeaderName, ByteString)]
+jsonHeadersFor body =
+  [ (hContentType, "application/json; charset=utf-8")
+  , (CI.mk "Content-Length", BSC.pack (show (LBS.length body)))
+  ]
+
 jsonOk :: LBS.ByteString -> Response
-jsonOk body = responseLBS status200 jsonHeaders body
+jsonOk body = responseLBS status200 (jsonHeadersFor body) body
 
 jsonCreated :: LBS.ByteString -> Response
-jsonCreated body = responseLBS status201 jsonHeaders body
+jsonCreated body = responseLBS status201 (jsonHeadersFor body) body
 
 jsonErr :: Status -> LBS.ByteString -> Response
-jsonErr st body = responseLBS st jsonHeaders body
+jsonErr st body = responseLBS st (jsonHeadersFor body) body
 
 jsonErrHdr :: Status -> [(HeaderName, ByteString)] -> LBS.ByteString -> Response
-jsonErrHdr st extra body = responseLBS st (jsonHeaders ++ extra) body
-
-jsonHeaders :: [(HeaderName, ByteString)]
-jsonHeaders = [(hContentType, "application/json; charset=utf-8")]
+jsonErrHdr st extra body = responseLBS st (jsonHeadersFor body ++ extra) body
 
 -- --------------------------------------------------------------------
 -- Miscellaneous helpers
