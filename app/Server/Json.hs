@@ -16,6 +16,8 @@ module Server.Json
   , sessionBody
   , sessionInfoBody
   , adminOkBody
+  , adminErrorBody
+  , statusBody
 
     -- * Error code extraction
   , evalErrorCode
@@ -26,23 +28,25 @@ module Server.Json
   , parseSessionBody
   , parseCompactBody
   , parseAddUserBody
+  , parseCheckpointBody
   , ExecuteReq (..)
   , SessionReq (..)
   ) where
 
-import Data.Aeson (Value (..), object, (.=), encode, toJSON)
+import Data.Aeson (Value (..), object, (.=), encode)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as AesonKey
 import qualified Data.Aeson.KeyMap as KM
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as LBS
+import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
 
 import Phase.AST (PValue (..))
-import Phase.State (Condition (..), EvalError (..), conditionMessage, formatError)
+import Phase.State (Condition (..), EvalError (..), formatError)
 import Phase.Storage.Types (TxId)
 
 -- --------------------------------------------------------------------
@@ -154,6 +158,29 @@ adminOkBody :: TxId -> Text -> ByteString
 adminOkBody lastTx reqId =
   encode $ object [ "ok" .= True, "lastTx" .= lastTx, "requestId" .= reqId ]
 
+-- | Admin failure envelope (§4.1, §6.3). HTTP 200 with ok: false, no output or elapsedMs.
+adminErrorBody :: Text -> Text -> TxId -> Text -> ByteString
+adminErrorBody code msg lastTx reqId =
+  encode $ object
+    [ "ok"        .= False
+    , "error"     .= object [ "code" .= code, "message" .= msg, "condition" .= Null ]
+    , "lastTx"    .= lastTx
+    , "requestId" .= reqId
+    ]
+
+-- | @GET /v1/admin/status@ response (§6.3).
+statusBody :: TxId -> Int -> Integer -> Text -> Value -> Text -> ByteString
+statusBody lastTx sessCount fileSize ver configObj reqId =
+  encode $ object
+    [ "ok"            .= True
+    , "lastTx"        .= lastTx
+    , "sessionCount"  .= sessCount
+    , "fileSizeBytes" .= fileSize
+    , "version"       .= ver
+    , "config"        .= configObj
+    , "requestId"     .= reqId
+    ]
+
 -- --------------------------------------------------------------------
 -- Error code extraction
 -- --------------------------------------------------------------------
@@ -237,7 +264,7 @@ parseSessionBody bs =
           _ -> Left "missing or non-string \"username\" or \"password\""
       _ -> Left "body must be a JSON object"
 
--- | Parse a @POST /v1/admin/compact@ body.
+-- | Parse a @POST /v1/admin/compact@ body (§6.3: { "beforeTx": n }, n non-negative integer).
 parseCompactBody :: LBS.ByteString -> Either Text Int
 parseCompactBody bs =
   case Aeson.decode bs :: Maybe Aeson.Value of
@@ -245,11 +272,14 @@ parseCompactBody bs =
     Just val -> case val of
       Object km ->
         case KM.lookup "beforeTx" km of
-          Just (Number n) -> Right (round n)
+          Just (Number n) ->
+            case toBoundedInteger n of
+              Just i | i >= 0 -> Right i
+              _               -> Left "beforeTx must be a non-negative integer"
           _ -> Left "missing or non-number \"beforeTx\""
       _ -> Left "body must be a JSON object"
 
--- | Parse a @POST /v1/admin/users@ body.
+-- | Parse a @POST /v1/admin/users@ body (§6.3).
 parseAddUserBody :: LBS.ByteString -> Either Text (Text, Text, Text)
 parseAddUserBody bs =
   case Aeson.decode bs :: Maybe Aeson.Value of
@@ -257,6 +287,17 @@ parseAddUserBody bs =
     Just val -> case val of
       Object km ->
         case (KM.lookup "username" km, KM.lookup "password" km, KM.lookup "role" km) of
-          (Just (String u), Just (String p), Just (String r)) -> Right (u, p, r)
+          (Just (String u), Just (String p), Just (String r))
+            | T.null u || T.null p -> Left "username and password must be non-empty"
+            | r `notElem` ["none", "read", "write", "admin"] -> Left "unknown role"
+            | otherwise -> Right (u, p, r)
           _ -> Left "missing or non-string field in {username, password, role}"
       _ -> Left "body must be a JSON object"
+
+-- | Parse a @POST /v1/admin/checkpoint@ body (§6.3: empty or {}).
+parseCheckpointBody :: LBS.ByteString -> Either Text ()
+parseCheckpointBody bs
+  | LBS.null bs || bs == "{}" = Right ()
+  | otherwise = case Aeson.decode bs of
+      Just (Object km) | KM.null km -> Right ()
+      _ -> Left "checkpoint takes no body (empty or {} accepted)"

@@ -16,12 +16,13 @@ module Server.Routes
 
 import Control.Concurrent.MVar (withMVar)
 import Control.Concurrent.STM (atomically, readTVar, modifyTVar')
+import Control.Exception (SomeException, mask_, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
 import Control.Monad (unless)
-import Data.IORef (readIORef)
+import Data.IORef (readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -30,6 +31,10 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (addUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
+import Data.Version (showVersion)
+import System.Directory (doesFileExist, getFileSize)
+import System.IO (hPutStrLn, stderr)
+import qualified Paths_phasedb_hs
 import Network.HTTP.Types
   ( Status, HeaderName
   , hAuthorization, hContentType
@@ -49,10 +54,13 @@ import Phase.Auth
   ( Role (..), checkAdminAccess, lookupUserRole, roleToText
   , authenticateUser, userExists
   )
-import Phase.Exec (AdminError (..), adminAddUser, adminCheckpoint, adminCompact)
+import Phase.Exec (AdminError (..), applyAddUser, prepareNewUser)
 import Phase.State (Env (..), EvalError (..), initEnvWithStorage)
-import Phase.Storage.Engine (StorageEngine (..), seLastTx)
-import Phase.Storage.Types (TxId)
+import Phase.Storage.Engine
+  ( StorageEngine (..), compactTo, flushPendingWal, openStorageEngine
+  , seLastTx, takeCheckpoint
+  )
+import Phase.Storage.Types (StorageError (..), TxId)
 
 import Server.Auth
   ( Credential (..), CredError (..)
@@ -66,6 +74,7 @@ import Server.Session
   ( Session (..), deleteSession, lookupSession, newSession, touchSession, tokenDigest )
 import Server.State
   ( ServerState (..), Snapshot (..), EngineLock
+  , configSourceInt, withBoundedEngineLock
   , effExecTimeoutMaxMs, effExecTimeoutMs, effMaxBodyBytes, effMaxOutputBytes
   , effMaxSessions, effQueueTimeoutMs, effSessionIdleSecs, effSessionMaxSecs
   )
@@ -282,8 +291,9 @@ handleDeleteSession ss reqId req respond = do
     -- release its LOCKs.  Same bounded wait as a second request on the session.
     r <- withSessionLock (effQueueTimeoutMs cfg snapQ) sess (closeSession ss digest sess)
     respond $ case r of
-      Nothing -> jsonErr status503 (transportError "BUSY" "session is busy with another request" reqId)
-      Just () -> jsonOk (handleDeleteSessionOk reqId)
+      Nothing    -> jsonErr status503 (transportError "BUSY" "session is busy with another request" reqId)
+      Just False -> jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId)
+      Just True  -> jsonOk (handleDeleteSessionOk reqId)
 
 -- | Body of a successful @DELETE /v1/sessions/current@.
 handleDeleteSessionOk :: Text -> LBS.ByteString
@@ -357,18 +367,27 @@ runInSession ss cfg reqId digest er = do
 handleAdminStatus :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminStatus ss guard reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
-  let eng  = snapEngine snap
-      cfg  = ssConfig ss
-  withAdminAuth ss guard cfg reqId req respond $ \user -> do
+  let cfg = ssConfig ss
+  withAdminAuth ss guard cfg reqId req respond $ \_user -> do
     smap <- atomically (readTVar (ssSessions ss))
-    let lastTx   = seLastTx eng
+    let lastTx    = seLastTx (snapEngine snap)
         sessCount = Map.size smap
-    respond $ jsonOk $ encode $ object
-      [ "ok"           .= True
-      , "lastTx"       .= lastTx
-      , "sessionCount" .= sessCount
-      , "requestId"    .= reqId
-      ]
+        ver       = T.pack (showVersion Paths_phasedb_hs.version)
+        configObj = object
+          [ "maxBodyBytes"       .= configEntry (effMaxBodyBytes cfg snap)     (configSourceInt "maxBodyBytes" (cfgMaxBodyBytes cfg) snap)
+          , "execTimeoutMs"      .= configEntry (effExecTimeoutMs cfg snap)    (configSourceInt "execTimeoutMs" (cfgExecTimeoutMs cfg) snap)
+          , "execTimeoutMaxMs"   .= configEntry (effExecTimeoutMaxMs cfg snap) (configSourceInt "execTimeoutMaxMs" (cfgExecTimeoutMaxMs cfg) snap)
+          , "maxOutputBytes"     .= configEntry (effMaxOutputBytes cfg snap)   (configSourceInt "maxOutputBytes" (cfgMaxOutputBytes cfg) snap)
+          , "sessionIdleSeconds" .= configEntry (effSessionIdleSecs cfg snap)  (configSourceInt "sessionIdleSeconds" (cfgSessionIdleSecs cfg) snap)
+          , "sessionMaxSeconds"  .= configEntry (effSessionMaxSecs cfg snap)   (configSourceInt "sessionMaxSeconds" (cfgSessionMaxSecs cfg) snap)
+          , "maxSessions"        .= configEntry (effMaxSessions cfg snap)      (configSourceInt "maxSessions" (cfgMaxSessions cfg) snap)
+          , "queueTimeoutMs"     .= configEntry (effQueueTimeoutMs cfg snap)   (configSourceInt "queueTimeoutMs" (cfgQueueTimeoutMs cfg) snap)
+          ]
+    exists <- doesFileExist (ssDbPath ss)
+    fileSize <- if exists then fromIntegral <$> getFileSize (ssDbPath ss) else pure 0
+    respond (jsonOk (statusBody lastTx sessCount fileSize ver configObj reqId))
+  where
+    configEntry val src = object [ "value" .= val, "source" .= src ]
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/checkpoint  (M3)
@@ -376,17 +395,39 @@ handleAdminStatus ss guard reqId req respond = do
 
 handleAdminCheckpoint :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminCheckpoint ss guard reqId req respond = do
-  snap <- readIORef (ssSnapshot ss)
   let cfg = ssConfig ss
-  withAdminAuth ss guard cfg reqId req respond $ \user -> do
-    let env0 = (initEnvWithStorage (snapEngine snap)) { envCurrentUser = user }
-    result <- adminCheckpoint env0
-    case result of
-      Left e  -> respond (jsonErr status403 (transportError "FORBIDDEN" (T.pack (show e)) reqId))
-      Right storage' -> do
-        -- Update the snapshot with the checkpointed engine.
-        withMVar (ssEngineLock ss) $ \_ -> pure ()  -- just for ordering; checkpoint already done
-        respond (jsonOk (adminOkBody (seLastTx storage') reqId))
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
+  body <- readBodyCapped maxBody req
+  case body of
+    Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
+    Just bs ->
+      case parseCheckpointBody (LBS.fromStrict bs) of
+        Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
+        Right () ->
+          withAdminAuth ss guard cfg reqId req respond $ \user -> do
+            snapQ <- readIORef (ssSnapshot ss)
+            let waitMs = effQueueTimeoutMs cfg snapQ
+            mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
+              if lookupUserRole user (snapEngine locked) < RAdmin
+                then pure (locked, Left (status403, transportError "FORBIDDEN" "admin role required" reqId))
+                else do
+                  mStorage <- try (takeCheckpoint (snapEngine locked)) :: IO (Either SomeException StorageEngine)
+                  case mStorage of
+                    Left e ->
+                      pure (locked, Left (status200, adminErrorBody "CHECKPOINT FAILED" (T.pack (show e)) (seLastTx (snapEngine locked)) reqId))
+                    Right storage' -> do
+                      let snap' = Snapshot
+                            { snapEngine  = storage'
+                            , snapLocks   = snapLocks locked
+                            , snapVersion = snapVersion locked + 1
+                            }
+                      writeIORef (ssSnapshot ss) snap'
+                      pure (snap', Right (seLastTx storage'))
+            case mResult of
+              Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
+              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/compact  (M3)
@@ -394,7 +435,7 @@ handleAdminCheckpoint ss guard reqId req respond = do
 
 handleAdminCompact :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminCompact ss guard reqId req respond = do
-  let cfg     = ssConfig ss
+  let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
@@ -405,16 +446,39 @@ handleAdminCompact ss guard reqId req respond = do
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
         Right beforeTx ->
           withAdminAuth ss guard cfg reqId req respond $ \user -> do
-            snap <- readIORef (ssSnapshot ss)
-            let env0 = (initEnvWithStorage (snapEngine snap)) { envCurrentUser = user }
-            result <- adminCompact (fromIntegral beforeTx) (ssDbPath ss) env0
-            case result of
-              Left (AdminPermissionDenied r) ->
-                respond (jsonErr status403 (transportError "FORBIDDEN" r reqId))
-              Left e ->
-                respond (jsonErr status400 (transportError "BAD_REQUEST" (T.pack (show e)) reqId))
-              Right (_backupPath, storage') ->
-                respond (jsonOk (adminOkBody (seLastTx storage') reqId))
+            snapQ <- readIORef (ssSnapshot ss)
+            let waitMs = effQueueTimeoutMs cfg snapQ
+            mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
+              if lookupUserRole user (snapEngine locked) < RAdmin
+                then pure (locked, Left (status403, transportError "FORBIDDEN" "admin role required" reqId))
+                else if fromIntegral beforeTx > seLastTx (snapEngine locked)
+                  then pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" "beforeTx is greater than lastTx" (seLastTx (snapEngine locked)) reqId))
+                  else do
+                    engFlushed <- flushPendingWal (snapEngine locked)
+                    cRes <- try (compactTo (ssDbPath ss) (fromIntegral beforeTx)) :: IO (Either SomeException (Either StorageError FilePath))
+                    case cRes of
+                      Left ex ->
+                        pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show ex)) (seLastTx engFlushed) reqId))
+                      Right (Left sErr) ->
+                        pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show sErr)) (seLastTx engFlushed) reqId))
+                      Right (Right backupPath) -> do
+                        hPutStrLn stderr ("compact: backup created at " ++ backupPath)
+                        reopened <- openStorageEngine (ssDbPath ss)
+                        case reopened of
+                          Left oErr ->
+                            pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show oErr)) (seLastTx engFlushed) reqId))
+                          Right storage' -> do
+                            let snap' = Snapshot
+                                  { snapEngine  = storage'
+                                  , snapLocks   = snapLocks locked
+                                  , snapVersion = snapVersion locked + 1
+                                  }
+                            writeIORef (ssSnapshot ss) snap'
+                            pure (snap', Right (seLastTx storage'))
+            case mResult of
+              Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
+              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/users  (M3)
@@ -422,7 +486,7 @@ handleAdminCompact ss guard reqId req respond = do
 
 handleAdminAddUser :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminAddUser ss guard reqId req respond = do
-  let cfg     = ssConfig ss
+  let cfg = ssConfig ss
   snapB <- readIORef (ssSnapshot ss)
   let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
@@ -433,21 +497,39 @@ handleAdminAddUser ss guard reqId req respond = do
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
         Right (uname, pass, role) ->
           withAdminAuth ss guard cfg reqId req respond $ \user -> do
-            snap <- readIORef (ssSnapshot ss)
-            let env0 = (initEnvWithStorage (snapEngine snap)) { envCurrentUser = user }
-            result <- adminAddUser uname pass role env0
-            case result of
-              Left (AdminPermissionDenied r) ->
-                respond (jsonErr status403 (transportError "FORBIDDEN" r reqId))
-              Left (AdminUserExists _) ->
-                respond (jsonErr status400 (transportError "BAD_REQUEST" "user already exists" reqId))
-              Left (AdminBadRole _) ->
-                respond (jsonErr status400 (transportError "BAD_REQUEST" "unknown role" reqId))
-              Left e ->
-                respond (jsonErr status400 (transportError "BAD_REQUEST" (T.pack (show e)) reqId))
-              Right env' -> do
-                let storage' = envStorage env'
-                respond (jsonOk (adminOkBody (seLastTx storage') reqId))
+            -- D15: Hash password outside the engine lock
+            (salt, hash) <- prepareNewUser pass
+            snapQ <- readIORef (ssSnapshot ss)
+            let waitMs = effQueueTimeoutMs cfg snapQ
+            mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
+              if lookupUserRole user (snapEngine locked) < RAdmin
+                then pure (locked, Left (status403, transportError "FORBIDDEN" "admin role required" reqId))
+                else
+                  let envL = (initEnvWithStorage (snapEngine locked)) { envCurrentUser = user }
+                  in case applyAddUser uname salt hash role envL of
+                       Left (AdminUserExists _) ->
+                         pure (locked, Left (status200, adminErrorBody "USER EXISTS" ("<USER EXISTS> user already exists: " <> uname) (seLastTx (snapEngine locked)) reqId))
+                       Left (AdminBadRole _) ->
+                         pure (locked, Left (status400, transportError "BAD_REQUEST" "unknown role" reqId))
+                       Left (AdminPermissionDenied r) ->
+                         pure (locked, Left (status403, transportError "FORBIDDEN" r reqId))
+                       Left (AdminStorageError err) ->
+                         pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
+                       Left (AdminOther err) ->
+                         pure (locked, Left (status400, transportError "BAD_REQUEST" err reqId))
+                       Right env' -> do
+                         storage' <- mask_ (flushPendingWal (envStorage env'))
+                         let snap' = Snapshot
+                               { snapEngine  = storage'
+                               , snapLocks   = snapLocks locked
+                               , snapVersion = snapVersion locked + 1
+                               }
+                         writeIORef (ssSnapshot ss) snap'
+                         pure (snap', Right (seLastTx storage'))
+            case mResult of
+              Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
+              Just (Left (st, b)) -> respond (responseLBS st jsonHeaders b)
+              Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
 
 -- --------------------------------------------------------------------
 -- Auth middleware helpers
@@ -543,6 +625,8 @@ outcomeResponse reqId elapsed lastTx = \case
     jsonOk (serverErrorEnvelope "TIMEOUT" "<TIMEOUT> execution timed out" lastTx elapsed reqId)
   ExecParseError msg ->
     jsonOk (errorEnvelope (SyntaxError msg) lastTx elapsed reqId)
+  ExecBusy ->
+    jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId)
 
 jsonOk :: LBS.ByteString -> Response
 jsonOk body = responseLBS status200 jsonHeaders body

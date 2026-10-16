@@ -23,6 +23,8 @@ module Phase.Exec
   , adminCheckpoint
   , adminCompact
   , adminAddUser
+  , prepareNewUser
+  , applyAddUser
   , AdminError (..)
   ) where
 
@@ -237,25 +239,29 @@ adminCompact tx dbPath env =
             Left openErr -> pure (Left (AdminStorageError (T.pack (show openErr))))
             Right storage' -> pure (Right (backupPath, storage'))
 
--- | Create a new user account (equivalent to the REPL's @.adduser@
--- dot-command).  Requires admin role.
-adminAddUser :: Text    -- ^ New username.
-             -> Text    -- ^ New password (plaintext; hashed here).
-             -> Text    -- ^ Role text: "admin", "write", "read", or "none".
-             -> Env
-             -> IO (Either AdminError Env)
-adminAddUser username password roleText env =
+-- | Prepare a salt and hash the password for a new user (D15).
+-- Does not touch the storage engine or acquire any locks, so this can
+-- run outside the engine lock.
+prepareNewUser :: Text -> IO (Text, Text)
+prepareNewUser password = do
+  salt <- generateSalt
+  let hash = hashPassword password salt
+  pure (salt, hash)
+
+-- | Check permissions, check existence, and apply writes for adding a user
+-- (D15). Runs under the engine lock without doing any password hashing.
+-- Does NOT flush the WAL; caller handles commit/flush.
+applyAddUser :: Text -> Text -> Text -> Text -> Env -> Either AdminError Env
+applyAddUser username salt hash roleText env =
   case checkAdminAccess (envCurrentUser env) (envStorage env) of
-    Just reason -> pure (Left (AdminPermissionDenied reason))
+    Just reason -> Left (AdminPermissionDenied reason)
     Nothing
       | roleText `notElem` ["admin", "write", "read", "none"] ->
-          pure (Left (AdminBadRole roleText))
+          Left (AdminBadRole roleText)
       | lookupUserRole username (envStorage env) /= RNone ->
-          pure (Left (AdminUserExists username))
-      | otherwise -> do
-          salt <- generateSalt
-          let hash   = hashPassword password salt
-              writes =
+          Left (AdminUserExists username)
+      | otherwise ->
+          let writes =
                 [ (mkValue "role",         mkValue (roleToText (roleFromText roleText)))
                 , (mkValue "passwordHash", mkValue hash)
                 , (mkValue "passwordSalt", mkValue salt)
@@ -263,8 +269,20 @@ adminAddUser username password roleText env =
               applyWrite envE (field, val) =
                 writeRef Global "_USERS" [mkValue username, field] val envE
               result = foldl (\acc w -> acc >>= flip applyWrite w) (Right env) writes
-          case result of
-            Left err   -> pure (Left (AdminOther (formatError err)))
-            Right env' -> do
-              env'' <- flushEnv env'
-              pure (Right env'')
+          in case result of
+               Left err   -> Left (AdminOther (formatError err))
+               Right env' -> Right env'
+
+-- | Create a new user account (equivalent to the REPL's @.adduser@
+-- dot-command).  Requires admin role.
+adminAddUser :: Text    -- ^ New username.
+             -> Text    -- ^ New password (plaintext; hashed here).
+             -> Text    -- ^ Role text: "admin", "write", "read", or "none".
+             -> Env
+             -> IO (Either AdminError Env)
+adminAddUser username password roleText env = do
+  (salt, hash) <- prepareNewUser password
+  case applyAddUser username salt hash roleText env of
+    Left err   -> pure (Left err)
+    Right env' -> Right <$> flushEnv env'
+

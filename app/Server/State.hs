@@ -31,6 +31,11 @@ module Server.State
     -- * Config-value resolution (D9)
   , configValueInt
   , configValueText
+  , configSourceInt
+
+    -- * Bounded engine lock (M3)
+  , withBoundedEngineLock
+  , tryEngineLock
 
     -- * Effective limits: flag, then ^_CONFIG(\"server\", name), then default
   , effMaxBodyBytes
@@ -43,13 +48,14 @@ module Server.State
   , effQueueTimeoutMs
   ) where
 
-import Control.Concurrent.MVar (MVar, newMVar)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM (TVar, newTVarIO)
+import Control.Exception (SomeException, catch, mask, throwIO)
 import Data.IORef (IORef, newIORef)
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.Timeout (timeout)
 
 import Phase.AST (mkValue, unPValue)
 import Phase.Storage.Engine (StorageEngine (..))
@@ -162,3 +168,64 @@ effSessionIdleSecs   cfg = configValueInt "sessionIdleSeconds" defaultSessionIdl
 effSessionMaxSecs    cfg = configValueInt "sessionMaxSeconds"  defaultSessionMaxSecs    (cfgSessionMaxSecs cfg)
 effMaxSessions       cfg = configValueInt "maxSessions"        defaultMaxSessions       (cfgMaxSessions cfg)
 effQueueTimeoutMs    cfg = configValueInt "queueTimeoutMs"     defaultQueueTimeoutMs    (cfgQueueTimeoutMs cfg)
+
+-- --------------------------------------------------------------------
+-- Config-source resolution (M3 §6.3 status)
+-- --------------------------------------------------------------------
+
+-- | The source of a config value: the CLI flag, the database @^_CONFIG@, or the built-in default.
+-- Used by @GET /v1/admin/status@ to populate the @config@ object.
+configSourceInt :: Text       -- ^ Config key (the @^_CONFIG(\"server\", key)@ name)
+                -> Maybe Int  -- ^ CLI-pinned value
+                -> Snapshot
+                -> Text       -- ^ \"flag\", \"config\", or \"default\"
+configSourceInt _key (Just _) _snap = "flag"
+configSourceInt key  Nothing  snap  =
+  case readLive "_CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
+    Right pv | [(n, "")] <- reads (T.unpack (unPValue pv)), n > (0 :: Int) -> "config"
+    _                                                                        -> "default"
+
+-- --------------------------------------------------------------------
+-- Bounded engine lock (M3 §6.3, §8)
+-- --------------------------------------------------------------------
+
+-- | Take the engine lock and run an action, waiting at most @waitMs@
+-- milliseconds.  Returns 'Nothing' if the wait timed out.
+--
+-- Exception-safe: the lock is always returned to the MVar on any
+-- exception from the action, with the snapshot unchanged.
+withBoundedEngineLock :: Int            -- ^ Max wait in milliseconds
+                      -> EngineLock
+                      -> (Snapshot -> IO (Snapshot, a))
+                      -> IO (Maybe a)
+withBoundedEngineLock waitMs lock action =
+  mask $ \restore -> do
+    mSnap <- timeout (waitMs * 1000) (takeMVar lock)
+    case mSnap of
+      Nothing   -> pure Nothing
+      Just snap ->
+        (do (snap', result) <- restore (action snap)
+            putMVar lock snap'
+            pure (Just result))
+        `catch`
+        (\e -> do putMVar lock snap
+                  throwIO (e :: SomeException))
+
+-- | Attempt to take the engine lock without waiting (try-lock for the
+-- expiry sweep, D12).  If the lock is free, runs the action with it;
+-- if it is held, returns '()' immediately without blocking.
+tryEngineLock :: EngineLock
+              -> (Snapshot -> IO (Snapshot, ()))
+              -> IO ()
+tryEngineLock lock action = mask $ \restore -> do
+  mSnap <- tryTakeMVar lock
+  case mSnap of
+    Nothing   -> pure ()   -- lock is busy; skip (D12)
+    Just snap ->
+      (do (snap', ()) <- restore (action snap)
+          putMVar lock snap')
+      `catch`
+      (\e -> do putMVar lock snap
+                throwIO (e :: SomeException))
+
+

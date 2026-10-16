@@ -25,7 +25,7 @@ module Server.Execute
   , withSessionLock
   ) where
 
-import Control.Concurrent.MVar (modifyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, modifyTVar')
 import Control.Exception (finally, mask, mask_)
 import Control.Monad (when)
@@ -43,7 +43,11 @@ import Phase.Storage.Lock (LockTable, releaseAllOwnerLocks)
 import Phase.Storage.Types (TxId)
 
 import Server.Session (Session (..), TokenDigest, anyExpired, generateToken, reapExpired)
-import Server.State (Snapshot (..), ServerState (..), effSessionIdleSecs, effSessionMaxSecs)
+import Server.State
+  ( Snapshot (..), ServerState (..)
+  , effSessionIdleSecs, effSessionMaxSecs, effQueueTimeoutMs
+  , withBoundedEngineLock, tryEngineLock
+  )
 
 -- | The outcome of executing one command.
 data ExecOutcome
@@ -56,6 +60,7 @@ data ExecOutcome
   | ExecError !EvalError !TxId
   | ExecTimeout
   | ExecParseError !Text
+  | ExecBusy                           -- ^ Engine lock wait timed out (503)
   deriving (Show)
 
 -- --------------------------------------------------------------------
@@ -179,15 +184,20 @@ isWrite snap env =
 -- Commit path
 -- --------------------------------------------------------------------
 
--- | Take the engine lock and commit.  If the version moved while we were
--- executing, re-run the command once under the lock, starting from the
--- ORIGINAL pre-run environment ('Env' @env0@) on the latest state, never
--- from the first run's result (that would apply session-local changes
--- twice).
+-- | Take the engine lock and commit.  Waits at most @queueTimeoutMs@
+-- milliseconds.  Returns 'ExecBusy' if the wait timed out.
+--
+-- If the version moved while we were executing, re-run the command once
+-- under the lock, starting from the ORIGINAL pre-run environment ('Env'
+-- @env0@) on the latest state, never from the first run's result (that
+-- would apply session-local changes twice).
 commitWrite :: ServerState -> Snapshot -> Env -> Text -> Text -> Int -> (Env -> Env)
             -> (TxId -> ExecOutcome) -> Env -> IO (ExecOutcome, Maybe Env)
-commitWrite ss snap0 env0 cmd ns timeoutMs fin finish env =
-  modifyMVar (ssEngineLock ss) $ \locked ->
+commitWrite ss snap0 env0 cmd ns timeoutMs fin finish env = do
+  snapQ <- readIORef (ssSnapshot ss)
+  let cfg    = ssConfig ss
+      waitMs = effQueueTimeoutMs cfg snapQ
+  mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
     if snapVersion locked == snapVersion snap0
       then -- Happy path: version unchanged, flush and publish.
         commitFlush ss locked env finish
@@ -210,6 +220,7 @@ commitWrite ss snap0 env0 cmd ns timeoutMs fin finish env =
             pure (locked, (ExecError err (seLastTx eng'), Nothing))
           Just (RunParseError msg) ->
             pure (locked, (ExecParseError msg, Nothing))
+  pure (maybe (ExecBusy, Nothing) id mResult)
 
 -- | Flush pending WAL (masked) and atomically update the snapshot.
 -- Returns the new snapshot (for the MVar) and the outcome.
@@ -230,12 +241,11 @@ commitFlush ss locked env finish = do
 
 -- | Remove every expired session and release the locks it held.  Called at
 -- the start of every request (except health), before the request takes its
--- snapshot, so no request ever observes a lock whose owner has expired.  The
--- common case (nothing expired) is one read of the session table.
+-- snapshot, so no request ever observes a lock whose owner has expired.
 --
--- Removal and release happen together under the engine lock, so a second
--- request that finds nothing left to remove only proceeds once the first
--- one has published the released locks.
+-- The sweep uses a try-lock on the engine lock (D12): if the lock is busy
+-- (e.g. a compaction is running), the sweep is skipped and the next request
+-- tries again.  This ensures reads are never blocked by the sweep.
 sweepExpiredSessions :: ServerState -> IO ()
 sweepExpiredSessions ss = do
   snap <- readIORef (ssSnapshot ss)
@@ -244,18 +254,24 @@ sweepExpiredSessions ss = do
       maxS  = effSessionMaxSecs  cfg snap
   expired <- anyExpired idleS maxS (ssSessions ss)
   when expired $
-    modifyMVar (ssEngineLock ss) $ \locked -> do
+    tryEngineLock (ssEngineLock ss) $ \locked -> do
       dead <- reapExpired idleS maxS (ssSessions ss)
       releaseLocksOf ss locked (map sessJobId dead)
 
 -- | Log a session out: remove it and release its locks.  The caller holds
 -- the session's own lock ('withSessionLock'), so no request of that session
--- is still running.
-closeSession :: ServerState -> TokenDigest -> Session -> IO ()
-closeSession ss digest sess =
-  modifyMVar (ssEngineLock ss) $ \locked -> do
+-- is still running.  The engine lock is taken with a bounded wait
+-- ('queueTimeoutMs'); 'False' means it timed out (the session was not
+-- removed).
+closeSession :: ServerState -> TokenDigest -> Session -> IO Bool
+closeSession ss digest sess = do
+  snapQ <- readIORef (ssSnapshot ss)
+  let cfg    = ssConfig ss
+      waitMs = effQueueTimeoutMs cfg snapQ
+  mR <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked -> do
     atomically (modifyTVar' (ssSessions ss) (Map.delete digest))
     releaseLocksOf ss locked [sessJobId sess]
+  pure (mR /= Nothing)
 
 -- | Drop the locks owned by the given job ids from the committed lock
 -- table.  Publishes a new snapshot (a write) only if some lock was held.

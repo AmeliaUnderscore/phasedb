@@ -164,6 +164,9 @@ executable phasedb-server
                     , Server.Execute
                     , Server.Json
                     , Server.Routes
+                    , Paths_phasedb_hs
+
+    autogen-modules:  Paths_phasedb_hs
 
     -- Other library packages from which modules are imported.
     build-depends: base ^>=4.20.2.0
@@ -185,6 +188,7 @@ executable phasedb-server
                  , base64-bytestring
                  , clock
                  , case-insensitive
+                 , scientific
 
     -- Directories containing source files.
     hs-source-dirs:   app
@@ -209,6 +213,9 @@ test-suite phasedb-hs-test
                     , Server.Execute
                     , Server.Json
                     , Server.Routes
+                    , Paths_phasedb_hs
+
+    autogen-modules:  Paths_phasedb_hs
 
     -- The interface type and version of the test suite.
     type:             exitcode-stdio-1.0

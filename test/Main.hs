@@ -63,7 +63,7 @@ import Phase.Storage.Lock (acquireLocks, emptyLockTable)
 import Server.Auth (newLoginGuard)
 import Server.Config (ServerConfig (..), defaultConfig)
 import Server.Routes (mkApp)
-import Server.State (ServerState (..), Snapshot (..), newServerState)
+import Server.State (ServerState (..), Snapshot (..), newServerState, withBoundedEngineLock)
 import Phase.Tree
 import Phase.Value
 
@@ -3791,6 +3791,188 @@ testHttpSessionLifecycleGroup ctx = do
     gone <- sessExec api t " WRITE 1,!"
     assertEqual ctx "the session is gone after logout" (statusOf gone) 401
 
+-- ====================================================================
+-- M3: admin endpoints, bounded engine-lock waits, try-lock sweep
+-- ====================================================================
+
+testHttpAdminGroup :: TestContext -> IO ()
+testHttpAdminGroup ctx = do
+  -- 1. Authentication and role restrictions (non-admin gets 403 on every admin endpoint)
+  withApi "admin-auth" id $ \api -> do
+    let rH = basicH "reader" "pw-reader"
+        wH = basicH "writer" "pw-writer"
+        endpoints =
+          [ ("GET",  "/v1/admin/status", "")
+          , ("POST", "/v1/admin/checkpoint", "")
+          , ("POST", "/v1/admin/compact", Aeson.encode (Aeson.object ["beforeTx" .= (1 :: Int)]))
+          , ("POST", "/v1/admin/users", Aeson.encode (Aeson.object ["username" .= ("u" :: T.Text), "password" .= ("p" :: T.Text), "role" .= ("write" :: T.Text)]))
+          ]
+    forM_ endpoints $ \(meth, path, body) -> do
+      rNoAuth <- http api meth path [jsonCT] body
+      assertEqual ctx (show path ++ ": unauthenticated -> 401") (statusOf rNoAuth, codeOf rNoAuth) (401, Just "UNAUTHENTICATED")
+      rReader <- http api meth path [rH, jsonCT] body
+      assertEqual ctx (show path ++ ": reader -> 403 FORBIDDEN") (statusOf rReader, codeOf rReader) (403, Just "FORBIDDEN")
+      rWriter <- http api meth path [wH, jsonCT] body
+      assertEqual ctx (show path ++ ": writer -> 403 FORBIDDEN") (statusOf rWriter, codeOf rWriter) (403, Just "FORBIDDEN")
+
+  -- 2. GET /v1/admin/status
+  withApi "admin-status" (\c -> c { cfgExecTimeoutMs = Just 4200 }) $ \api -> do
+    let aH = basicH "admin" "secret123"
+    _ <- adminShot api " SET ^_CONFIG(\"server\",\"maxBodyBytes\")=2000000"
+    st <- http api "GET" "/v1/admin/status" [aH] ""
+    let sj = bodyJson st
+    assertEqual ctx "status: 200 ok" (statusOf st, okOf st) (200, Just True)
+    assertEqual ctx "status: version matches cabal package version" (jText ["version"] sj) (Just "0.1.0.0")
+    runAssert ctx "status: fileSizeBytes is reported and > 0" (maybe False (> 0) (jInt ["fileSizeBytes"] sj)) (show sj)
+    assertEqual ctx "status: sessionCount is reported" (jInt ["sessionCount"] sj) (Just 0)
+    -- check config sources (D9)
+    assertEqual ctx "status: execTimeoutMs source is flag"
+      (jText ["config", "execTimeoutMs", "source"] sj, jInt ["config", "execTimeoutMs", "value"] sj)
+      (Just "flag", Just 4200)
+    assertEqual ctx "status: maxBodyBytes source is config"
+      (jText ["config", "maxBodyBytes", "source"] sj, jInt ["config", "maxBodyBytes", "value"] sj)
+      (Just "config", Just 2000000)
+    assertEqual ctx "status: maxSessions source is default"
+      (jText ["config", "maxSessions", "source"] sj) (Just "default")
+
+  -- 3. POST /v1/admin/users
+  withApi "admin-users" id $ \api -> do
+    let aH = basicH "admin" "secret123"
+    badRole <- http api "POST" "/v1/admin/users" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["username" .= ("u1" :: T.Text), "password" .= ("p" :: T.Text), "role" .= ("superuser" :: T.Text)]))
+    assertEqual ctx "admin users: unknown role -> 400 BAD_REQUEST" (statusOf badRole, codeOf badRole) (400, Just "BAD_REQUEST")
+
+    emptyU <- http api "POST" "/v1/admin/users" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["username" .= ("" :: T.Text), "password" .= ("p" :: T.Text), "role" .= ("read" :: T.Text)]))
+    assertEqual ctx "admin users: empty username -> 400 BAD_REQUEST" (statusOf emptyU, codeOf emptyU) (400, Just "BAD_REQUEST")
+
+    v0 <- snapVer api
+    uRes <- http api "POST" "/v1/admin/users" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["username" .= ("alice" :: T.Text), "password" .= ("alicepw" :: T.Text), "role" .= ("write" :: T.Text)]))
+    assertEqual ctx "admin users: create user -> 200 ok" (statusOf uRes, okOf uRes) (200, Just True)
+    v1 <- snapVer api
+    assertEqual ctx "admin users: write publishes a snapshot" (v1 - v0) 1
+
+    tok <- tokenFor api "alice" "alicepw"
+    runAssert ctx "admin users: new user can log in immediately" (BS.length tok > 0) ""
+
+    wRes <- sessExec api tok " SET ^ALICE=1"
+    assertEqual ctx "admin users: new user can execute writes" (okOf wRes) (Just True)
+    runAssert ctx "admin users: write continues from right lastTx"
+      (lastTxOf wRes > lastTxOf uRes) (show (lastTxOf wRes) ++ " <= " ++ show (lastTxOf uRes))
+
+    dupRes <- http api "POST" "/v1/admin/users" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["username" .= ("alice" :: T.Text), "password" .= ("alicepw" :: T.Text), "role" .= ("write" :: T.Text)]))
+    assertEqual ctx "admin users: duplicate user -> 200 ok:false USER EXISTS"
+      (statusOf dupRes, okOf dupRes, codeOf dupRes) (200, Just False, Just "USER EXISTS")
+
+    cResults <- concurrently
+      [ http api "POST" "/v1/admin/users" [aH, jsonCT]
+          (Aeson.encode (Aeson.object ["username" .= ("bob" :: T.Text), "password" .= ("bobpw" :: T.Text), "role" .= ("read" :: T.Text)]))
+      , http api "POST" "/v1/admin/users" [aH, jsonCT]
+          (Aeson.encode (Aeson.object ["username" .= ("bob" :: T.Text), "password" .= ("bobpw" :: T.Text), "role" .= ("read" :: T.Text)]))
+      ]
+    let oks = sort (map okOf cResults)
+    assertEqual ctx "two concurrent users requests for one name give one success and one failure"
+      oks [Just False, Just True]
+    let codes = [codeOf r | r <- cResults, okOf r == Just False]
+    assertEqual ctx "the failing concurrent request gets USER EXISTS" codes [Just "USER EXISTS"]
+
+  -- 4. POST /v1/admin/checkpoint
+  withApi "admin-checkpoint" id $ \api -> do
+    let aH = basicH "admin" "secret123"
+    _ <- adminShot api " SET ^CP=123"
+    txBefore <- lastTxOf <$> adminShot api "^CP"
+    v0 <- snapVer api
+    cp1 <- http api "POST" "/v1/admin/checkpoint" [aH, jsonCT] ""
+    assertEqual ctx "checkpoint: empty body -> 200 ok" (statusOf cp1, okOf cp1) (200, Just True)
+    assertEqual ctx "checkpoint: lastTx is unchanged" (lastTxOf cp1) txBefore
+    v1 <- snapVer api
+    assertEqual ctx "checkpoint: publishes a new snapshot version" (v1 - v0) 1
+
+    cp2 <- http api "POST" "/v1/admin/checkpoint" [aH, jsonCT] "{}"
+    assertEqual ctx "checkpoint: {} body -> 200 ok" (statusOf cp2, okOf cp2) (200, Just True)
+
+    cpBad <- http api "POST" "/v1/admin/checkpoint" [aH, jsonCT] "{\"unexpected\":1}"
+    assertEqual ctx "checkpoint: invalid body -> 400 BAD_REQUEST" (statusOf cpBad, codeOf cpBad) (400, Just "BAD_REQUEST")
+
+    reopened <- openStorageEngine (apPath api) >>= either (error . show) pure
+    assertEqual ctx "checkpoint: reopening file shows data intact"
+      (unPValue <$> either (const Nothing) Just (readLive "CP" [] reopened)) (Just "123")
+
+  -- 5. POST /v1/admin/compact
+  withApi "admin-compact" id $ \api -> do
+    let aH = basicH "admin" "secret123"
+    _ <- adminShot api " SET ^K(1)=10"
+    _ <- adminShot api " SET ^K(2)=20"
+    _ <- adminShot api " SET ^K(3)=30"
+    w3 <- adminShot api " SET ^K(4)=40"
+    let Just tx4 = lastTxOf w3
+
+    badTx <- http api "POST" "/v1/admin/compact" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["beforeTx" .= (tx4 + 100)]))
+    assertEqual ctx "compact: beforeTx > lastTx -> 200 ok:false COMPACT FAILED"
+      (statusOf badTx, okOf badTx, codeOf badTx) (200, Just False, Just "COMPACT FAILED")
+
+    negTx <- http api "POST" "/v1/admin/compact" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["beforeTx" .= (-1 :: Int)]))
+    assertEqual ctx "compact: negative beforeTx -> 400 BAD_REQUEST"
+      (statusOf negTx, codeOf negTx) (400, Just "BAD_REQUEST")
+
+    v0 <- snapVer api
+    compOk <- http api "POST" "/v1/admin/compact" [aH, jsonCT]
+      (Aeson.encode (Aeson.object ["beforeTx" .= tx4]))
+    assertEqual ctx "compact: valid -> 200 ok" (statusOf compOk, okOf compOk) (200, Just True)
+    assertEqual ctx "compact: lastTx is unchanged" (lastTxOf compOk) (Just tx4)
+    v1 <- snapVer api
+    assertEqual ctx "compact: publishes a new snapshot version" (v1 - v0) 1
+
+    k4 <- adminShot api "^K(4)"
+    assertEqual ctx "compact: committed data readable after compaction" (valOf k4) (Just "40")
+
+    wNext <- adminShot api " SET ^K(5)=50"
+    assertEqual ctx "compact: next write succeeds" (okOf wNext) (Just True)
+    runAssert ctx "compact: next write advances from right lastTx"
+      (lastTxOf wNext > Just tx4) ""
+
+    reopened <- openStorageEngine (apPath api) >>= either (error . show) pure
+    assertEqual ctx "compact: reopening file shows data intact"
+      (unPValue <$> either (const Nothing) Just (readLive "K" [mkValue "4"] reopened)) (Just "40")
+
+  -- 6. Concurrency & bounded waits behind compaction
+  withApi "admin-concurrency" (\c -> c { cfgQueueTimeoutMs = Just 300, cfgExecTimeoutMs = Just 2000 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    lockHeld <- newEmptyMVar
+    releaseHolder <- newEmptyMVar
+    _ <- forkIO $ do
+      _ <- withBoundedEngineLock 5000 (ssEngineLock (apSS api)) $ \snap -> do
+        putMVar lockHeld ()
+        takeMVar releaseHolder
+        pure (snap, ())
+      pure ()
+
+    takeMVar lockHeld
+    -- 1) Reads are not delayed while engine lock is held
+    (rRes, rMs) <- timed (sessExec api t " WRITE \"read-ok\",!")
+    assertEqual ctx "reads are not delayed when engine lock is held" (okOf rRes, outOf rRes) (Just True, Just "read-ok\n")
+    runAssert ctx "read completes quickly" (rMs < 200) ("read took " ++ show rMs ++ " ms")
+
+    -- 2) Writers queue and get 503 BUSY after queueTimeoutMs (300 ms)
+    (wRes, wMs) <- timed (sessExec api t " SET ^BLOCKED=1")
+    assertEqual ctx "writer behind busy engine lock gets 503 BUSY" (statusOf wRes, codeOf wRes) (503, Just "BUSY")
+    runAssert ctx "writer timed out around queueTimeoutMs (300 ms)" (wMs >= 250 && wMs < 700) ("writer waited " ++ show wMs ++ " ms")
+
+    -- 3) Admin write endpoint also gets 503 BUSY when lock is busy
+    (aRes, aMs) <- timed (http api "POST" "/v1/admin/checkpoint" [basicH "admin" "secret123", jsonCT] "")
+    assertEqual ctx "admin checkpoint behind busy engine lock gets 503 BUSY" (statusOf aRes, codeOf aRes) (503, Just "BUSY")
+    runAssert ctx "admin checkpoint timed out around queueTimeoutMs" (aMs >= 250 && aMs < 700) ("admin checkpoint waited " ++ show aMs ++ " ms")
+
+    putMVar releaseHolder ()
+    threadDelay 50000
+
+    wAfter <- sessExec api t " SET ^FREED=1"
+    assertEqual ctx "writer succeeds after engine lock is released" (okOf wAfter) (Just True)
+
 testHttpApiGroup :: TestContext -> IO ()
 testHttpApiGroup ctx = do
   putStrLn "  -- M1: protocol, auth, errors"
@@ -3811,6 +3993,8 @@ testHttpApiGroup ctx = do
   testHttpLockGroup ctx
   putStrLn "  -- M2: session lifecycle (lock release, serialization, logout)"
   testHttpSessionLifecycleGroup ctx
+  putStrLn "  -- M3: admin endpoints, bounded waits, try-lock sweep"
+  testHttpAdminGroup ctx
 
 
 -- --------------------------------------------------------------------
@@ -3843,7 +4027,7 @@ main = do
   runGroup ctx "Phase.Exec: admin operations (M0 Prereq 2)" testAdminExecGroup
   runGroup ctx "Phase.State: output limit / envFileIOEnabled (M0 Prereq 5)" testOutputLimitGroup
   runGroup ctx "Phase.Storage.Engine: cross-process file lock (M0 Prereq 4)" testDbLockGroup
-  runGroup ctx "HTTP API (M1+M2): WAI in-process tests" testHttpApiGroup
+  runGroup ctx "HTTP API (M1+M2+M3): WAI in-process tests" testHttpApiGroup
 
   passed <- readIORef (tcPassed ctx)
   failed <- readIORef (tcFailed ctx)
