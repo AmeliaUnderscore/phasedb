@@ -8,6 +8,7 @@ module Server.Json
   ( -- * Response envelopes
     runEnvelope
   , errorEnvelope
+  , serverErrorEnvelope
   , transportError
 
     -- * Individual response bodies
@@ -76,6 +77,21 @@ errorEnvelope err lastTx elapsedMs reqId =
     [ "ok"        .= False
     , "output"    .= ("" :: Text)
     , "error"     .= evalErrorJson err
+    , "lastTx"    .= lastTx
+    , "elapsedMs" .= elapsedMs
+    , "requestId" .= reqId
+    ]
+
+-- | A Phase-run failure the server itself produces rather than the
+-- engine (@TIMEOUT@, §4.1).  Same shape and HTTP 200 as 'errorEnvelope'.
+serverErrorEnvelope :: Text   -- ^ code, e.g. \"TIMEOUT\"
+                    -> Text   -- ^ message
+                    -> TxId -> Int -> Text -> ByteString
+serverErrorEnvelope code msg lastTx elapsedMs reqId =
+  encode $ object
+    [ "ok"        .= False
+    , "output"    .= ("" :: Text)
+    , "error"     .= object [ "code" .= code, "message" .= msg, "condition" .= Null ]
     , "lastTx"    .= lastTx
     , "elapsedMs" .= elapsedMs
     , "requestId" .= reqId

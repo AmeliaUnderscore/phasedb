@@ -20,7 +20,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
+import Control.Monad (unless)
 import Data.IORef (readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -38,7 +40,7 @@ import qualified Data.CaseInsensitive as CI
 import Network.Wai
   ( Application, Request, Response
   , pathInfo, requestHeaders, requestMethod, responseLBS, getRequestBodyChunk
-  , isSecure, remoteHost
+  , isSecure, mapResponseHeaders, remoteHost
   )
 import Data.Aeson (object, encode, (.=))
 import System.Clock (Clock (Monotonic), TimeSpec (..), getTime)
@@ -58,11 +60,15 @@ import Server.Auth
   , extractCredential, isLoopback, tryLogin
   )
 import Server.Config (ServerConfig (..), resolveExecTimeoutMs, resolveExecTimeoutMaxMs, resolveMaxBodyBytes, resolveMaxOutputBytes, resolveQueueTimeoutMs, resolveSessionIdleSecs, resolveSessionMaxSecs, resolveMaxSessions)
-import Server.Execute (ExecOutcome (..), executeOneShot, executeSession)
+import Server.Execute (ExecOutcome (..), closeSession, executeOneShot, executeSession, sweepExpiredSessions, withSessionLock)
 import Server.Json
 import Server.Session
   ( Session (..), deleteSession, lookupSession, newSession, touchSession, tokenDigest )
-import Server.State (ServerState (..), Snapshot (..), EngineLock)
+import Server.State
+  ( ServerState (..), Snapshot (..), EngineLock
+  , effExecTimeoutMaxMs, effExecTimeoutMs, effMaxBodyBytes, effMaxOutputBytes
+  , effMaxSessions, effQueueTimeoutMs, effSessionIdleSecs, effSessionMaxSecs
+  )
 
 -- Import just for the config resolution:
 import qualified Server.Config as Cfg
@@ -74,10 +80,26 @@ import qualified Server.Config as Cfg
 -- | Build the WAI 'Application'.
 mkApp :: ServerState -> LoginGuard -> Application
 mkApp ss guard req respond = do
-  reqId <- generateRequestId
-  let method = requestMethod req
-      path   = pathInfo req
-  dispatch ss guard reqId method path req respond
+  generated <- generateRequestId
+  let reqId    = fromMaybe generated (clientRequestId req)
+      method   = requestMethod req
+      path     = pathInfo req
+      -- every response carries the id, in a header as well as the body (§4)
+      respond' = respond . mapResponseHeaders ((CI.mk "X-Request-Id", TE.encodeUtf8 reqId) :)
+  -- Expired sessions are removed, and their locks released, before this
+  -- request takes its snapshot.  Health stays lock-free.
+  unless (method == "GET" && path == ["v1", "health"]) (sweepExpiredSessions ss)
+  dispatch ss guard reqId method path req respond'
+
+-- | A client-supplied @X-Request-Id@, if it is short and printable (1 to 64
+-- visible ASCII characters, no spaces); anything else is ignored and the
+-- server generates its own.
+clientRequestId :: Request -> Maybe Text
+clientRequestId req = do
+  v <- lookupHeader "X-Request-Id" req
+  if BS.length v >= 1 && BS.length v <= 64 && BS.all (\c -> c >= 0x21 && c <= 0x7e) v
+    then Just (TE.decodeLatin1 v)
+    else Nothing
 
 -- --------------------------------------------------------------------
 -- Router
@@ -132,7 +154,8 @@ handleExecuteOneShot :: ServerState -> LoginGuard -> Text -> Request -> (Respons
 handleExecuteOneShot ss guard reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg     = ssConfig ss
-      maxBody = resolveMaxBodyBytes cfg
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
@@ -172,8 +195,8 @@ handleExecuteOneShot ss guard reqId req respond = do
                         Left msg ->
                           respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
                         Right er -> do
-                          let timeoutMs  = clampTimeout cfg (erTimeoutMs er)
-                              maxOut     = resolveMaxOutputBytes cfg
+                          let timeoutMs  = clampTimeout cfg snap (erTimeoutMs er)
+                              maxOut     = effMaxOutputBytes cfg snap
                               ns         = erNamespace er
                           t0 <- getTime Monotonic
                           outcome <- executeOneShot ss user (erCommand er) ns timeoutMs maxOut
@@ -190,7 +213,8 @@ handleCreateSession :: ServerState -> LoginGuard -> Text -> Request -> (Response
 handleCreateSession ss guard reqId req respond = do
   snap <- readIORef (ssSnapshot ss)
   let cfg     = ssConfig ss
-      maxBody = resolveMaxBodyBytes cfg
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
@@ -203,7 +227,7 @@ handleCreateSession ss guard reqId req respond = do
               pass = srPassword sr
           -- Check max-sessions cap.
           smap <- atomically (readTVar (ssSessions ss))
-          let maxSess = resolveMaxSessions cfg
+          let maxSess = effMaxSessions cfg snap
           if Map.size smap >= maxSess
             then respond (jsonErr status503 (transportError "BUSY" "too many sessions" reqId))
             else do
@@ -217,8 +241,8 @@ handleCreateSession ss guard reqId req respond = do
                   respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid credentials" reqId))
                 LoginOk -> do
                   let role    = lookupUserRole user eng
-                      idleS   = resolveSessionIdleSecs cfg
-                      maxS    = resolveSessionMaxSecs cfg
+                      idleS   = effSessionIdleSecs cfg snap
+                      maxS    = effSessionMaxSecs cfg snap
                       initEnv = (initEnvWithStorage eng)
                                   { envCurrentUser = user
                                   , envFileIOEnabled = False
@@ -240,8 +264,8 @@ handleGetSession ss reqId req respond = do
     let eng      = snapEngine snap
         user     = sessUser sess
         role     = lookupUserRole user eng
-        idleS    = resolveSessionIdleSecs cfg
-        maxS     = resolveSessionMaxSecs cfg
+        idleS    = effSessionIdleSecs cfg snap
+        maxS     = effSessionMaxSecs cfg snap
         expiresAt = addUTCTime (fromIntegral maxS) (sessCreatedAt sess)
     respond (jsonOk (sessionInfoBody user (roleToText role) (sessNamespace sess) expiresAt idleS reqId))
 
@@ -252,14 +276,16 @@ handleGetSession ss reqId req respond = do
 handleDeleteSession :: ServerState -> Text -> Request -> (Response -> IO a) -> IO a
 handleDeleteSession ss reqId req respond = do
   let cfg = ssConfig ss
+  snapQ <- readIORef (ssSnapshot ss)
   withBearerSession ss cfg reqId req respond $ \sess digest -> do
-    -- Release any LOCKs held by this session from the shared lock table.
-    withMVar (ssEngineLock ss) $ \locked -> do
-      pure ()  -- Locks released lazily; full cleanup done by expireAll.
-    deleteSession digest (ssSessions ss)
-    respond (jsonOk (transportError "ok" "session deleted" reqId))
+    -- Wait for any request still running in this session, then remove it and
+    -- release its LOCKs.  Same bounded wait as a second request on the session.
+    r <- withSessionLock (effQueueTimeoutMs cfg snapQ) sess (closeSession ss digest sess)
+    respond $ case r of
+      Nothing -> jsonErr status503 (transportError "BUSY" "session is busy with another request" reqId)
+      Just () -> jsonOk (handleDeleteSessionOk reqId)
 
--- Actually: build a proper ok body for DELETE.
+-- | Body of a successful @DELETE /v1/sessions/current@.
 handleDeleteSessionOk :: Text -> LBS.ByteString
 handleDeleteSessionOk reqId = LBS.fromStrict $ TE.encodeUtf8 $
   "{\"ok\":true,\"requestId\":\"" <> reqId <> "\"}"
@@ -271,36 +297,58 @@ handleDeleteSessionOk reqId = LBS.fromStrict $ TE.encodeUtf8 $
 handleSessionExecute :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleSessionExecute ss guard reqId req respond = do
   let cfg     = ssConfig ss
-      maxBody = resolveMaxBodyBytes cfg
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
     Just bs ->
-      withBearerSession ss cfg reqId req respond $ \sess digest -> do
+      withBearerSession ss cfg reqId req respond $ \sess0 digest ->
         case parseExecuteBody (LBS.fromStrict bs) of
           Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
           Right er -> do
-            snap <- readIORef (ssSnapshot ss)
-            let eng      = snapEngine snap
-                user     = sessUser sess
-                role     = lookupUserRole user eng
-            if role == RNone
-              then respond (jsonErr status403 (transportError "FORBIDDEN" "account has no access" reqId))
-              else do
-                let timeoutMs = clampTimeout cfg (erTimeoutMs er)
-                    maxOut    = resolveMaxOutputBytes cfg
-                    ns        = erNamespace er
-                t0 <- getTime Monotonic
-                (outcome, env') <- executeSession ss user (sessEnv sess) (erCommand er) ns timeoutMs maxOut
-                t1 <- getTime Monotonic
-                let elapsed = elapsedMs t0 t1
-                    lastTx  = seLastTx eng
-                case outcome of
-                  ExecOk {} -> do
-                    -- Update session's env and last-used time.
-                    touchSession digest env' (if T.null ns then sessNamespace sess else ns) (ssSessions ss)
-                  _ -> pure ()
-                respond (outcomeResponse reqId elapsed lastTx outcome)
+            -- Two requests for one session never run at the same time (D6):
+            -- wait for the session lock, but no longer than the queue timeout.
+            snapQ <- readIORef (ssSnapshot ss)
+            result <- withSessionLock (effQueueTimeoutMs cfg snapQ) sess0 (runInSession ss cfg reqId digest er)
+            -- the response is written after the lock is released
+            respond $ case result of
+              Nothing   -> jsonErr status503 (transportError "BUSY" "session is busy with another request" reqId)
+              Just resp -> resp
+
+-- | The body of a session request, run while holding the session's lock.
+-- The session is looked up again here: while this request waited, the
+-- previous one may have changed the session's locals, or the session may
+-- have been closed or expired.
+runInSession :: ServerState -> ServerConfig -> Text -> Text -> ExecuteReq -> IO Response
+runInSession ss cfg reqId digest er = do
+  snap <- readIORef (ssSnapshot ss)
+  let idleS = effSessionIdleSecs cfg snap
+      maxS  = effSessionMaxSecs  cfg snap
+  mSess <- lookupSession digest idleS maxS (ssSessions ss)
+  case mSess of
+    Nothing -> pure (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid or expired token" reqId))
+    Just sess -> do
+      let eng  = snapEngine snap
+          user = sessUser sess
+          role = lookupUserRole user eng
+      if role == RNone
+        then pure (jsonErr status403 (transportError "FORBIDDEN" "account has no access" reqId))
+        else do
+          let timeoutMs = clampTimeout cfg snap (erTimeoutMs er)
+              maxOut    = effMaxOutputBytes cfg snap
+              ns        = erNamespace er
+          t0 <- getTime Monotonic
+          (outcome, env') <- executeSession ss user (sessEnv sess) (erCommand er) ns timeoutMs maxOut
+          t1 <- getTime Monotonic
+          let elapsed = elapsedMs t0 t1
+              lastTx  = seLastTx eng
+          case outcome of
+            ExecOk {} ->
+              -- Update the session's env and last-used time.
+              touchSession digest env' (if T.null ns then sessNamespace sess else ns) (ssSessions ss)
+            _ -> pure ()
+          pure (outcomeResponse reqId elapsed lastTx outcome)
 
 -- --------------------------------------------------------------------
 -- GET /v1/admin/status  (M3)
@@ -347,7 +395,8 @@ handleAdminCheckpoint ss guard reqId req respond = do
 handleAdminCompact :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminCompact ss guard reqId req respond = do
   let cfg     = ssConfig ss
-      maxBody = resolveMaxBodyBytes cfg
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
@@ -374,7 +423,8 @@ handleAdminCompact ss guard reqId req respond = do
 handleAdminAddUser :: ServerState -> LoginGuard -> Text -> Request -> (Response -> IO a) -> IO a
 handleAdminAddUser ss guard reqId req respond = do
   let cfg     = ssConfig ss
-      maxBody = resolveMaxBodyBytes cfg
+  snapB <- readIORef (ssSnapshot ss)
+  let maxBody = effMaxBodyBytes cfg snapB
   body <- readBodyCapped maxBody req
   case body of
     Nothing -> respond (jsonErr status413 (transportError "TOO_LARGE" "request body too large" reqId))
@@ -412,6 +462,7 @@ withBearerSession :: ServerState
                   -> (Session -> Text -> IO a)  -- ^ (session, digest)
                   -> IO a
 withBearerSession ss cfg reqId req respond action = do
+  snap <- readIORef (ssSnapshot ss)
   let authHdrVal = lookupHeader hAuthorization req
   case extractCredential (maybe "" id authHdrVal) of
     Left _ ->
@@ -420,8 +471,8 @@ withBearerSession ss cfg reqId req respond action = do
       respond (jsonErr status401 (transportError "UNAUTHENTICATED" "Bearer token required" reqId))
     Right (BearerCred raw) -> do
       let digest  = tokenDigest raw
-          idleS   = resolveSessionIdleSecs cfg
-          maxS    = resolveSessionMaxSecs cfg
+          idleS   = effSessionIdleSecs cfg snap
+          maxS    = effSessionMaxSecs cfg snap
       mSess <- lookupSession digest idleS maxS (ssSessions ss)
       case mSess of
         Nothing -> respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid or expired token" reqId))
@@ -446,8 +497,8 @@ withAdminAuth ss guard cfg reqId req respond action = do
       respond (jsonErr status401 (transportError "UNAUTHENTICATED" "credentials required" reqId))
     Right (BearerCred raw) -> do
       let digest = tokenDigest raw
-          idleS  = resolveSessionIdleSecs cfg
-          maxS   = resolveSessionMaxSecs cfg
+          idleS  = effSessionIdleSecs cfg snap
+          maxS   = effSessionMaxSecs cfg snap
       mSess <- lookupSession digest idleS maxS (ssSessions ss)
       case mSess of
         Nothing -> respond (jsonErr status401 (transportError "UNAUTHENTICATED" "invalid or expired token" reqId))
@@ -489,7 +540,7 @@ outcomeResponse reqId elapsed lastTx = \case
   ExecError err tx ->
     jsonOk (errorEnvelope err tx elapsed reqId)
   ExecTimeout ->
-    jsonOk (errorEnvelope (CustomError "execution timed out") lastTx elapsed reqId)
+    jsonOk (serverErrorEnvelope "TIMEOUT" "<TIMEOUT> execution timed out" lastTx elapsed reqId)
   ExecParseError msg ->
     jsonOk (errorEnvelope (SyntaxError msg) lastTx elapsed reqId)
 
@@ -550,9 +601,9 @@ elapsedMs (TimeSpec s0 n0) (TimeSpec s1 n1) =
   fromIntegral ((s1 - s0) * 1000 + (n1 - n0) `div` 1_000_000)
 
 -- | Clamp a client-supplied timeout to the server's configured max.
-clampTimeout :: ServerConfig -> Maybe Int -> Int
-clampTimeout cfg mReq =
-  let def = resolveExecTimeoutMs  cfg
-      cap = resolveExecTimeoutMaxMs cfg
+clampTimeout :: ServerConfig -> Snapshot -> Maybe Int -> Int
+clampTimeout cfg snap mReq =
+  let def = effExecTimeoutMs  cfg snap
+      cap = effExecTimeoutMaxMs cfg snap
       req = maybe def id mReq
   in min req cap

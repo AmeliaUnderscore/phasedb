@@ -2,6 +2,7 @@
 module Main (main) where
 
 import Control.Concurrent (forkIO, getNumCapabilities, threadDelay)
+import GHC.Conc (getNumProcessors)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad (foldM, forM, forM_, replicateM)
@@ -3211,6 +3212,15 @@ isHex64 t = T.length t == 64 && T.all (`elem` ("0123456789abcdef" :: String)) t
 -- M1: protocol, execution semantics, limits, concurrency
 -- ====================================================================
 
+-- | A Phase snippet that tries to take a lock without waiting and reports
+-- the result.  LOCK does not set $TEST here; a failed acquisition is only
+-- visible through a CATCH <LOCK-TIMEOUT> handler (handbook Part III §1.1).
+-- Outputs "got" if the lock was free (or already ours), "blocked" otherwise.
+lockProbe :: T.Text -> T.Text
+lockProbe ref = T.intercalate "\n"
+  [ " DO", " LOCK " <> ref <> ":0", " WRITE \"got\",!"
+  , " CATCH <LOCK-TIMEOUT>", " WRITE \"blocked\",!", " END DO" ]
+
 testHttpProtocolGroup :: TestContext -> IO ()
 testHttpProtocolGroup ctx = withApi "protocol" id $ \api -> do
   -- health ------------------------------------------------------------
@@ -3351,33 +3361,43 @@ testHttpLimitsGroup ctx = do
     assertEqual ctx "D9: ^_CONFIG(\"server\",...) applies without a restart (maxOutputBytes)"
       (codeOf r) (Just "OUTPUT LIMIT")
 
-  withApi "timeouts" (\c -> c { cfgExecTimeoutMs = Just 250, cfgExecTimeoutMaxMs = Just 600 }) $ \api -> do
+  -- Timing tests use a session (Bearer): a one-shot request pays a PBKDF2 on
+  -- every call, which on a slow machine would swamp the numbers.  Bounds are
+  -- lower-bounds on the configured timeouts and generous upper bounds
+  -- relative to a measured baseline, so they hold on a slow or loaded machine.
+  withApi "timeouts" (\c -> c { cfgExecTimeoutMs = Just 1000, cfgExecTimeoutMaxMs = Just 1500 }) $ \api -> do
+    tok <- tokenFor api "admin" "secret123"
+    let run extra cmd = http api "POST" "/v1/sessions/current/execute" [bearerH tok, jsonCT] (execBodyWith extra cmd)
+    -- baseline latency of a trivial request and of a trivial write
+    (_, base)  <- timed (sessExec api tok " WRITE 1,!")
+    (_, wbase) <- timed (sessExec api tok " SET ^BASE=1")
+    let slack = 2000 + 20 * max base wbase :: Double
     -- allocating loop
-    (loopR, ms) <- timed (adminShot api " SET ^TO(1)=1\n FOR  SET X=1")
+    (loopR, ms) <- timed (sessExec api tok " SET ^TO(1)=1\n FOR  SET X=1")
     assertEqual ctx "timed-out request: ok false" (statusOf loopR, okOf loopR) (200, Just False)
     assertEqual ctx "timed-out request: error code TIMEOUT (§4.1)" (codeOf loopR) (Just "TIMEOUT")
-    runAssert ctx "timed-out request stops near the default timeout"
-      (ms >= 200 && ms < 2000) ("elapsed ms: " ++ show ms)
+    runAssert ctx "timed-out request runs for about the default timeout (1000 ms), no longer than a slack above it"
+      (ms >= 900 && ms < 1000 + slack) ("elapsed ms: " ++ show ms ++ ", slack " ++ show slack)
     gone <- adminShot api "^TO(1)"
     assertEqual ctx "timed-out request leaves no trace (its write is not visible)" (codeOf gone) (Just "UNDEFINED VARIABLE")
     -- non-allocating loop (needs -fno-omit-yields)
-    (spinR, ms2) <- timed (adminShot api " SET I=0\n FOR  SET I=I")
+    (spinR, ms2) <- timed (sessExec api tok " SET I=0\n FOR  SET I=I")
     assertEqual ctx "non-allocating loop is interrupted" (okOf spinR) (Just False)
-    runAssert ctx "non-allocating loop stops near the timeout" (ms2 < 2000) ("elapsed ms: " ++ show ms2)
+    runAssert ctx "non-allocating loop is stopped by the timeout" (ms2 < 1000 + slack) ("elapsed ms: " ++ show ms2)
     -- timeoutMs honoured, then capped by the server maximum
-    (shortR, ms3) <- timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
-                              (execBodyWith ["timeoutMs" .= (100 :: Int)] " FOR  SET X=1"))
+    (shortR, ms3) <- timed (run ["timeoutMs" .= (200 :: Int)] " FOR  SET X=1")
     assertEqual ctx "client timeoutMs is honoured" (okOf shortR) (Just False)
-    runAssert ctx "client timeoutMs 100 stops well before the 250 ms default" (ms3 < 240) ("elapsed ms: " ++ show ms3)
-    (capR, ms4) <- timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
-                            (execBodyWith ["timeoutMs" .= (999999 :: Int)] " FOR  SET X=1"))
+    runAssert ctx "client timeoutMs 200 ends clearly sooner than the 1000 ms default"
+      (ms3 >= 150 && ms3 + 300 < ms) ("200 ms request took " ++ show ms3 ++ ", default-timeout request took " ++ show ms)
+    (capR, ms4) <- timed (run ["timeoutMs" .= (999999 :: Int)] " FOR  SET X=1")
     assertEqual ctx "timeoutMs above the server maximum is capped" (okOf capR) (Just False)
-    runAssert ctx "capped request stops near the server maximum (600 ms), not 999999"
-      (ms4 >= 500 && ms4 < 3000) ("elapsed ms: " ++ show ms4)
+    runAssert ctx "capped request runs for about the server maximum (1500 ms), not 999999"
+      (ms4 >= 1400 && ms4 < 1500 + slack) ("elapsed ms: " ++ show ms4 ++ ", slack " ++ show slack)
     -- the engine lock is free afterwards
-    (okW, ms5) <- timed (adminShot api " SET ^AFTER(1)=1")
+    (okW, ms5) <- timed (sessExec api tok " SET ^AFTER(1)=1")
     assertEqual ctx "a write succeeds right after a timed-out request (lock released)" (okOf okW) (Just True)
-    runAssert ctx "...and does not wait on the lock" (ms5 < 1000) ("elapsed ms: " ++ show ms5)
+    runAssert ctx "...and is not delayed by the lock (about as fast as the baseline write)"
+      (ms5 < wbase + 500 + slack / 4) ("write took " ++ show ms5 ++ ", baseline write " ++ show wbase)
 
 testHttpExecutionGroup :: TestContext -> IO ()
 testHttpExecutionGroup ctx = withApi "execution" id $ \api -> do
@@ -3454,25 +3474,36 @@ testHttpConcurrencyGroup ctx = withApi "concurrency" (\c -> c { cfgExecTimeoutMs
   q <- valOf <$> adminShot api "^Q"
   assertEqual ctx "multi-global transactions apply atomically in some serial order (P=16, Q=32)" (p, q) (Just "16", Just "32")
 
-  -- a long-running read does not delay writes or other reads ------------------------------
-  if caps < 2
-    then runAssert ctx "(skipped: needs -N with >= 2 capabilities)" True ""
+  -- a long-running read does not delay writes or other reads -----------------------------
+  -- (sessions, so no PBKDF2 in the timings; compared with a measured baseline)
+  procs <- getNumProcessors
+  if caps < 2 || procs < 2
+    then runAssert ctx "(skipped: needs at least 2 capabilities and 2 processors)" True ""
     else do
+      tr <- tokenFor api "admin" "secret123"
+      tw <- tokenFor api "admin" "secret123"
+      (_, wbase) <- timed (sessExec api tw " SET ^W0=1")
       [(_, readMs), (wr, writeMs)] <- concurrently
-        [ timed (http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
-                   (execBodyWith ["timeoutMs" .= (1500 :: Int)] " FOR  SET X=1"))
-        , do threadDelay 200000
-             timed (adminShot api " SET ^W2=1")
+        [ timed (http api "POST" "/v1/sessions/current/execute" [bearerH tr, jsonCT]
+                   (execBodyWith ["timeoutMs" .= (2000 :: Int)] " FOR  SET X=1"))
+        , do threadDelay 300000
+             timed (sessExec api tw " SET ^W2=1")
         ]
-      runAssert ctx "long-running read ran for ~its full timeout" (readMs >= 1000) ("ms: " ++ show readMs)
+      runAssert ctx "long-running read ran for ~its full timeout" (readMs >= 1500) ("ms: " ++ show readMs)
       assertEqual ctx "write completes while a long read is running" (okOf wr) (Just True)
-      runAssert ctx "a long-running read does not delay a concurrent write" (writeMs < 700) ("write ms: " ++ show writeMs)
+      runAssert ctx "a long-running read does not delay a concurrent write (write finishes in a fraction of the read's time)"
+        (writeMs < wbase + 500 && writeMs * 2 < readMs)
+        ("write " ++ show writeMs ++ " ms (baseline " ++ show wbase ++ " ms), read " ++ show readMs ++ " ms")
 
       -- two requests are observed running at the same time (-N) ----------------------------
-      (_, wallMs) <- timed $ concurrently
-        [ http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBodyWith ["timeoutMs" .= (700 :: Int)] " FOR  SET X=1")
-        , http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT] (execBodyWith ["timeoutMs" .= (700 :: Int)] " FOR  SET X=1") ]
-      runAssert ctx "with -N, two 700 ms requests overlap (wall time well under 1400 ms)" (wallMs < 1300) ("wall ms: " ++ show wallMs)
+      t1 <- tokenFor api "admin" "secret123"
+      t2 <- tokenFor api "admin" "secret123"
+      let spin tok = http api "POST" "/v1/sessions/current/execute" [bearerH tok, jsonCT]
+                       (execBodyWith ["timeoutMs" .= (800 :: Int)] " FOR  SET X=1")
+      (_, single) <- timed (spin t1)
+      (_, both)   <- timed (concurrently [spin t1, spin t2])
+      runAssert ctx "with -N, two 800 ms requests overlap (wall time well under two sequential runs)"
+        (both < single * 1.6) ("one request " ++ show single ++ " ms, two in parallel " ++ show both ++ " ms")
 
 -- ====================================================================
 -- M2: sessions, shared locks, rate limiting
@@ -3639,39 +3670,126 @@ testHttpLockGroup ctx = withApi "locks" id $ \api -> do
   ja <- outOf <$> sessExec api a " WRITE $JOB,!"
   jb <- outOf <$> sessExec api b " WRITE $JOB,!"
   runAssert ctx "each session has its own $JOB" (ja /= jb) ("both sessions report " ++ show ja)
+  let jobText = maybe "" T.strip ja
+  runAssert ctx "$JOB is independent of the bearer token (does not reveal a prefix of it)"
+    (not (T.null jobText) && not (jobText `T.isPrefixOf` TE.decodeUtf8 a)) ("$JOB " ++ show jobText ++ " is a prefix of the token")
 
   v0 <- snapVer api
-  la <- sessExec api a " LOCK ^L:0  WRITE $TEST,!"
+  la <- sessExec api a (lockProbe "^L")
   v1 <- snapVer api
-  assertEqual ctx "session A acquires a free lock" (outOf la) (Just "1\n")
+  assertEqual ctx "session A acquires a free lock" (outOf la) (Just "got\n")
   assertEqual ctx "a LOCK counts as a write (publishes a snapshot)" (v1 - v0) 1
 
-  lb <- sessExec api b " LOCK ^L:0  WRITE $TEST,!"
-  assertEqual ctx "a LOCK held by one session blocks another" (outOf lb) (Just "0\n")
-  lbOther <- sessExec api b " LOCK ^OTHER:0  WRITE $TEST,!"
-  assertEqual ctx "an unrelated lock is still free for the other session" (outOf lbOther) (Just "1\n")
+  lb <- sessExec api b (lockProbe "^L")
+  assertEqual ctx "a LOCK held by one session blocks another" (outOf lb) (Just "blocked\n")
+  lbOther <- sessExec api b (lockProbe "^OTHER")
+  assertEqual ctx "an unrelated lock is still free for the other session" (outOf lbOther) (Just "got\n")
 
-  la2 <- sessExec api a " LOCK ^L:0  WRITE $TEST,!"
-  assertEqual ctx "re-acquiring a lock the session already holds succeeds" (outOf la2) (Just "1\n")
+  la2 <- sessExec api a (lockProbe "^L")
+  assertEqual ctx "re-acquiring a lock the session already holds succeeds" (outOf la2) (Just "got\n")
 
   _ <- sessExec api a " LOCK"
-  lb2 <- sessExec api b " LOCK ^L:0  WRITE $TEST,!"
-  assertEqual ctx "releasing a lock (bare LOCK) frees it for the other session" (outOf lb2) (Just "1\n")
+  lb2 <- sessExec api b (lockProbe "^L")
+  assertEqual ctx "releasing a lock (bare LOCK) frees it for the other session" (outOf lb2) (Just "got\n")
 
   -- closing a session frees its locks
   _ <- sessExec api b " LOCK"
   _ <- sessExec api a " LOCK ^M:0"
-  blockedB <- sessExec api b " LOCK ^M:0  WRITE $TEST,!"
-  assertEqual ctx "before logout: A's lock on ^M blocks B" (outOf blockedB) (Just "0\n")
+  blockedB <- sessExec api b (lockProbe "^M")
+  assertEqual ctx "before logout: A's lock on ^M blocks B" (outOf blockedB) (Just "blocked\n")
   _ <- http api "DELETE" "/v1/sessions/current" [bearerH a] ""
-  freedB <- sessExec api b " LOCK ^M:0  WRITE $TEST,!"
-  assertEqual ctx "closing a session frees its locks" (outOf freedB) (Just "1\n")
+  freedB <- sessExec api b (lockProbe "^M")
+  assertEqual ctx "closing a session frees its locks" (outOf freedB) (Just "got\n")
 
   -- a failed request does not leave a lock behind
   c <- tokenFor api "admin" "secret123"
   _ <- sessExec api c " LOCK ^F:0\n WRITE 1/0,!"
-  dB <- sessExec api b " LOCK ^F:0  WRITE $TEST,!"
-  assertEqual ctx "a failed request does not publish its lock" (outOf dB) (Just "1\n")
+  dB <- sessExec api b (lockProbe "^F")
+  assertEqual ctx "a failed request does not publish its lock" (outOf dB) (Just "got\n")
+
+testHttpSessionLifecycleGroup :: TestContext -> IO ()
+testHttpSessionLifecycleGroup ctx = do
+  -- one-shot requests: own job id, locks released when the request ends ------------------
+  withApi "oneshot-locks" id $ \api -> do
+    v0 <- snapVer api
+    r  <- adminShot api (lockProbe "^OS")
+    v1 <- snapVer api
+    assertEqual ctx "one-shot LOCK acquires a free lock" (outOf r) (Just "got\n")
+    assertEqual ctx "a one-shot request's locks are released when it ends (so it publishes nothing)" (v1 - v0) 0
+    a <- tokenFor api "admin" "secret123"
+    la <- sessExec api a (lockProbe "^OS")
+    assertEqual ctx "a session can take a lock a one-shot request used" (outOf la) (Just "got\n")
+    held <- adminShot api (lockProbe "^OS")
+    assertEqual ctx "a one-shot request is blocked by a lock a session holds" (outOf held) (Just "blocked\n")
+    still <- adminShot api (lockProbe "^OS")
+    assertEqual ctx "...and does not release the session's lock when it ends" (outOf still) (Just "blocked\n")
+    j1 <- outOf <$> adminShot api " WRITE $JOB,!"
+    j2 <- outOf <$> adminShot api " WRITE $JOB,!"
+    runAssert ctx "each one-shot request gets its own $JOB" (j1 /= j2) ("both report " ++ show j1)
+
+  -- expired sessions release their locks and leave the table (lazy sweep) -------------------
+  withApi "expiry-locks" (\c -> c { cfgSessionIdleSecs = Just 1 }) $ \api -> do
+    a  <- tokenFor api "admin" "secret123"
+    la <- sessExec api a (lockProbe "^X")
+    assertEqual ctx "expiry: session A takes a lock" (outOf la) (Just "got\n")
+    threadDelay 1400000
+    b  <- tokenFor api "admin" "secret123"       -- any request triggers the sweep
+    lb <- sessExec api b (lockProbe "^X")
+    assertEqual ctx "an idle-expired session's lock is released" (outOf lb) (Just "got\n")
+    st <- http api "GET" "/v1/admin/status" [bearerH b] ""
+    assertEqual ctx "an expired session is removed from the table (sessionCount = 1)"
+      (jInt ["sessionCount"] (bodyJson st)) (Just 1)
+
+  -- a session with a request in flight is not expired under it ------------------------------
+  withApi "inflight-sweep" (\c -> c { cfgSessionIdleSecs = Just 1, cfgExecTimeoutMs = Just 2500 }) $ \api -> do
+    a <- tokenFor api "admin" "secret123"
+    [_, cnt] <- concurrently
+      [ sessExec api a " FOR  SET X=1" >> pure Nothing
+      , do threadDelay 1500000
+           b  <- tokenFor api "admin" "secret123"
+           st <- http api "GET" "/v1/admin/status" [bearerH b] ""
+           pure (jInt ["sessionCount"] (bodyJson st))
+      ]
+    assertEqual ctx "an idle-expired session that is still running a request is kept (sessionCount = 2)" cnt (Just 2)
+
+  -- D6: second request on a busy session ------------------------------------------------------
+  withApi "session-busy" (\c -> c { cfgQueueTimeoutMs = Just 300, cfgExecTimeoutMs = Just 1500 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    [(r1, ms1), (r2, ms2)] <- concurrently
+      [ timed (sessExec api t " FOR  SET X=1")
+      , do threadDelay 200000
+           timed (sessExec api t " WRITE 1,!")
+      ]
+    assertEqual ctx "the long request ends with TIMEOUT" (codeOf r1) (Just "TIMEOUT")
+    assertEqual ctx "a second request on a busy session waits at most the queue timeout, then 503 BUSY"
+      (statusOf r2, codeOf r2) (503, Just "BUSY")
+    runAssert ctx "...and the 503 comes back long before the first request ends" (ms2 < ms1) ("503 after " ++ show ms2 ++ " ms, first request " ++ show ms1 ++ " ms")
+    after <- sessExec api t " WRITE 2,!"
+    assertEqual ctx "the session is usable afterwards" (outOf after) (Just "2\n")
+
+  withApi "session-wait" (\c -> c { cfgExecTimeoutMs = Just 500 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    _ <- sessExec api t " SET N=0"
+    [(_, ms1), (r2, ms2)] <- concurrently
+      [ timed (sessExec api t " FOR  SET X=1")
+      , do threadDelay 100000
+           timed (sessExec api t " WRITE \"ran\",!")
+      ]
+    assertEqual ctx "a second request on a busy session waits for its turn, then runs" (okOf r2, outOf r2) (Just True, Just "ran\n")
+    runAssert ctx "...after the first request finished" (ms2 + 100 >= ms1 - 50) ("first " ++ show ms1 ++ " ms, second " ++ show ms2 ++ " ms")
+
+  -- logout waits for an in-flight request ------------------------------------------------------
+  withApi "logout-waits" (\c -> c { cfgExecTimeoutMs = Just 600 }) $ \api -> do
+    t <- tokenFor api "admin" "secret123"
+    [(_, ms1), (d, ms2)] <- concurrently
+      [ timed (sessExec api t " FOR  SET X=1")
+      , do threadDelay 150000
+           timed (http api "DELETE" "/v1/sessions/current" [bearerH t] "")
+      ]
+    assertEqual ctx "logout during an in-flight request: 200 ok" (statusOf d, okOf d) (200, Just True)
+    runAssert ctx "logout waited for the in-flight request to finish" (ms2 + 150 >= ms1 - 50) ("request " ++ show ms1 ++ " ms, logout ended at " ++ show (ms2 + 150) ++ " ms")
+    gone <- sessExec api t " WRITE 1,!"
+    assertEqual ctx "the session is gone after logout" (statusOf gone) 401
 
 testHttpApiGroup :: TestContext -> IO ()
 testHttpApiGroup ctx = do
@@ -3691,6 +3809,8 @@ testHttpApiGroup ctx = do
   putStrLn "  -- M2: session concurrency and shared locks"
   testHttpSessionConcurrencyGroup ctx
   testHttpLockGroup ctx
+  putStrLn "  -- M2: session lifecycle (lock release, serialization, logout)"
+  testHttpSessionLifecycleGroup ctx
 
 
 -- --------------------------------------------------------------------

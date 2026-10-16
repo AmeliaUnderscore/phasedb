@@ -18,6 +18,15 @@ module Server.Config
   , resolveSessionMaxSecs
   , resolveMaxSessions
   , resolveQueueTimeoutMs
+    -- * Built-in defaults (the last tier of the D9 resolution order)
+  , defaultMaxBodyBytes
+  , defaultExecTimeoutMs
+  , defaultExecTimeoutMaxMs
+  , defaultMaxOutputBytes
+  , defaultSessionIdleSecs
+  , defaultSessionMaxSecs
+  , defaultMaxSessions
+  , defaultQueueTimeoutMs
   ) where
 
 import Options.Applicative

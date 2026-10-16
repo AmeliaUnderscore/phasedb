@@ -31,6 +31,16 @@ module Server.State
     -- * Config-value resolution (D9)
   , configValueInt
   , configValueText
+
+    -- * Effective limits: flag, then ^_CONFIG(\"server\", name), then default
+  , effMaxBodyBytes
+  , effExecTimeoutMs
+  , effExecTimeoutMaxMs
+  , effMaxOutputBytes
+  , effSessionIdleSecs
+  , effSessionMaxSecs
+  , effMaxSessions
+  , effQueueTimeoutMs
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -46,7 +56,12 @@ import Phase.Storage.Engine (StorageEngine (..))
 import Phase.Storage.Lock (LockTable, emptyLockTable)
 import Phase.Storage.Engine (readLive)
 
-import Server.Config (ServerConfig)
+import Server.Config
+  ( ServerConfig (..)
+  , defaultExecTimeoutMaxMs, defaultExecTimeoutMs, defaultMaxBodyBytes
+  , defaultMaxOutputBytes, defaultMaxSessions, defaultQueueTimeoutMs
+  , defaultSessionIdleSecs, defaultSessionMaxSecs
+  )
 import Server.Session (SessionMap)
 
 -- | A consistent snapshot: storage engine + lock table + monotone version.
@@ -126,3 +141,24 @@ configValueText key def mFlag snap =
       case readLive "_CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
         Right pv | not (T.null (unPValue pv)) -> unPValue pv
         _                                     -> def
+
+-- --------------------------------------------------------------------
+-- Effective limits (D9)
+-- --------------------------------------------------------------------
+--
+-- Each limit is resolved on every use, in this order: the command-line
+-- flag (when given it pins the value), then @^_CONFIG("server", name)@
+-- read from the request's snapshot, then the built-in default.  Reading
+-- the snapshot means a committed @SET@ applies from the next request.
+
+effMaxBodyBytes, effExecTimeoutMs, effExecTimeoutMaxMs, effMaxOutputBytes,
+  effSessionIdleSecs, effSessionMaxSecs, effMaxSessions, effQueueTimeoutMs
+  :: ServerConfig -> Snapshot -> Int
+effMaxBodyBytes      cfg = configValueInt "maxBodyBytes"       defaultMaxBodyBytes      (cfgMaxBodyBytes cfg)
+effExecTimeoutMs     cfg = configValueInt "execTimeoutMs"      defaultExecTimeoutMs     (cfgExecTimeoutMs cfg)
+effExecTimeoutMaxMs  cfg = configValueInt "execTimeoutMaxMs"   defaultExecTimeoutMaxMs  (cfgExecTimeoutMaxMs cfg)
+effMaxOutputBytes    cfg = configValueInt "maxOutputBytes"     defaultMaxOutputBytes    (cfgMaxOutputBytes cfg)
+effSessionIdleSecs   cfg = configValueInt "sessionIdleSeconds" defaultSessionIdleSecs   (cfgSessionIdleSecs cfg)
+effSessionMaxSecs    cfg = configValueInt "sessionMaxSeconds"  defaultSessionMaxSecs    (cfgSessionMaxSecs cfg)
+effMaxSessions       cfg = configValueInt "maxSessions"        defaultMaxSessions       (cfgMaxSessions cfg)
+effQueueTimeoutMs    cfg = configValueInt "queueTimeoutMs"     defaultQueueTimeoutMs    (cfgQueueTimeoutMs cfg)
