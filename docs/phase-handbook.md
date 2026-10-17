@@ -13,7 +13,7 @@ The handbook has these parts:
 - **Part IV**, string tools: interpolation, formatting, slicing,
   `FOR EACH`.
 - **Part V**, namespaces.
-- **Part VI**, dynamic references and macros: `REF(...)`, MACLIB.
+- **Part VI**, dynamic references and macros: `REF(...)`.
 - **Part VII**, time travel.
 - **Part VIII**, graph operations.
 - **Part IX**, secondary indexes.
@@ -1095,57 +1095,6 @@ two locals into a global name at runtime.
 `REF(...)` works the same way in `SET`, in `KILL`, and in an ordinary
 read.
 
-## 2. MACLIB: runtime-mutable, data-stored macros
-
-```
-DEFINE MACRO MAX BETWEEN &A AND &B AS "IF &A>&B THEN &A ELSE &B END IF"
-...
-SET result = MAX BETWEEN 3 AND 7
-WRITE result,!                          ; -> 7
-DROP MACRO "MAX BETWEEN &A AND &B"
-```
-
-- A macro's **pattern** must start with a literal keyword, never with a
-  `&param`. Each `&NAME` token inside the pattern marks a parameter slot.
-- A macro's **body is an ordinary Phase expression**, not a separate
-  formula language. `DEFINE MACRO` tokenizes and parses its body string
-  exactly like any other expression. `&A` and `&B` resolve as ordinary,
-  specially-named local references, bound fresh on each call.
-- **Phase dispatches a macro at both statement position and expression
-  position**, using the same leading-keyword lookup. `SET result = MAX
-  BETWEEN 3 AND 7` invokes the macro in expression position and keeps its
-  value. A macro invoked at statement position runs its body and
-  discards the result. When two macros share a lead word but differ in
-  arity or pattern shape, Phase tries the longest pattern first.
-- An argument may be any expression, not just a literal:
-  `MAX BETWEEN x+1 AND y*2` evaluates both operands before it invokes the
-  macro.
-- `^MACLIB` is a **reserved global**. `SET ^MACLIB(...)` and
-  `KILL ^MACLIB(...)`, written directly, are rejected with
-  `<RESERVED GLOBAL>`. The only way to write it is through `DEFINE
-  MACRO`/`DROP MACRO`, which write `^MACLIB(patternText, "BODY")` and keep
-  the in-memory macro registry in sync in the same operation. A defined
-  macro survives an interpreter restart over the same database, since it
-  is ordinary durable data underneath.
-
-**Implementation note: a required two-pass workflow.** You must `DEFINE`
-a macro in a separate parse-and-execution pass from any line that calls
-it. `RoutineBuilder.build` parses a whole routine up front, so a macro
-defined earlier in the *same* multi-line source is not yet registered for
-a later line in that same parse pass. This works one step at a time in
-the REPL, where Phase submits and runs one line at a time. This does not
-work inside one big multi-line script that both defines and calls a
-macro.
-
-**Implementation note: narrower than the design document describes.**
-Phase only ever writes `^MACLIB(pattern, "BODY")`. There is no
-`^MACLIB(id, "DESC")` field, and no `LIST MACLIB HISTORY` command. The
-macro registry is also not the `txId`-keyed, self-invalidating cache the
-design document describes. It is a plain in-memory registry, loaded once
-from `^MACLIB` at interpreter startup, and kept in sync afterward only
-when `DEFINE MACRO` or `DROP MACRO` calls directly into it. Phase performs
-no per-transaction staleness check.
-
 ---
 
 # Part VII, Time Travel
@@ -1201,134 +1150,7 @@ Phase code, with no need to reach into storage internals.
 
 ---
 
-# Part VIII, Graph Operations: `EDGE`, `PATH`, `SHORTEST`
-
-A graph edge is not a new storage type. It is an ordinary global write,
-using the same node-duality machinery as everything else:
-
-```
-EDGE FROM ^GRAPH("supplyChain","A") TO "B" WEIGHT 4.2
-EDGE DELETE ^GRAPH("supplyChain","A") TO "B"
-
-SET route=PATH FROM ^GRAPH("supplyChain","A") TO "D"
-SET shortest=SHORTEST FROM ^GRAPH("supplyChain","A") TO "D" LIMIT 500
-```
-
-`EDGE FROM`/`EDGE DELETE` each take a real `^GRAPH(...)` global
-reference, with the source vertex as the reference's final subscript.
-Phase stores an edge to `dst`, with weight `w`, as
-`^GRAPH(graphName, src, "EDGES", dst) = w` (Phase uses default weight
-`"1"` when you omit `WEIGHT`). Because this is an ordinary global
-reference, it composes with time travel (`EDGE FROM ^[tx]GRAPH(...) ...`)
-with no extra work.
-
-`PATH FROM ... TO ...` and `SHORTEST FROM ... TO ...` are
-**expression-position** constructs. Use each one in `SET`, not in
-statement position. Each one evaluates to a comma-joined vertex list, from
-source to destination, inclusive. An empty string means Phase found no
-path. Phase introduces no new sentinel value for this case.
-
-- **`PATH`** runs unweighted breadth-first search. The first path Phase
-  finds is, by definition, the path with the fewest hops. `PATH` never
-  reads edge weight.
-- **`SHORTEST`** runs Dijkstra's algorithm. `SHORTEST` reads each edge's
-  weight using the same numeric-coercion rule as everywhere else in
-  Phase. A malformed or missing weight coerces to zero rather than
-  raising an error.
-
-Both constructs read directly against live storage, or against the
-active `TRANSACTION` if you invoke them inside one, at whatever
-transaction or timestamp the graph reference's `asOf` resolves to.
-Neither one copies the graph into memory first, so `AS OF` composes
-correctly with graph traversal.
-
-`LIMIT n` caps the number of nodes Phase visits (Phase uses a default of
-`500` when you omit `LIMIT`). This guards against a runaway or cyclic
-traversal hanging the interpreter indefinitely, since traversal runs
-synchronously, with no way to cancel it partway through.
-
-**Implementation note.** Exceeding `LIMIT` throws `<TRAVERSAL-LIMIT>` as
-a **plain runtime error**, not as a `SIGNAL`ed condition. Unlike
-`<INDEX-BUILD-FAILED>` (Part IX), `HANDLE`/`CATCH` cannot catch
-`<TRAVERSAL-LIMIT>` today, even though the design document describes it
-as one more condition type, alongside `<CONFLICT>` and similar
-conditions.
-
----
-
-# Part IX, Secondary Indexes
-
-```
-INDEX ON ^ORDERS(*,"STATUS") AS statusIdx
-INDEX DELETE statusIdx
-REBUILD INDEX statusIdx
-
-SET shippedIds=$INDEXLOOKUP("statusIdx","SHIPPED")
-```
-
-`INDEX ON` takes a real global reference, with exactly one `*` marking
-the subscript position it indexes. This keeps the indexed shape visible
-and checkable at the point where you declare it, rather than as a bare
-integer position. Declaring an index against a global that already holds
-data **backfills it immediately**. Phase has no separate "declare, then
-populate" step.
-
-## 1. What changes about an ordinary `SET`
-
-This is the one feature in the language that changes the behavior of an
-*ordinary* write, rather than only adding new syntax alongside it. Once
-`^ORDERS(*,"STATUS")` is indexed, a plain `SET
-^ORDERS(id,"STATUS")="SHIPPED"`, written with no special syntax at the
-call site, also writes into the index behind the scenes. Phase performs
-this write atomically with the primary write, staged as a second change
-in the same underlying commit. A bare `SET`/`KILL` against an indexed
-global becomes implicitly transactional as a result, even outside any
-explicit `TRANSACTION` block.
-
-## 2. Metadata and backfill
-
-Index state lives in ordinary reserved globals, not only in memory, so
-it survives a crash partway through a build:
-
-```
-^_IDXMETA(indexName, "STATUS")="BUILDING" | "READY"
-^_IDXMETA(indexName, "LAST-PATH")=<encoded path of the last backfilled entry>
-^_IDX_<indexName>(value, primaryKey...)=""
-```
-
-Backfill runs in **chunks**, 2,000 entries per commit, not as one giant
-transaction. Phase persists `LAST-PATH` after every batch. `REBUILD
-INDEX` resumes from the persisted `LAST-PATH`, rather than always
-rescanning from the root. This is safe, not merely convenient, because
-re-writing the same index entry twice causes no harm.
-
-**Implementation note.** The design document describes a third status,
-`CORRUPT`, assigned automatically to any index Phase finds still
-`BUILDING` when the database opens, implying a crash interrupted its
-backfill. **Phase never assigns this status anywhere in the code.** An
-index that crashes mid-backfill simply stays `BUILDING` after restart.
-Phase does not promote it to `CORRUPT`. Treat "an index stuck at
-`BUILDING` after an unclean shutdown" as something you detect and fix
-with `REBUILD INDEX` yourself. Phase does not flag this for you
-automatically today.
-
-## 3. Querying: `$INDEXLOOKUP`
-
-```
-SET shippedIds=$INDEXLOOKUP("statusIdx","SHIPPED")
-```
-
-This returns a comma-separated list of matching primary keys. Looking up
-an undeclared index name throws `<INDEX>`. Querying an index that is not
-`READY`, whether it is still `BUILDING` or, in theory, `CORRUPT`, signals
-`<INDEX-BUILD-FAILED>` (with fields `indexName`, `globalName`, `reason`,
-`lastPath`), rather than silently answering from an incomplete index.
-This signal *is* routed through the real, catchable condition mechanism
-(Part III).
-
----
-
-# Part X, Bulk Data Movement: `MERGE` and Materializing Joins
+# Part VIII, Bulk Data Movement: `MERGE` and Materializing Joins
 
 ## 1. `MERGE`: copying a whole subtree
 
@@ -1417,7 +1239,7 @@ of these three, nothing more.
 
 ---
 
-# Part XI, Blob Storage
+# Part IX, Blob Storage
 
 **Content-addressed storage** stores a file once and identifies it by a
 hash of its own bytes, not by a name a person picks. Two uploads of the
@@ -1486,7 +1308,7 @@ list.
 
 ---
 
-# Part XII, Storage & Concurrency Internals
+# Part XI, Storage & Concurrency Internals
 
 ## 1. Architecture, in one pass
 
@@ -1566,7 +1388,7 @@ not as a bug to patch casually.
 
 ---
 
-# Part XIII, Intrinsic Function Reference
+# Part XII, Intrinsic Function Reference
 
 ## Intrinsic variables (no parentheses)
 
@@ -1611,25 +1433,6 @@ the 76 baseline; Phase has not merely left them unimplemented.
 ---
 
 # Part XIV, Using the REPL
-
-`Repl.java` is a direct-mode terminal front end. It runs on JLine, so it
-feels like a real language toplevel: it supports line editing, keeps a
-persistent history, and offers tab completion, rather than acting as a
-bare line-at-a-time loop. One `Interpreter`, one `Environment`, and one
-`PhaseDB` instance persist for the whole session, so a local you set on
-one line stays visible on the next line.
-
-```
-mvn -f PhaseDB/pom.xml compile
-java -cp PhaseDB/target/classes com.phase.Repl /tmp/phase.db [script ...]
-```
-
-(`Main.java` is currently only a placeholder. `Repl` is the actual entry
-point. `pom.xml` has no `exec-maven-plugin` wiring for it yet, so invoke
-`Repl` directly against the compiled classes, as shown above. A database
-path defaults to `/tmp/phasem.db` if you omit it. Any further arguments
-name Phase source files, which Phase runs with `.load` before the first
-prompt.)
 
 ```
 phase# SET X=5 WRITE X,!
@@ -1700,98 +1503,6 @@ phase# ^ORDERS(1,"PRICE")
 
 ---
 
-# Part XV, What Phase does not implement yet
-
-This part exists so nobody spends an afternoon "fixing" something that is
-actually a known, deliberate gap:
-
-- **The `?` pattern-match operator.** The parser accepts it, but
-  `MValue.matchesPattern` unconditionally throws `<NOTIMPL>`. Phase has
-  built no repeat-count, alternation, or literal pattern grammar yet.
-- **`@` indirection.** The tokenizer and parser accept it
-  (`Expr.Indirect`), so surrounding syntax does not choke on it, but
-  evaluating it throws `<NOTIMPL>`. It is not coming back in its classic
-  string-eval form. `REF(...)` (Part VI §1) and MACLIB (Part VI §2) are
-  its intended, narrower replacements.
-- **Time-traveled `$ORDER`.** Reading and `$DATA` through an `[asOf]`
-  reference both work. Iterating a historical subscript level does not
-  work (Part VII §2).
-- **Path-shape `EVALUATE` clauses.** Phase defers this, pending a
-  decision on whether Phase ever adds a value kind beyond plain strings
-  (Part II §5).
-- **List and array literals.** Phase has not resolved this at all. It
-  shares the same underlying blocker as path-shape `EVALUATE` clauses.
-- **True lexical closures over shared mutable state.** Only
-  value-snapshot closures exist (Part II §3), by deliberate design.
-- **True resumption and continuations** in the condition system. Only
-  retry-the-block exists (Part III §1).
-- **Explicit cross-namespace qualified calls** (`CALL Other.Namespace.TAG
-  (...)`). The grammar for this does not exist. Only same-namespace
-  automatic fallback resolution works (Part V).
-- **`<TRAVERSAL-LIMIT>` and `<CONFLICT>` as fully structured conditions.**
-  `<TRAVERSAL-LIMIT>` is not routed through the catchable condition
-  mechanism at all yet. `<CONFLICT>`'s fields are a single best-effort
-  `detail` string, rather than the structured `global`, `path`,
-  `expectedTx`, and `actualTx` fields the design document describes.
-- **Index `CORRUPT` status.** Phase never assigns it. A crash mid-backfill
-  leaves an index at `BUILDING` indefinitely, rather than Phase detecting
-  this automatically.
-- **MACLIB's `txId`-keyed cache invalidation, `^MACLIB(id,"DESC")`, and
-  `LIST MACLIB HISTORY`.** None of these exist. The macro registry is a
-  plain in-memory table, synced only by `DEFINE MACRO`/`DROP MACRO`
-  themselves (Part VI §2).
-- **`TRANSACTION` nesting restrictions.** The design document says Phase
-  forbids nesting. The parser does not actually enforce this (Part III
-  §2).
-- **A reusable, named join definition.** `MERGE` (Part X §1) and a
-  materializing `FOR EACH`/`MERGE` join (Part X §2) both exist. A way to
-  declare a join once, under a name, and re-run it later without
-  retyping its clauses, does not exist yet.
-
----
-
-# Appendix A, Error reference
-
-| Tag                    | Thrown when                                                                                                                                                                                                                                                                                                                                                                        |
-|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `<UNDEFINED VARIABLE>` | A bare read of a local or global finds no value at that exact node, and no handler is catching `<UNDEFINED>`.                                                                                                                                                                                                                                                                      |
-| `<UNDEFINED LABEL>`    | `DO`/`GOTO` targets a tag not in the routine's tag map.                                                                                                                                                                                                                                                                                                                            |
-| `<UNDEFINED FUNCTION>` | Code calls an unrecognized `$FUNCTION(...)`.                                                                                                                                                                                                                                                                                                                                       |
-| `<DIVIDE BY ZERO>`     | `/`, `\`, or `#` runs with a zero divisor, and no handler is catching `<DIVIDE-BY-ZERO>`.                                                                                                                                                                                                                                                                                          |
-| `<SUBSCRIPT>`          | For example, `$ORDER` is called against a bare, unsubscripted local.                                                                                                                                                                                                                                                                                                               |
-| `<SYNTAX>`             | Phase throws this for a parse-time grammar error, and for a wide range of runtime shape errors: a wrong argument count for an intrinsic, an invalid `SET`/`KILL` target, `CALL`/`&ref` misuse, an `EVALUATE`/`WHEN` arity mismatch, a macro argument-count mismatch, `RETRY` outside a `HANDLE` clause, an undeclared `SIGNAL` field, or an unparseable time-travel bracket value. |
-| `<SET ON READONLY>`    | `SET` targets a time-traveled (`^[...]`) global reference.                                                                                                                                                                                                                                                                                                                         |
-| `<RESERVED GLOBAL>`    | `SET`/`KILL` targets `^MACLIB` directly.                                                                                                                                                                                                                                                                                                                                           |
-| `<INDEX>`              | `$INDEXLOOKUP`/`REBUILD INDEX` references an undeclared index name.                                                                                                                                                                                                                                                                                                                |
-| `<TRAVERSAL-LIMIT>`    | A graph traversal (`PATH`/`SHORTEST`) exceeds its `LIMIT`. `HANDLE`/`CATCH` cannot catch this today.                                                                                                                                                                                                                                                                               |
-| `<NOTIMPL>`            | Code runs an unsupported statement, `@` indirection, time-traveled `$ORDER`, the `?` pattern operator, or one of the explicitly stubbed intrinsics. Check Part XV before assuming this is a bug.                                                                                                                                                                                   |
-| `<INTERNAL>`           | A defensive "this should not happen" branch runs: an unknown AST node, a malformed operator enum, or `RETRY`/`HANDLE`/`CATCH` reached with no enclosing frame. Report this if you see it.                                                                                                                                                                                          |
-| `<IO ERROR>`           | An `IOException` surfaces from the storage layer, during a write, an index operation, or a macro operation.                                                                                                                                                                                                                                                                        |
-
-Catchable **conditions** (`<CONFLICT>`, `<LOCK-TIMEOUT>`, `<UNDEFINED>`,
-`<DIVIDE-BY-ZERO>`, `<INDEX-BUILD-FAILED>`) form a separate, structured
-mechanism, layered on top of several rows in this table. See Part III §1.
-
----
-
-# Appendix B, Operator precedence quick reference
-
-Loosest to tightest:
-
-```
-&  !                          logical AND / OR (not short-circuiting)
-=  <  >  [  ]]  ?  ('-negatable)   comparison / contains / sorts-after / pattern-match
-_                              string concatenation
-+  -                           additive
-*  /  \  #                     multiplicative / integer-divide / modulo
-**                             exponentiation (right-associative)
--  +  '  @                     unary prefix (highest)
-```
-
-`s[start:end]` slice syntax binds tighter than every operator above, as a
-postfix wrap directly on the value that comes before it.
-
----
 
 # Part XVI, The HTTP Server
 
@@ -2302,3 +2013,95 @@ A hard kill (`SIGKILL`) skips the shutdown sequence but leaves the
 database file intact. On next startup the WAL recovery routine trims
 any torn trailing record and any transaction whose commit never
 reached disk.
+
+
+# Part XIV, What Phase does not implement yet
+
+This part exists so nobody spends an afternoon "fixing" something that is
+actually a known, deliberate gap:
+
+- **The `?` pattern-match operator.** The parser accepts it, but
+  `MValue.matchesPattern` unconditionally throws `<NOTIMPL>`. Phase has
+  built no repeat-count, alternation, or literal pattern grammar yet.
+- **`@` indirection.** The tokenizer and parser accept it
+  (`Expr.Indirect`), so surrounding syntax does not choke on it, but
+  evaluating it throws `<NOTIMPL>`. It is not coming back in its classic
+  string-eval form. `REF(...)` (Part VI §1) and MACLIB (Part VI §2) are
+  its intended, narrower replacements.
+- **Time-traveled `$ORDER`.** Reading and `$DATA` through an `[asOf]`
+  reference both work. Iterating a historical subscript level does not
+  work (Part VII §2).
+- **Path-shape `EVALUATE` clauses.** Phase defers this, pending a
+  decision on whether Phase ever adds a value kind beyond plain strings
+  (Part II §5).
+- **List and array literals.** Phase has not resolved this at all. It
+  shares the same underlying blocker as path-shape `EVALUATE` clauses.
+- **True lexical closures over shared mutable state.** Only
+  value-snapshot closures exist (Part II §3), by deliberate design.
+- **True resumption and continuations** in the condition system. Only
+  retry-the-block exists (Part III §1).
+- **Explicit cross-namespace qualified calls** (`CALL Other.Namespace.TAG
+  (...)`). The grammar for this does not exist. Only same-namespace
+  automatic fallback resolution works (Part V).
+- **`<TRAVERSAL-LIMIT>` and `<CONFLICT>` as fully structured conditions.**
+  `<TRAVERSAL-LIMIT>` is not routed through the catchable condition
+  mechanism at all yet. `<CONFLICT>`'s fields are a single best-effort
+  `detail` string, rather than the structured `global`, `path`,
+  `expectedTx`, and `actualTx` fields the design document describes.
+- **Index `CORRUPT` status.** Phase never assigns it. A crash mid-backfill
+  leaves an index at `BUILDING` indefinitely, rather than Phase detecting
+  this automatically.
+- **MACLIB's `txId`-keyed cache invalidation, `^MACLIB(id,"DESC")`, and
+  `LIST MACLIB HISTORY`.** None of these exist. The macro registry is a
+  plain in-memory table, synced only by `DEFINE MACRO`/`DROP MACRO`
+  themselves (Part VI §2).
+- **`TRANSACTION` nesting restrictions.** The design document says Phase
+  forbids nesting. The parser does not actually enforce this (Part III
+  §2).
+- **A reusable, named join definition.** `MERGE` (Part X §1) and a
+  materializing `FOR EACH`/`MERGE` join (Part X §2) both exist. A way to
+  declare a join once, under a name, and re-run it later without
+  retyping its clauses, does not exist yet.
+
+---
+
+# Appendix A, Error reference
+
+| Tag                    | Thrown when                                                                                                                                                                                                                                                                                                                                                                        |
+|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `<UNDEFINED VARIABLE>` | A bare read of a local or global finds no value at that exact node, and no handler is catching `<UNDEFINED>`.                                                                                                                                                                                                                                                                      |
+| `<UNDEFINED LABEL>`    | `DO`/`GOTO` targets a tag not in the routine's tag map.                                                                                                                                                                                                                                                                                                                            |
+| `<UNDEFINED FUNCTION>` | Code calls an unrecognized `$FUNCTION(...)`.                                                                                                                                                                                                                                                                                                                                       |
+| `<DIVIDE BY ZERO>`     | `/`, `\`, or `#` runs with a zero divisor, and no handler is catching `<DIVIDE-BY-ZERO>`.                                                                                                                                                                                                                                                                                          |
+| `<SUBSCRIPT>`          | For example, `$ORDER` is called against a bare, unsubscripted local.                                                                                                                                                                                                                                                                                                               |
+| `<SYNTAX>`             | Phase throws this for a parse-time grammar error, and for a wide range of runtime shape errors: a wrong argument count for an intrinsic, an invalid `SET`/`KILL` target, `CALL`/`&ref` misuse, an `EVALUATE`/`WHEN` arity mismatch, a macro argument-count mismatch, `RETRY` outside a `HANDLE` clause, an undeclared `SIGNAL` field, or an unparseable time-travel bracket value. |
+| `<SET ON READONLY>`    | `SET` targets a time-traveled (`^[...]`) global reference.                                                                                                                                                                                                                                                                                                                         |
+| `<RESERVED GLOBAL>`    | `SET`/`KILL` targets `^MACLIB` directly.                                                                                                                                                                                                                                                                                                                                           |
+| `<INDEX>`              | `$INDEXLOOKUP`/`REBUILD INDEX` references an undeclared index name.                                                                                                                                                                                                                                                                                                                |
+| `<TRAVERSAL-LIMIT>`    | A graph traversal (`PATH`/`SHORTEST`) exceeds its `LIMIT`. `HANDLE`/`CATCH` cannot catch this today.                                                                                                                                                                                                                                                                               |
+| `<NOTIMPL>`            | Code runs an unsupported statement, `@` indirection, time-traveled `$ORDER`, the `?` pattern operator, or one of the explicitly stubbed intrinsics. Check Part XV before assuming this is a bug.                                                                                                                                                                                   |
+| `<INTERNAL>`           | A defensive "this should not happen" branch runs: an unknown AST node, a malformed operator enum, or `RETRY`/`HANDLE`/`CATCH` reached with no enclosing frame. Report this if you see it.                                                                                                                                                                                          |
+| `<IO ERROR>`           | An `IOException` surfaces from the storage layer, during a write, an index operation, or a macro operation.                                                                                                                                                                                                                                                                        |
+
+Catchable **conditions** (`<CONFLICT>`, `<LOCK-TIMEOUT>`, `<UNDEFINED>`,
+`<DIVIDE-BY-ZERO>`, `<INDEX-BUILD-FAILED>`) form a separate, structured
+mechanism, layered on top of several rows in this table. See Part III §1.
+
+---
+
+# Appendix B, Operator precedence quick reference
+
+Loosest to tightest:
+
+```
+&  !                          logical AND / OR (not short-circuiting)
+=  <  >  [  ]]  ?  ('-negatable)   comparison / contains / sorts-after / pattern-match
+_                              string concatenation
++  -                           additive
+*  /  \  #                     multiplicative / integer-divide / modulo
+**                             exponentiation (right-associative)
+-  +  '  @                     unary prefix (highest)
+```
+
+`s[start:end]` slice syntax binds tighter than every operator above, as a
+postfix wrap directly on the value that comes before it.
