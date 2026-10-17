@@ -29,6 +29,7 @@ module Phase.Storage.Engine
   , readAtTime
   , dataAtTx
   , orderAtTx
+  , getTreeAtTx
 
     -- * Direct & Transactional Commit
   , commitTransaction
@@ -47,6 +48,7 @@ module Phase.Storage.Engine
     -- * Checkpointing & Compaction
   , takeCheckpoint
   , compactTo
+  , compactToTime
   ) where
 
 import Data.Int (Int64)
@@ -87,6 +89,7 @@ import Phase.Tree
   , dataNode
   , dumpTree
   , emptyNode
+  , isNodeEmpty
   , findSubNode
   , getNode
   , killNode
@@ -472,6 +475,48 @@ readAtTxResident targetTx global subs eng =
                 case revValue latest of
                   Just val -> Right val
                   Nothing  -> Left (StorageUndefinedVar global subs)
+
+-- | Reconstruct the complete global 'Node' tree as it existed at a past transaction ID.
+getTreeAtTx :: TxId -> Text -> StorageEngine -> IO (Maybe Node)
+getTreeAtTx targetTx global eng
+  | targetTx >= seLastTx eng = pure (Map.lookup global (seLive eng))
+  | otherwise =
+      case seWalPath eng of
+        Nothing -> pure (getTreeAtTxResident targetTx global eng)
+        Just path -> do
+          records <- readWalRecords path
+          let (baseEngine, recordsToTarget) = case findCheckpointBeforeTx targetTx records of
+                Just (idx, cpTx, cpTs, cpEntries) ->
+                  ( (loadCheckpointEntries cpTs cpEntries initStorageEngine) { seLastTx = cpTx }
+                  , drop (idx + 1) records
+                  )
+                Nothing ->
+                  (initStorageEngine, records)
+              deepEngine = replayFrom baseEngine (takeWhileUpToTx targetTx recordsToTarget)
+          pure (Map.lookup global (seLive deepEngine))
+
+-- | Purely in-memory reconstruction of a global's tree at a past transaction ID.
+getTreeAtTxResident :: TxId -> Text -> StorageEngine -> Maybe Node
+getTreeAtTxResident targetTx global eng =
+  let matchingKeys = [ (subs, revs)
+                     | ((g, subs), revs) <- Map.toList (seHistory eng)
+                     , g == global ]
+      liveKeys = [ (subs, val)
+                 | ((g, subs), lastTx) <- Map.toList (seLastTxMap eng)
+                 , g == global
+                 , lastTx <= targetTx
+                 , not (Map.member (g, subs) (seHistory eng))
+                 , Right val <- [readLive global (map unSubscriptKey subs) eng] ]
+      applyRev node (subKeys, revs) =
+        let validRevs = filter (\r -> revTx r <= targetTx) revs
+        in case validRevs of
+             (Revision _ _ (Just val) : _) -> setNode (map unSubscriptKey subKeys) val node
+             _ -> node
+      nodeFromHist = foldl' applyRev emptyNode matchingKeys
+      nodeFull = foldl' (\n (subKeys, val) -> setNode (map unSubscriptKey subKeys) val n) nodeFromHist liveKeys
+  in if isNodeEmpty nodeFull
+       then Map.lookup global (seLive eng) >>= \root -> if targetTx >= seLastTx eng then Just root else Nothing
+       else Just nodeFull
 
 -- | Stop replaying once a record's own tx exceeds the target, a deep
 -- replay only needs to reconstruct state UP TO 'targetTx', not the
@@ -996,3 +1041,26 @@ compactTo path targetTx = do
     removeFileIfExists p = do
       e <- doesFileExist p
       if e then removeFile p else pure ()
+
+-- | Compact (vacuum) a @.db@ file up to a specific timestamp cutoff:
+-- permanently discard every record whose commit time is at or before
+-- 'cutoff'.  Resolves the cutoff to the highest 'TxId' whose
+-- 'WalCommit' timestamp is @<= cutoff@, then delegates to 'compactTo'.
+-- If no committed transaction falls at or before 'cutoff', this is a
+-- no-op that still produces a backup (consistent with 'compactTo tx=0').
+compactToTime :: FilePath -> UTCTime -> IO (Either StorageError FilePath)
+compactToTime path cutoff = do
+  fileExists <- doesFileExist path
+  if not fileExists
+    then pure (Left (StorageCustom "cannot compact: database file does not exist"))
+    else do
+      records <- readWalRecords path
+      -- Find the highest committed TxId whose commit timestamp <= cutoff.
+      let commitTimes = Map.fromList
+            [ (ctx, cts)
+            | WalRecord _ (WalCommit ctx cts _user) <- records
+            ]
+          targetTx = foldl' (\acc (tx, ts) -> if ts <= cutoff then max acc tx else acc)
+                             0
+                             (Map.toList commitTimes)
+      compactTo path targetTx

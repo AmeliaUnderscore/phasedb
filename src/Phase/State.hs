@@ -28,6 +28,8 @@ module Phase.State
   , orderRef
   , childCountRef
   , mergeRef
+  , mergeJsonRef
+  , readNodeRef
   , resolveRelativeTx
   , effectivePin
   , enterPinScope
@@ -51,7 +53,8 @@ module Phase.State
   ) where
 
 import Control.Monad (mplus)
-import Data.List (foldl')
+import Data.List (nub, sortBy)
+import Data.Ord (Down (..), comparing)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -72,6 +75,8 @@ import Phase.Auth
   , checkWriteAccess
   , lookupUserRole
   )
+import qualified Data.Aeson as Aeson
+import Phase.Json (jsonToNode)
 import Phase.Storage.Engine
   ( StorageEngine (..)
   , commitKill
@@ -80,6 +85,7 @@ import Phase.Storage.Engine
   , dataAtTx
   , orderAtTx
   , dataLive
+  , getTreeAtTx
   , initStorageEngine
   , orderLive
   , readAtTx
@@ -88,7 +94,7 @@ import Phase.Storage.Engine
 import Phase.Storage.Lock (LockTable, emptyLockTable)
 import Phase.Storage.Transaction (TxHandle (..), newTxHandle, stageKill, stageSet)
 import Phase.Storage.Types (Revision (..), TxId, formatStorageError)
-import Phase.Tree (Node (..), childCountNode, dataNode, dumpTree, emptyNode, findSubNode, getNode, killNode, mergeNode, orderNode, setNode, toSubKey)
+import Phase.Tree (Node (..), childCountNode, dataNode, dumpTree, emptyNode, findSubNode, getNode, isNodeEmpty, killNode, mergeNode, orderNode, setNode, toSubKey)
 
 -- --------------------------------------------------------------------
 -- Error Handling
@@ -525,18 +531,29 @@ enterPinScope newTx Nothing env =
 -- ('Phase.Parser.pLocal' has no time-travel bracket at all).
 resolveRelativeTx :: Bool -> Text -> [PValue] -> Int -> Env -> TxId
 resolveRelativeTx fromLive targetName subs n env =
-  let allRevs = Map.findWithDefault [] (targetName, map toSubKey subs) (seHistory (envStorage env))
-      -- Inside a pinned block the IMPLICIT baseline is the revision in
-      -- effect at the pin, so a plain @^[-N]@ counts back from THAT; the
-      -- explicit @LAST@ spelling ('fromLive' = True) always counts from
-      -- the true live latest, which is what makes @LAST@ the escape
-      -- hatch back out of a pin (docs/tx-pinning-design.md Part 2).
-      revs = case (fromLive, effectivePin targetName env) of
-               (False, Just pin) -> dropWhile (\r -> revTx r > pin) allRevs
-               _                 -> allRevs
-  in case drop (max 0 n) revs of
-       (Revision tx _ _ : _) -> tx
-       _                     -> 0
+  let subKeys = map toSubKey subs
+      hist     = seHistory (envStorage env)
+      -- Collect all revisions at the exact path AND any descendant paths
+      -- (needed when the reference is a non-leaf node, e.g. ^TT(1) whose
+      -- only history entries are at ^TT(1,"status") etc.).  Build a
+      -- deduplicated, descending list of all TxIds that touched anything
+      -- in this subtree.
+      isUnderOrAt (g, p) = g == targetName && subKeys `isPrefixOf'` p
+      subtreeRevs = concatMap snd [ entry | entry@(k, _) <- Map.toList hist, isUnderOrAt k ]
+      -- Apply the pin filter the same way the single-path branch does:
+      -- inside a pinned block a plain ^[-N] counts back from the pin,
+      -- while LAST always counts from the true live latest.
+      filteredRevs = case (fromLive, effectivePin targetName env) of
+                       (False, Just pin) -> filter (\r -> revTx r <= pin) subtreeRevs
+                       _                 -> subtreeRevs
+      -- Deduplicate and sort descending so the most-recent transaction
+      -- is first, then 'drop n' gives the n-th revision back.
+      txIds = sortBy (comparing Down) . nub . map revTx $ filteredRevs
+  in case drop (max 0 n) txIds of
+       (tx : _) -> tx
+       _        -> 0
+  where
+    isPrefixOf' prefix list = take (length prefix) list == prefix
 
 -- Subject to the same read-permission check as 'readRef', time
 -- travel does not bypass access control.
@@ -816,6 +833,88 @@ mergeRef (dstKind, dstRawName, dstSubs) (srcKind, srcRawName, srcSubs) env = do
                  -- fire today; surface it rather than swallow it like
                  -- the SET fallback does.
                  Left err -> Left (ConflictError (formatStorageError err))
+
+-- | MERGE a JSON value into a target reference.
+--
+-- Mirrors 'mergeRef' semantics: merges recursively into existing trees,
+-- overwriting matching paths and preserving existing non-overlapping nodes.
+mergeJsonRef :: (VarKind, Text, [PValue]) -> Aeson.Value -> Env -> Either EvalError Env
+mergeJsonRef (_, dstRawName0, dstSubs0) _ _
+  | any (T.null . unPValue) dstSubs0 = Left (NullSubscript dstRawName0 dstSubs0)
+mergeJsonRef (dstKind, dstRawName, dstSubs) jsonVal env =
+  let jsonTree = jsonToNode jsonVal
+  in case dstKind of
+    Local ->
+      let dstName = resolveLocalName dstRawName env
+          dstRoot = Map.findWithDefault emptyNode dstName (envLocals env)
+          dstRoot' = mergeNode dstSubs dstRoot [] jsonTree
+      in Right env { envLocals = Map.insert dstName dstRoot' (envLocals env) }
+    Global -> do
+      case checkWriteAccess (envCurrentUser env) dstRawName (envStorage env) of
+        Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
+        Nothing -> Right ()
+      let leaves = [ (dstSubs ++ rel, val) | (rel, val) <- dumpTree jsonTree ]
+      case [ r | (subs, val) <- leaves
+               , Just r <- [checkReservedGlobalWrite dstRawName subs (Just val) env] ] of
+        (reason : _) -> Left (PermissionDenied (envCurrentUser env) reason)
+        []           -> Right ()
+      case [ subs | (subs, _) <- leaves, any (T.null . unPValue) subs ] of
+        (subs : _) -> Left (NullSubscript dstRawName subs)
+        []         -> Right ()
+      if null leaves
+        then Right env
+        else case envActiveTx env of
+          Just tx ->
+            let tx' = foldl' (\t (subs, val) -> stageSet dstRawName subs val Nothing t) tx leaves
+                node = Map.findWithDefault emptyNode dstRawName (envGlobals env)
+                node' = foldl' (\n (subs, val) -> setNode subs val n) node leaves
+            in Right env { envActiveTx = Just tx', envGlobals = Map.insert dstRawName node' (envGlobals env) }
+          Nothing ->
+            let tx = foldl' (\t (subs, val) -> stageSet dstRawName subs val Nothing t)
+                            (newTxHandle 0 (envNow env)) leaves
+            in case commitTransaction (envCurrentUser env) tx (envNow env) (envStorage env) of
+                 Right (newTx, storage') ->
+                   Right env
+                     { envStorage = storage'
+                     , envGlobals = seLive storage'
+                     , envTxId    = T.pack (show newTx)
+                     }
+                 Left err -> Left (ConflictError (formatStorageError err))
+
+-- | Read the complete 'Node' subtree at a given reference, supporting
+-- live locals, live globals, and historical/time-traveled globals.
+readNodeRef :: VarKind -> Text -> [PValue] -> Maybe TxId -> Env -> IO (Either EvalError Node)
+readNodeRef Local rawName subs _mTx env =
+  let name = resolveLocalName rawName env
+  in case Map.lookup name (envLocals env) of
+    Nothing   -> pure (Left (UndefinedVariable name subs))
+    Just root ->
+      case findSubNode subs root of
+        Nothing   -> pure (Left (UndefinedVariable name subs))
+        Just node ->
+          if isNodeEmpty node
+            then pure (Left (UndefinedVariable name subs))
+            else pure (Right node)
+
+readNodeRef Global rawName subs mTx env =
+  case checkReadAccess (envCurrentUser env) rawName (envStorage env) of
+    Just reason -> pure (Left (PermissionDenied (envCurrentUser env) reason))
+    Nothing -> do
+      mRoot <- case mTx of
+        Just tx -> getTreeAtTx tx rawName (envStorage env)
+        Nothing ->
+          case effectivePin rawName env of
+            Just pin -> getTreeAtTx pin rawName (envStorage env)
+            Nothing  -> pure (Map.lookup rawName (envGlobals env))
+      pure $ case mRoot of
+        Nothing   -> Left (UndefinedVariable ("^" <> rawName) subs)
+        Just root ->
+          case findSubNode subs root of
+            Nothing   -> Left (UndefinedVariable ("^" <> rawName) subs)
+            Just node ->
+              if isNodeEmpty node
+                then Left (UndefinedVariable ("^" <> rawName) subs)
+                else Right node
 
 -- --------------------------------------------------------------------
 -- Variable Scoping (NEW) and Frame Management

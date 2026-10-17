@@ -39,6 +39,7 @@ import Data.Time.Clock (utctDay, utctDayTime)
 
 import Phase.AST
 import Phase.Catalog
+import Phase.Json (parseJsonText, renderNodeJson)
 import Phase.Lines (buildLogicalLines)
 import Phase.State
 import Phase.Stmt (parseLogicalLine)
@@ -257,6 +258,36 @@ resolveWriteTarget (RefDynamic (nameExpr : subExprs)) = do
   subs <- mapM evalExpr subExprs
   pure (kind, name, subs)
 resolveWriteTarget (RefNaked subExprs) = resolveNakedRef subExprs
+
+-- | Resolve a reference for ZWRITE, extracting the kind, name, subscripts,
+-- and optional historical transaction ID (from time travel or pinning).
+resolveZWriteTarget :: Ref -> Eval (VarKind, Text, [PValue], Maybe TxId)
+resolveZWriteTarget (Ref kind mNS name subExprs mTimeTravel) = do
+  let targetName = case kind of
+                     Global -> qualifyGlobalName mNS name
+                     Local  -> name
+  rememberGlobalRef kind targetName
+  subs <- mapM evalExpr subExprs
+  mTx <- case mTimeTravel of
+    Just ttExpr -> Just <$> resolveTimeTravelExpr targetName subs ttExpr
+    Nothing     -> implicitPin kind targetName
+  pure (kind, targetName, subs, mTx)
+resolveZWriteTarget (RefDynamic []) =
+  throwError (SyntaxError "REF() requires at least one argument (the variable name)")
+resolveZWriteTarget (RefDynamic (nameExpr : subExprs)) = do
+  nameVal <- evalExpr nameExpr
+  let raw = unPValue nameVal
+      (kind, name) = if T.isPrefixOf "^" raw
+                       then (Global, T.drop 1 raw)
+                       else (Local,  raw)
+  rememberGlobalRef kind name
+  subs <- mapM evalExpr subExprs
+  mTx <- implicitPin kind name
+  pure (kind, name, subs, mTx)
+resolveZWriteTarget (RefNaked subExprs) = do
+  (kind, name, subs) <- resolveNakedRef subExprs
+  mTx <- implicitPin kind name
+  pure (kind, name, subs, mTx)
 
 -- | Record this NAMED reference as the target a later naked reference
 -- (@^(subs)@) should mean, only a GLOBAL counts, matching real M
@@ -901,6 +932,19 @@ evalStmt (SMerge pairs) _ _ = do
     modifyEnvE (mergeRef (dstKind, dstTarget, dstSubs) (srcKind, srcTarget, srcSubs))
   pure NextStmt
 
+evalStmt (SZMerge pairs) _ _ = do
+  forM_ pairs $ \(dstRef, source) -> do
+    (dstKind, dstTarget, dstSubs) <- resolveWriteTarget dstRef
+    jsonVal <- case source of
+      ZMergeValue v -> pure v
+      ZMergeExpr expr -> do
+        val <- evalExpr expr
+        case parseJsonText (unPValue val) of
+          Left err -> throwError (SyntaxError ("Invalid JSON in ZMERGE: " <> T.pack err))
+          Right v  -> pure v
+    modifyEnvE (mergeJsonRef (dstKind, dstTarget, dstSubs) jsonVal)
+  pure NextStmt
+
 evalStmt (SKill mTargets) _ _ = do
   case mTargets of
     Nothing -> modifyEnv killAllLocals
@@ -922,6 +966,26 @@ evalStmt (SWrite items) _ _ = do
         modifyEnvOutput (appendOutput "\f")
       Right (WTabTo col) ->
         modifyEnvOutput (appendOutput (T.replicate col " "))
+  pure NextStmt
+
+evalStmt (SZWrite mTargets) _ _ = do
+  case mTargets of
+    Nothing -> do
+      env <- getEnv
+      let locals = Map.toList (envLocals env)
+      forM_ locals $ \(name, node) -> do
+        let rendered = renderNodeJson node
+        modifyEnvOutput (appendOutput (name <> "=" <> rendered <> "\n"))
+    Just targets -> do
+      forM_ targets $ \ref -> do
+        (kind, targetName, subs, mTx) <- resolveZWriteTarget ref
+        env <- getEnv
+        readResult <- liftIO (readNodeRef kind targetName subs mTx env)
+        case readResult of
+          Left err   -> throwError err
+          Right node -> do
+            let rendered = renderNodeJson node
+            modifyEnvOutput (appendOutput (rendered <> "\n"))
   pure NextStmt
 
 evalStmt (SIf conds) _ _ = do

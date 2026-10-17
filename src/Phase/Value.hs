@@ -22,7 +22,7 @@ module Phase.Value
   , isTruthy
 
     -- * Canonical numeric form (§3.2)
-  , CanonicalNumber
+  , CanonicalNumber (..)
   , canonicalNumber
   , canonicalText
 

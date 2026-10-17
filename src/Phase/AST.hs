@@ -34,6 +34,7 @@ module Phase.AST
 
     -- * Statements (skeleton, extended as later parts are implemented)
   , Stmt (..)
+  , ZMergeSource (..)
   , SetTarget (..)
   , CallArg (..)
   , CallTarget (..)
@@ -46,6 +47,7 @@ module Phase.AST
   , Line (..)
   ) where
 
+import qualified Data.Aeson as Aeson
 import Data.Text (Text)
 
 -- --------------------------------------------------------------------
@@ -292,6 +294,13 @@ data SetTarget
     -- omitted from source).
   deriving (Eq, Show)
 
+-- | Source for a 'SZMerge' statement: either an already-parsed JSON value,
+-- or a Phase expression evaluated at runtime to a JSON string.
+data ZMergeSource
+  = ZMergeValue !Aeson.Value
+  | ZMergeExpr !Expr
+  deriving (Eq, Show)
+
 -- | Statement skeleton. Deliberately minimal for now: we are building
 -- Part I (expressions/values/control-flow shape) first, and Parts
 -- II–XIII each add commands here as they're tackled. Per handbook §5,
@@ -345,6 +354,8 @@ data Stmt
   | SNew (Maybe [Text])                      -- ^ Nothing = bare NEW (news every current local)
   | SKill (Maybe [Ref])                      -- ^ Nothing = bare KILL (kills all locals)
   | SMerge [(Ref, Ref)]                      -- ^ MERGE t=s, t2=s2, ... (§9, Part X §1)
+  | SZMerge ![(Ref, ZMergeSource)]            -- ^ ZMERGE target=json, ...
+  | SZWrite !(Maybe [Ref])                   -- ^ ZWRITE ref1, ref2, ... (Nothing = bare ZWRITE)
   | SLock (Maybe [LockSpec])                 -- ^ Nothing = bare LOCK (release/acquire everything)
   | SUnlock (Maybe [LockSpec])               -- ^ Nothing = bare UNLOCK
   | SEndDo

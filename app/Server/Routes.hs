@@ -60,7 +60,7 @@ import Phase.Exec (AdminError (..), applyAddUser, prepareNewUser)
 import Phase.Parser (pRef)
 import Phase.State (Env (..), EvalError (..), initEnvWithStorage)
 import Phase.Storage.Engine
-  ( StorageEngine (..), compactTo, flushPendingWal, openStorageEngine
+  ( StorageEngine (..), compactTo, compactToTime, flushPendingWal, openStorageEngine
   , seLastTx, takeCheckpoint, readBlob, writeBlob, commitTransaction, readLive
   )
 import Phase.Storage.Transaction (TxHandle (..))
@@ -522,41 +522,48 @@ handleAdminCompact ss guard uRef reqId req respond = do
     Just bs ->
       case parseCompactBody (LBS.fromStrict bs) of
         Left msg -> respond (jsonErr status400 (transportError "BAD_REQUEST" msg reqId))
-        Right beforeTx ->
+        Right target ->
           withAdminAuth ss guard uRef cfg reqId req respond $ \user -> do
             snapQ <- readIORef (ssSnapshot ss)
             let waitMs = effQueueTimeoutMs cfg snapQ
             mResult <- withBoundedEngineLock waitMs (ssEngineLock ss) $ \locked ->
               if lookupUserRole user (snapEngine locked) < RAdmin
                 then pure (locked, Left (status403, transportError "FORBIDDEN" "admin role required" reqId))
-                else if fromIntegral beforeTx > seLastTx (snapEngine locked)
-                  then pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" "beforeTx is greater than lastTx" (seLastTx (snapEngine locked)) reqId))
-                  else do
-                    engFlushed <- flushPendingWal (snapEngine locked)
-                    cRes <- try (compactTo (ssDbPath ss) (fromIntegral beforeTx)) :: IO (Either SomeException (Either StorageError FilePath))
-                    case cRes of
-                      Left ex ->
-                        pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show ex)) (seLastTx engFlushed) reqId))
-                      Right (Left sErr) ->
-                        pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show sErr)) (seLastTx engFlushed) reqId))
-                      Right (Right backupPath) -> do
-                        hPutStrLn stderr ("compact: backup created at " ++ backupPath)
-                        reopened <- openStorageEngine (ssDbPath ss)
-                        case reopened of
-                          Left oErr ->
-                            pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show oErr)) (seLastTx engFlushed) reqId))
-                          Right storage' -> do
-                            let snap' = Snapshot
-                                  { snapEngine  = storage'
-                                  , snapLocks   = snapLocks locked
-                                  , snapVersion = snapVersion locked + 1
-                                  }
-                            writeIORef (ssSnapshot ss) snap'
-                            pure (snap', Right (seLastTx storage'))
+                else
+                  case target of
+                    CompactByTx beforeTx ->
+                      if fromIntegral beforeTx > seLastTx (snapEngine locked)
+                        then pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" "beforeTx is greater than lastTx" (seLastTx (snapEngine locked)) reqId))
+                        else runCompact (compactTo (ssDbPath ss) (fromIntegral beforeTx)) locked
+                    CompactByTime cutoff ->
+                      runCompact (compactToTime (ssDbPath ss) cutoff) locked
             case mResult of
               Nothing -> respond (jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId))
               Just (Left (st, b)) -> respond (jsonErr st b)
               Just (Right tx)     -> respond (jsonOk (adminOkBody tx reqId))
+  where
+    runCompact action locked = do
+      engFlushed <- flushPendingWal (snapEngine locked)
+      cRes <- try action :: IO (Either SomeException (Either StorageError FilePath))
+      case cRes of
+        Left ex ->
+          pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show ex)) (seLastTx engFlushed) reqId))
+        Right (Left sErr) ->
+          pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show sErr)) (seLastTx engFlushed) reqId))
+        Right (Right backupPath) -> do
+          hPutStrLn stderr ("compact: backup created at " ++ backupPath)
+          reopened <- openStorageEngine (ssDbPath ss)
+          case reopened of
+            Left oErr ->
+              pure (locked, Left (status200, adminErrorBody "COMPACT FAILED" (T.pack (show oErr)) (seLastTx engFlushed) reqId))
+            Right storage' -> do
+              let snap' = Snapshot
+                    { snapEngine  = storage'
+                    , snapLocks   = snapLocks locked
+                    , snapVersion = snapVersion locked + 1
+                    }
+              writeIORef (ssSnapshot ss) snap'
+              pure (snap', Right (seLastTx storage'))
 
 -- --------------------------------------------------------------------
 -- POST /v1/admin/users  (M3)

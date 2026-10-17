@@ -106,6 +106,7 @@ import Text.Parsec
 import Phase.AST
 import qualified Phase.AST as AST
 import Phase.Lines (LogicalLine (..))
+import Phase.Json (pJsonValue)
 import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pCompareBinOp, pExpr, pIdentifier, pPinSpec, pRef)
 
 -- --------------------------------------------------------------------
@@ -228,7 +229,7 @@ reservedKeywords :: [Text]
 reservedKeywords =
   [ "SET", "KILL", "WRITE", "IF", "ELSE", "FOR", "DO", "GOTO"
   , "QUIT", "RETURN", "NEW", "MERGE", "LOCK", "UNLOCK", "NAMESPACE"
-  , "SIGNAL", "RETRY"
+  , "SIGNAL", "RETRY", "ZMERGE", "ZWRITE"
   ]
 
 -- | The single-space/double-space split at the heart of
@@ -359,8 +360,10 @@ pStmt stmtStart =
       pSet stmtStart
   <|> pNamespace
   <|> pMerge
+  <|> pZMerge
   <|> pKill
   <|> pWrite
+  <|> pZWrite
   <|> pIf
   <|> pElse
   <|> pFor
@@ -571,6 +574,27 @@ sepBy1' p sep = do
   pure (x : xs)
 
 -- --------------------------------------------------------------------
+-- ZMERGE
+-- --------------------------------------------------------------------
+
+-- | @ZMERGE target=json, ...@ where json may be an inline raw JSON value
+-- or a Phase expression evaluating to a JSON string.
+pZMerge :: PParser (Maybe Expr, Stmt)
+pZMerge = do
+  postCond <- pKeyword "ZMERGE"
+  spacesOnly
+  assigns <- pAssign `sepBy1'` (spacesOnly *> char ',' <* spacesOnly)
+  pure (postCond, SZMerge assigns)
+  where
+    pAssign = do
+      target <- pRef
+      spacesOnly
+      _ <- char '='
+      spacesOnly
+      source <- (ZMergeValue <$> try pJsonValue) <|> (ZMergeExpr <$> pExpr)
+      pure (target, source)
+
+-- --------------------------------------------------------------------
 -- KILL
 -- --------------------------------------------------------------------
 
@@ -606,6 +630,17 @@ pWrite = do
       <|> (Right WFormFeed <$ char '#')
       <|> (try (Right . WTabTo . read <$> (char '?' *> many1 digit)))
       <|> (Left <$> pExpr)
+
+-- --------------------------------------------------------------------
+-- ZWRITE
+-- --------------------------------------------------------------------
+
+-- | Bare @ZWRITE@ (dumps all locals as JSON) or @ZWRITE target,target,...@.
+pZWrite :: PParser (Maybe Expr, Stmt)
+pZWrite = do
+  postCond <- pKeyword "ZWRITE"
+  targets <- pOptionalArg (pRef `sepBy1'` char ',')
+  pure (postCond, SZWrite targets)
 
 -- --------------------------------------------------------------------
 -- IF / ELSE

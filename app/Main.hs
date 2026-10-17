@@ -5,6 +5,8 @@ import qualified Data.Text as T
 import Data.Text (Text)
 import qualified Data.Text.IO as TIO
 import Data.Time (getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601ParseM)
+import Data.Word (Word64)
 import System.Directory (getHomeDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -36,6 +38,7 @@ import Phase.Storage.Engine
   ( StorageEngine (..)
   , acquireDbLock
   , compactTo
+  , compactToTime
   , flushPendingWal
   , openStorageEngine
   , releaseDbLock
@@ -407,16 +410,13 @@ main = do
                       outputStrLn (errorMsg ("Permission denied: " <> reason))
                       loop dbPath env
                     Nothing -> do
-                      let txArg = T.strip (T.drop 9 trimmed)
-                      case reads (T.unpack txArg) of
-                        ((tx, "") : _) -> do
-                          result <- liftIO $ compactTo dbPath tx
-                          case result of
+                      let arg = T.strip (T.drop 9 trimmed)
+                          runAfterCompact result label = case result of
                             Left err -> do
                               outputStrLn (errorMsg (T.pack (show err)))
                               loop dbPath env
                             Right backupPath -> do
-                              outputStrLn (infoMsg ("Compacted to transaction " ++ show tx ++ "."))
+                              outputStrLn (infoMsg ("Compacted to " ++ label ++ "."))
                               outputStrLn (dimMsg ("Pre-compaction backup: " ++ backupPath))
                               reopened <- liftIO $ openStorageEngine dbPath
                               case reopened of
@@ -434,9 +434,17 @@ main = do
                                   loop dbPath env
                                 Right newStorage ->
                                   loop dbPath (env { envStorage = newStorage, envGlobals = seLive newStorage })
-                        _ -> do
-                          outputStrLn (errorMsg "Syntax: .compact <transaction-number>")
-                          loop dbPath env
+                      case reads (T.unpack arg) :: [(Word64, String)] of
+                        ((tx, "") : _) -> do
+                          result <- liftIO $ compactTo dbPath tx
+                          runAfterCompact result ("transaction " ++ show tx)
+                        _ -> case iso8601ParseM (T.unpack arg) of
+                          Just cutoff -> do
+                            result <- liftIO $ compactToTime dbPath cutoff
+                            runAfterCompact result (T.unpack arg)
+                          Nothing -> do
+                            outputStrLn (errorMsg "Syntax: .compact <tx-number>  or  .compact <ISO8601-timestamp>")
+                            loop dbPath env
 
               | ".adduser " `T.isPrefixOf` trimmed ->
                   case checkAdminAccess (envCurrentUser env) (envStorage env) of
@@ -604,7 +612,7 @@ main = do
       , "  " ++ dimMsg ".history <n> [ns]" ++ "        show version history for a catalog item"
       , "  " ++ dimMsg ".revert <n> <v> [ns]" ++ "   revert a catalog item to an earlier version"
       , "  " ++ dimMsg ".checkpoint"     ++ "              write a WAL checkpoint"
-      , "  " ++ dimMsg ".compact <tx>"   ++ "          vacuum history before <tx>  (admin only)"
+      , "  " ++ dimMsg ".compact <tx|timestamp>" ++ "   vacuum history before <tx> or ISO 8601 timestamp  (admin only)"
       , "  " ++ dimMsg ".adduser <name> [role]" ++ "  create a user: admin/write/read/none, default write  (admin only)"
       , ""
       , infoMsg "Multi-line input:"

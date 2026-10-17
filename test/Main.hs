@@ -4439,6 +4439,119 @@ testHttpApiGroup ctx = do
 
 
 -- --------------------------------------------------------------------
+-- ZMERGE and ZWRITE Extension Tests
+-- --------------------------------------------------------------------
+
+testZMergeZWriteGroup :: TestContext -> IO ()
+testZMergeZWriteGroup ctx = do
+  adminEnv <- testAdminEnv
+  let runScript script env = do
+        case mapM parseLogicalLine (buildLogicalLines script) of
+          Left parseErr -> pure (Left (show parseErr))
+          Right astLines -> do
+            result <- runRoutine astLines env
+            case result of
+              Left evalErr -> pure (Left (show evalErr))
+              Right env'   -> pure (Right env')
+
+  -- 1. User's canonical example: ZMERGE with inline raw JSON
+  let src1 = " ZMERGE ^CUSTOMERS(3)={ \"name\": { \"first\": \"Bob\", \"last\": \"Smith\" }, \"balance\": 156.50 }\n"
+  r1 <- runScript src1 adminEnv
+  case r1 of
+    Left err -> runAssert ctx "ZMERGE ^CUSTOMERS(3) execution" False err
+    Right env1 -> do
+      assertEqual ctx "ZMERGE first name" (readRef Global "CUSTOMERS" [mkValue "3", mkValue "name", mkValue "first"] env1) (Right (mkValue "Bob"))
+      assertEqual ctx "ZMERGE last name" (readRef Global "CUSTOMERS" [mkValue "3", mkValue "name", mkValue "last"] env1) (Right (mkValue "Smith"))
+      assertEqual ctx "ZMERGE balance" (readRef Global "CUSTOMERS" [mkValue "3", mkValue "balance"] env1) (Right (mkValue "156.5"))
+
+      -- 2. ZWRITE ^CUSTOMERS(3) produces equivalent JSON
+      let src2 = " ZWRITE ^CUSTOMERS(3)\n"
+      r2 <- runScript src2 (clearOutput env1)
+      case r2 of
+        Left err -> runAssert ctx "ZWRITE ^CUSTOMERS(3) execution" False err
+        Right env2 -> do
+          assertEqual ctx "ZWRITE ^CUSTOMERS(3) JSON output" (getOutputText env2) "{\"balance\":156.5,\"name\":{\"first\":\"Bob\",\"last\":\"Smith\"}}\n"
+
+      -- 3. ZWRITE on subnodes
+      let src3 = " ZWRITE ^CUSTOMERS(3,\"name\")\n ZWRITE ^CUSTOMERS(3,\"balance\")\n"
+      r3 <- runScript src3 (clearOutput env1)
+      case r3 of
+        Left err -> runAssert ctx "ZWRITE subnodes execution" False err
+        Right env3 -> do
+          assertEqual ctx "ZWRITE subnodes output" (getOutputText env3) "{\"first\":\"Bob\",\"last\":\"Smith\"}\n156.5\n"
+
+      -- 4. Recursive merge (mirroring MERGE behavior)
+      let src4 = " ZMERGE ^CUSTOMERS(3,\"address\")={ \"city\": \"Boston\" }\n ZMERGE ^CUSTOMERS(3)={ \"balance\": 200 }\n ZWRITE ^CUSTOMERS(3)\n"
+      r4 <- runScript src4 (clearOutput env1)
+      case r4 of
+        Left err -> runAssert ctx "Recursive ZMERGE execution" False err
+        Right env4 -> do
+          assertEqual ctx "Recursive ZMERGE preserves existing nodes" (getOutputText env4) "{\"address\":{\"city\":\"Boston\"},\"balance\":200,\"name\":{\"first\":\"Bob\",\"last\":\"Smith\"}}\n"
+
+  -- 5. JSON null sets node value to empty string ""
+  let src5 = " ZMERGE ^NULLTEST(1)={ \"val\": null }\n WRITE ^NULLTEST(1,\"val\"),!,$DATA(^NULLTEST(1,\"val\")),!\n ZWRITE ^NULLTEST(1)\n"
+  r5 <- runScript src5 adminEnv
+  case r5 of
+    Left err -> runAssert ctx "ZMERGE null handling" False err
+    Right env5 -> do
+      assertEqual ctx "ZMERGE null sets empty string" (getOutputText env5) "\n1\n{\"val\":\"\"}\n"
+
+  -- 6. JSON array handling (numeric 1-based keys in collation order)
+  let src6 = " ZMERGE ^ARRTEST(1)={ \"items\": [\"first\", \"second\"] }\n ZWRITE ^ARRTEST(1,\"items\")\n"
+  r6 <- runScript src6 adminEnv
+  case r6 of
+    Left err -> runAssert ctx "ZMERGE array handling" False err
+    Right env6 -> do
+      assertEqual ctx "ZMERGE array keys are object" (getOutputText env6) "{\"1\":\"first\",\"2\":\"second\"}\n"
+      assertEqual ctx "Array item 1" (readRef Global "ARRTEST" [mkValue "1", mkValue "items", mkValue "1"] env6) (Right (mkValue "first"))
+      assertEqual ctx "Array item 2" (readRef Global "ARRTEST" [mkValue "1", mkValue "items", mkValue "2"] env6) (Right (mkValue "second"))
+
+  -- 7. Local variables with ZMERGE and ZWRITE
+  let src7 = " ZMERGE MYLOC={ \"alpha\": 1, \"beta\": { \"sub\": 2 } }\n ZWRITE MYLOC\n"
+  r7 <- runScript src7 adminEnv
+  case r7 of
+    Left err -> runAssert ctx "ZMERGE/ZWRITE local variable" False err
+    Right env7 -> do
+      assertEqual ctx "ZWRITE local output" (getOutputText env7) "{\"alpha\":1,\"beta\":{\"sub\":2}}\n"
+
+  -- 8. Bare ZWRITE (dumps all process-global locals)
+  let src8 = " KILL\n SET A=10, B=20\n ZWRITE\n"
+  r8 <- runScript src8 adminEnv
+  case r8 of
+    Left err -> runAssert ctx "Bare ZWRITE" False err
+    Right env8 -> do
+      assertEqual ctx "Bare ZWRITE output" (getOutputText env8) "A=10\nB=20\n"
+
+  -- 9. Expression evaluating to JSON string
+  let src9 = " SET JSONSTR=\"{ \"\"role\"\": \"\"admin\"\" }\"\n ZMERGE ^ACCT(1)=JSONSTR\n ZWRITE ^ACCT(1)\n"
+  r9 <- runScript src9 adminEnv
+  case r9 of
+    Left err -> runAssert ctx "ZMERGE expression RHS" False err
+    Right env9 -> do
+      assertEqual ctx "ZMERGE expression RHS output" (getOutputText env9) "{\"role\":\"admin\"}\n"
+
+  -- 10. Time Travel with ZWRITE
+  let src10 = " ZMERGE ^TT(1)={ \"status\": \"v1\" }\n ZMERGE ^TT(1)={ \"status\": \"v2\" }\n ZWRITE ^[-1]TT(1)\n ZWRITE ^TT(1)\n"
+  r10 <- runScript src10 adminEnv
+  case r10 of
+    Left err -> runAssert ctx "Time travel ZWRITE" False err
+    Right env10 -> do
+      assertEqual ctx "Time travel ZWRITE past vs live" (getOutputText env10) "{\"status\":\"v1\"}\n{\"status\":\"v2\"}\n"
+
+  -- 11. Error handling
+  let srcErr1 = " SET BAD=\"not valid json\"  ZMERGE ^ERR=BAD\n"
+  rErr1 <- runScript srcErr1 adminEnv
+  case rErr1 of
+    Left _ -> runAssert ctx "Invalid JSON string throws SyntaxError" True ""
+    Right _ -> runAssert ctx "Invalid JSON string throws SyntaxError" False "Expected error but succeeded"
+
+  let srcErr2 = " ZWRITE ^NONEXISTENT(999)\n"
+  rErr2 <- runScript srcErr2 adminEnv
+  case rErr2 of
+    Left _ -> runAssert ctx "ZWRITE non-existent node throws UndefinedVariable" True ""
+    Right _ -> runAssert ctx "ZWRITE non-existent node throws UndefinedVariable" False "Expected error but succeeded"
+
+-- --------------------------------------------------------------------
 -- Main
 -- --------------------------------------------------------------------
 
@@ -4456,6 +4569,7 @@ main = do
   runGroup ctx "Phase.Tree" testTreeGroup
   runGroup ctx "Phase.Eval (Expr)" testEvalExprGroup
   runGroup ctx "Phase.Eval (Stmt & Routine)" testEvalStmtGroup
+  runGroup ctx "ZMERGE / ZWRITE JSON Commands" testZMergeZWriteGroup
   runGroup ctx "Phase.Catalog (^_CATALOG Repository & Versioning)" testCatalogGroup
   runGroup ctx "Phase.Storage (MVCC, WAL, Transactions, Time Travel & Locks)" testStorageGroup
   runGroup ctx "$CHILDCOUNT intrinsic" testChildCountGroup

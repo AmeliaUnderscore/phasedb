@@ -33,6 +33,7 @@ module Server.Json
   , parseCheckpointBody
   , ExecuteReq (..)
   , SessionReq (..)
+  , CompactTarget (..)
   ) where
 
 import Data.Aeson (Value (..), object, (.=), encode)
@@ -45,7 +46,7 @@ import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime)
-import Data.Time.Format.ISO8601 (iso8601Show)
+import Data.Time.Format.ISO8601 (iso8601Show, iso8601ParseM)
 
 import Phase.AST (PValue (..))
 import Phase.State (Condition (..), EvalError (..), formatError)
@@ -296,19 +297,33 @@ parseSessionBody bs =
           _ -> Left "missing or non-string \"username\" or \"password\""
       _ -> Left "body must be a JSON object"
 
--- | Parse a @POST /v1/admin/compact@ body (§6.3: { "beforeTx": n }, n non-negative integer).
-parseCompactBody :: LBS.ByteString -> Either Text Int
+-- | The target for a compact operation: either a transaction ID or a
+-- UTC timestamp cutoff.
+data CompactTarget
+  = CompactByTx  !Int
+  | CompactByTime !UTCTime
+  deriving (Show)
+
+-- | Parse a @POST /v1/admin/compact@ body.
+-- Accepts either @{ "beforeTx": n }@ (non-negative integer) or
+-- @{ "beforeTime": "ISO8601" }@ (UTC timestamp, e.g.
+-- @"2024-01-15T12:00:00Z"@).
+parseCompactBody :: LBS.ByteString -> Either Text CompactTarget
 parseCompactBody bs =
   case Aeson.decode bs :: Maybe Aeson.Value of
     Nothing  -> Left "malformed JSON"
     Just val -> case val of
       Object km ->
-        case KM.lookup "beforeTx" km of
-          Just (Number n) ->
+        case (KM.lookup "beforeTx" km, KM.lookup "beforeTime" km) of
+          (Just (Number n), _) ->
             case toBoundedInteger n of
-              Just i | i >= 0 -> Right i
+              Just i | i >= 0 -> Right (CompactByTx i)
               _               -> Left "beforeTx must be a non-negative integer"
-          _ -> Left "missing or non-number \"beforeTx\""
+          (_, Just (String s)) ->
+            case iso8601ParseM (T.unpack s) of
+              Just t  -> Right (CompactByTime t)
+              Nothing -> Left "beforeTime must be a valid ISO 8601 timestamp (e.g. \"2024-01-15T12:00:00Z\")"
+          _ -> Left "body must contain \"beforeTx\" (integer) or \"beforeTime\" (ISO 8601 string)"
       _ -> Left "body must be a JSON object"
 
 -- | Parse a @POST /v1/admin/users@ body (§6.3).
