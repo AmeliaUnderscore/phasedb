@@ -431,7 +431,7 @@ TOTAL(orders,taxRate)
 
 ```
 WRITE CALL DOUBLE(21),!               ; -> 42
-SET total,tax = CALL TOTAL(500,0.1)   ; multi-value destructuring
+SET total,tax=CALL TOTAL(500,0.1)   ; multi-value destructuring
 ```
 
 A tag's formal parameter list names each parameter by position. Phase

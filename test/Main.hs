@@ -3824,7 +3824,7 @@ testHttpAdminGroup ctx = do
     st <- http api "GET" "/v1/admin/status" [aH] ""
     let sj = bodyJson st
     assertEqual ctx "status: 200 ok" (statusOf st, okOf st) (200, Just True)
-    assertEqual ctx "status: version matches cabal package version" (jText ["version"] sj) (Just "0.1.0.0")
+    assertEqual ctx "status: version matches cabal package version" (jText ["version"] sj) (Just "0.1.0.1")
     runAssert ctx "status: fileSizeBytes is reported and > 0" (maybe False (> 0) (jInt ["fileSizeBytes"] sj)) (show sj)
     assertEqual ctx "status: sessionCount is reported" (jInt ["sessionCount"] sj) (Just 0)
     -- check config sources (D9)

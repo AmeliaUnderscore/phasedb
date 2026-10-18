@@ -355,10 +355,11 @@ isCommandKeyword :: Text -> Bool
 isCommandKeyword kw =
   T.toUpper kw `elem`
     [ "SET", "KILL", "WRITE", "IF", "ELSE", "FOR", "DO", "GOTO"
-    , "QUIT", "RETURN", "NEW", "MERGE", "LOCK", "UNLOCK", "END", "NAMESPACE"
+    , "QUIT", "RETURN", "NEW", "MERGE", "ZMERGE", "LOCK", "UNLOCK", "END", "NAMESPACE"
     , "EVALUATE", "WHEN"
     , "CONDITION", "SIGNAL", "HANDLE", "CATCH", "RETRY"
     , "BLOBSAVE", "BLOBMETA"
+    , "ZWRITE"
     ]
 
 -- | Does the current accumulated text need more input before it can
