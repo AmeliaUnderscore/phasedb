@@ -215,7 +215,8 @@ data Expr
     -- above; a postfix wrap directly on the value that precedes it.
     -- Both bounds are optional per Phase's slice syntax.
   | FuncCall Text [Expr]
-    -- ^ An intrinsic function call, @$NAME(args...)@ (Part XIII). We
+    -- ^ An intrinsic function call, @$NAME(args...)@ (Part XIII), including
+    -- the reference-taking @$CHANGED(ref)@ history query. We
     -- keep this untyped at the AST level, 'Phase.Eval' is
     -- responsible for recognizing known intrinsics vs. throwing
     -- <UNDEFINED FUNCTION>.

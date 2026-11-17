@@ -11,7 +11,7 @@
   raised (secondary indexing is deprecated).
 * Extension: `RETRY n TIMES` / `RETRY 1 TIME` (optionally with `WITH`), a
   bounded retry that falls through to the rest of the handler once used
-  up. Every `RETRY` is capped by `^_CONFIG("retry","max")` (default 1000).
+  up. Every `RETRY` is capped by `^%CONFIG("retry","max")` (default 1000).
 * HANDLE, CATCH, CONDITION, SIGNAL and RETRY are now recognized command
   words at column 0, and `SIGNAL` and `RETRY` joined the keywords that
   stop a bare `QUIT`/`DO` argument.
@@ -42,8 +42,8 @@
 * Fix: `\` (integer division) and `#` (modulo) went through `Double`,
   losing precision beyond ~15 digits. They now use exact `Scientific`
   arithmetic (`exactIntQuotient`), truncating toward zero as before.
-* Fix: `pNamespaceIdentifier` accepts a leading `_`, so `_GLOBAL` can be
-  named after `^` (`CALL FOOBAR^_GLOBAL(X)`).
+* Fix: `pNamespaceIdentifier` accepts a leading `_`, so `%GLOBAL` can be
+  named after `^` (`CALL FOOBAR^%GLOBAL(X)`).
 * Fix: `aliasVar` mapped a reference parameter to itself when its name
   matched the caller's variable (`DO F(&x)` with formal `x`), sending
   `resolveLocalName` into an infinite loop on the first read.
@@ -72,13 +72,13 @@
   the path, for locals and globals alike (`<SUBSCRIPT>`,
   `Phase.State.NullSubscript`). Real M reserves `""` as `$ORDER`'s
   exhaustion sentinel, so it was never a legal subscript to begin with.
-* Feature/fix: `^_CATALOG` definitions authored by an admin are now
+* Feature/fix: `^%CATALOG` definitions authored by an admin are now
   protected from being overwritten by a non-admin, while non-admins
   keep the ability to define their own routines (the only way they can
-  define one at all). Tracked per item as `^_CATALOG(ns,name,
+  define one at all). Tracked per item as `^%CATALOG(ns,name,
   "AUTHOR_ROLE")`, enforced both in `Phase.Catalog.defineItem` (so
   `revertItem` inherits it) and for a raw `SET`/`KILL`/`MERGE` that
-  reaches `^_CATALOG` directly (`Phase.Auth.checkCatalogAccess`, wired
+  reaches `^%CATALOG` directly (`Phase.Auth.checkCatalogAccess`, wired
   into `Phase.State.writeRef`/`killRef`/`mergeRef`) -- the latter was a
   real bypass of the former before this change.
 * Fix: the REPL now bootstraps a first admin account whenever the
@@ -90,7 +90,7 @@
   `checkUsersSetSafety`), so a database can't be locked out from under
   its own admin.
 * Tests: new `Phase.State`/`Phase.Auth`/`Phase.Catalog` group covering
-  null-subscript rejection, `^_CATALOG` ownership (new items, editing
+  null-subscript rejection, `^%CATALOG` ownership (new items, editing
   your own, admin takeover, raw-write bypass, broad-kill refusal), and
   the last-admin safeguard.
 * Feature ( not in the handbook): naked references,
@@ -195,7 +195,7 @@
   through the ordinary permission-checked `writeRef` path rather than
   the bootstrap bypass. Previously the only way to add a user after the
   first admin was to hand-compute a PBKDF2 hash and salt outside Phase
-  and `SET` them into `^_USERS`. Its writes are flushed explicitly (as
+  and `SET` them into `^%USERS`. Its writes are flushed explicitly (as
   `.revert` already did), the first draft wasn't, so a new account
   existed only in that process's memory and couldn't log in afterwards.
 * Feature ( `docs/tx-pinning-design.md` Part 2):
@@ -225,7 +225,7 @@
 * Docs: README deviation 6 documents that `TAG^X` resolves `X` as a
   Catalog namespace (cross-namespace calls without `NAMESPACE`).
 * Tests: eval-level coverage for `GOTO`, cross-namespace
-  `CALL`/`DO`/`GOTO`, `_GLOBAL` fallback, and large-operand `\`/`#`.
+  `CALL`/`DO`/`GOTO`, `%GLOBAL` fallback, and large-operand `\`/`#`.
   None of these has been compiled or run (no GHC in the authoring
   sandbox).
 
@@ -318,7 +318,7 @@
   dropping a SET already staged against the same global, and it assigned
   `envGlobals` (staged data included) to `seLive`, leaking uncommitted data
   past a rollback. It also skipped the per-value `checkReservedGlobalWrite`
-  a SET gets, so `MERGE ^_USERS(u)=...` could demote the last admin.
+  a SET gets, so `MERGE ^%USERS(u)=...` could demote the last admin.
   Now a global `MERGE` is the sequence of SETs it stands for: every merged
   path is checked like a SET before anything is written (all or nothing);
   inside a transaction the paths are staged and `envGlobals` updated

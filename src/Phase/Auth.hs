@@ -3,19 +3,19 @@
 -- | User accounts, roles, and permission enforcement.
 --
 -- Follows the same "the database configures itself via its own data
--- model" convention already established by @^_CATALOG@ (routines)
--- and @^_CONFIG@ (tunables): user accounts live in an ordinary
--- special global, @^_USERS@, read and written through the storage
+-- model" convention already established by @^%CATALOG@ (routines)
+-- and @^%CONFIG@ (tunables): user accounts live in an ordinary
+-- special global, @^%USERS@, read and written through the storage
 -- engine's normal 'readLive'/'commitSet' functions, NOT a separate
 -- Haskell-level user database or config file.
 --
 -- == Storage shape
 --
 -- @
--- ^_USERS(username,"role")           = "none" | "read" | "write" | "admin"
--- ^_USERS(username,"passwordHash")   = <hex PBKDF2-SHA256 digest>
--- ^_USERS(username,"passwordSalt")   = <hex random salt>
--- ^_USERS(username,"denied",global)  = "1"   -- presence means denied; absence means allowed
+-- ^%USERS(username,"role")           = "none" | "read" | "write" | "admin"
+-- ^%USERS(username,"passwordHash")   = <hex PBKDF2-SHA256 digest>
+-- ^%USERS(username,"passwordSalt")   = <hex random salt>
+-- ^%USERS(username,"denied",global)  = "1"   -- presence means denied; absence means allowed
 -- @
 --
 -- == Two independent permission axes
@@ -23,13 +23,13 @@
 -- 1. ROLE, a strict, linear hierarchy: 'RNone' (cannot even read) <
 --    'RRead' (can read, cannot write) < 'RWrite' (can read and write)
 --    < 'RAdmin' (can also run destructive maintenance and manage
---    @^_USERS@/@^_CONFIG@).
+--    @^%USERS@/@^%CONFIG@).
 -- 2. PER-GLOBAL DENYLIST, independent of role: a user can be locked
 --    out of a SPECIFIC global tree entirely (whole-tree, not
 --    subtree, the team's own call on scope), regardless of what their
 --    role would otherwise allow.
 --
--- @^_USERS@ and @^_CONFIG@ are a hardcoded special case on top of
+-- @^%USERS@ and @^%CONFIG@ are a hardcoded special case on top of
 -- both of these: writable ONLY by 'RAdmin', unconditionally, this is
 -- deliberately NOT expressed through the general per-global denylist
 -- mechanism (which a non-admin's role could never grant them access
@@ -62,6 +62,7 @@ module Phase.Auth
     -- * Permission checks
   , checkReadAccess
   , checkWriteAccess
+  , checkCatalogMutationAccess
   , checkAdminAccess
 
     -- * Reserved-global write safeguards (subscript-aware; see below)
@@ -190,9 +191,9 @@ decodeHex t =
 -- --------------------------------------------------------------------
 
 usersGlobalName :: Text
-usersGlobalName = "_USERS"
+usersGlobalName = "%USERS"
 
--- | Does this username have ANY entry in @^_USERS@ at all? Used at
+-- | Does this username have ANY entry in @^%USERS@ at all? Used at
 -- login time to distinguish "no such user" from "wrong password"
 -- only insofar as both currently produce the same generic failure,
 -- see the REPL login flow, which deliberately does NOT reveal which
@@ -213,7 +214,7 @@ lookupUserRole username eng =
     Left _     -> RNone
 
 -- | Is this user denied access to a specific global tree, per
--- @^_USERS(username,"denied",globalName)@? Presence of ANY value
+-- @^%USERS(username,"denied",globalName)@? Presence of ANY value
 -- there (a $DATA-style existence check, not a value comparison) means
 -- denied, this is deliberately a denylist, not an allowlist (per
 -- the team's own call), and whole-tree, not subtree-scoped.
@@ -223,7 +224,7 @@ isGloballyDenied username globalName eng =
     Right _ -> True
     Left _  -> False
 
--- | Does @^_USERS@ have ANY account defined at all? Used by the REPL
+-- | Does @^%USERS@ have ANY account defined at all? Used by the REPL
 -- purely as a sanity signal, NOT as the trigger for running the
 -- bootstrap flow, bootstrap is triggered by "this @.db@ file did not
 -- exist before this process created it" (see @app/Main.hs@), so a
@@ -237,7 +238,7 @@ hasAnyUser eng = not (T.null (unPValue (orderLive usersGlobalName [] (mkValue ""
 -- | Create a user account by writing DIRECTLY to the storage engine
 -- (via 'commitSet'), bypassing 'Phase.State.writeRef' and its
 -- permission checks entirely. This is deliberate and its use is
--- meant to stay narrow: @^_USERS@ is hardcoded admin-only (see the
+-- meant to stay narrow: @^%USERS@ is hardcoded admin-only (see the
 -- module header), which means an ordinary write path can never create
 -- the very FIRST admin account, there is no caller with an admin
 -- role yet to satisfy that check. This function is that necessary
@@ -254,7 +255,7 @@ hasAnyUser eng = not (T.null (unPValue (orderLive usersGlobalName [] (mkValue ""
 --      production.
 --
 -- Every ordinary "admin creates another user" operation AFTER
--- bootstrap should go through the normal @SET ^_USERS(...)@ path
+-- bootstrap should go through the normal @SET ^%USERS(...)@ path
 -- instead (which correctly enforces that only an already-established
 -- admin may do so), this function has no such check by design, so it
 -- must never be reachable from ordinary Phase language execution.
@@ -284,7 +285,7 @@ bootstrapCreateUser username password role now eng = do
 -- Login
 -- --------------------------------------------------------------------
 
--- | Verify a username/password attempt against @^_USERS@ for the
+-- | Verify a username/password attempt against @^%USERS@ for the
 -- REPL's ordinary login flow. Deliberately returns the SAME 'False'
 -- for "no such user" and "wrong password", this is a standard
 -- precaution against username enumeration (an attacker probing logins
@@ -300,22 +301,23 @@ authenticateUser username password eng =
 -- Permission checks
 -- --------------------------------------------------------------------
 
--- | Is @^_USERS@, @^_CONFIG@, or @^_BLOBS@, hardcoded admin-only for BOTH read
+-- | Is @^%USERS@, @^%CONFIG@, @^%CATALOG@, @^%BLOBS@, or @^%BLOB@, hardcoded admin-only for BOTH read
 -- and write, unconditionally, regardless of role or the per-global
 -- denylist (which could otherwise, in principle, be misconfigured by
 -- an admin to loosen access to credential material). See the module
 -- header for why this is a hardcoded special case rather than
 -- expressed through the general mechanism.
 isHardcodedAdminOnlyGlobal :: Text -> Bool
-isHardcodedAdminOnlyGlobal g = g == "_USERS" || g == "_CONFIG" || g == "_BLOBS" || g == "_BLOB"
+isHardcodedAdminOnlyGlobal g =
+  g == "%USERS" || g == "%CONFIG" || g == "%CATALOG" || g == "%BLOBS" || g == "%BLOB"
 
 -- | Is this global managed exclusively by its own API, so that even
 -- admins cannot write to it via ordinary SET/KILL?  Currently only
--- @^_BLOBS@ / @^_BLOB@: blob content must be stored through the blob upload API
+-- @^%BLOBS@ / @^%BLOB@: blob content must be stored through the blob upload API
 -- (or the BLOB* built-ins), not through arbitrary Phase SET commands,
 -- so that hashes always match content and metadata stays consistent.
 isApiManagedGlobal :: Text -> Bool
-isApiManagedGlobal g = g == "_BLOBS" || g == "_BLOB"
+isApiManagedGlobal g = g == "%BLOBS" || g == "%BLOB"
 
 -- | Check whether a user may READ a given global. Returns 'Nothing'
 -- on success, or 'Just' a human-readable reason on denial (the caller
@@ -336,8 +338,9 @@ checkReadAccess username globalName eng
 
 -- | Check whether a user may WRITE (SET/KILL/MERGE) a given global.
 -- Same shape as 'checkReadAccess', requiring 'RWrite' instead of
--- 'RRead'.  API-managed globals (@^_BLOBS@) are additionally blocked
--- for direct writes even by admin, use the blob API instead.
+-- 'RRead'. API-managed blob globals are additionally blocked for direct
+-- writes even by admin, use the blob API instead. Catalog access is
+-- checked by the catalog-aware mutation path in 'Phase.State'.
 checkWriteAccess :: Text -> Text -> StorageEngine -> Maybe Text
 checkWriteAccess username globalName eng
   | isApiManagedGlobal globalName =
@@ -348,6 +351,19 @@ checkWriteAccess username globalName eng
       Just "role does not permit writing"
   | isGloballyDenied username globalName eng =
       Just ("denied access to " <> globalName)
+  | otherwise = Nothing
+
+-- | Check the ordinary role and denylist requirements for a sanctioned
+-- catalog mutation. Catalog writes have their own per-item authorization
+-- in 'checkCatalogAccess', so they must bypass the global-level
+-- admin-only/API-managed restrictions while still respecting the user's
+-- write role and denylist.
+checkCatalogMutationAccess :: Text -> StorageEngine -> Maybe Text
+checkCatalogMutationAccess username eng
+  | lookupUserRole username eng < RWrite =
+      Just "role does not permit writing"
+  | isGloballyDenied username catalogGlobalName eng =
+      Just ("denied access to " <> catalogGlobalName)
   | otherwise = Nothing
 
 -- | Check whether a user may run a destructive maintenance operation
@@ -369,7 +385,7 @@ checkAdminAccess username eng
 -- 'Phase.State' at the actual point of mutation, ALONGSIDE (never
 -- instead of) the ordinary checks above.
 
--- | Every username currently present in @^_USERS@, in collation order.
+-- | Every username currently present in @^%USERS@, in collation order.
 listUsernames :: StorageEngine -> [Text]
 listUsernames eng = go ""
   where
@@ -383,15 +399,15 @@ isSoleAdmin username eng =
   lookupUserRole username eng == RAdmin
     && length (filter (== RAdmin) (map (`lookupUserRole` eng) (listUsernames eng))) <= 1
 
--- | Refuse a KILL on @^_USERS@ that would leave the database with no
+-- | Refuse a KILL on @^%USERS@ that would leave the database with no
 -- admin account at all -- the safeguard against ending up with a
 -- database nobody can administer.
 --
 -- Naming a specific user (or just their @\"role\"@ subscript) is
 -- refused only when that user IS the sole admin; a broader kill (a
--- bare @KILL ^_USERS@, or naming nothing precise enough to identify
+-- bare @KILL ^%USERS@, or naming nothing precise enough to identify
 -- one user) is refused outright whenever ANY admin currently exists,
--- since it would remove them all at once. @^_USERS@ is hardcoded
+-- since it would remove them all at once. @^%USERS@ is hardcoded
 -- admin-only for writes ('isHardcodedAdminOnlyGlobal'), so reaching
 -- this function at all already means the acting user IS an admin --
 -- this protects an admin from locking themselves out, not from a
@@ -407,7 +423,7 @@ checkUsersKillSafety subs eng =
           Just "cannot remove every user: at least one admin account must always remain"
        | otherwise -> Nothing
 
--- | Refuse a SET on @^_USERS(username,\"role\")@ that would demote the
+-- | Refuse a SET on @^%USERS(username,\"role\")@ that would demote the
 -- sole remaining admin to anything else. Same "already an admin to
 -- get here" reasoning as 'checkUsersKillSafety'.
 checkUsersSetSafety :: [PValue] -> PValue -> StorageEngine -> Maybe Text
@@ -426,12 +442,12 @@ checkUsersSetSafety subs newVal eng =
 -- transitively through 'Phase.State', so the dependency can't run the
 -- other way.
 catalogGlobalName :: Text
-catalogGlobalName = "_CATALOG"
+catalogGlobalName = "%CATALOG"
 
 catalogAuthorRoleSubscript :: Text
 catalogAuthorRoleSubscript = "AUTHOR_ROLE"
 
--- | Is @^_CATALOG(ns,name)@'s current version authored by an admin?
+-- | Is @^%CATALOG(ns,name)@'s current version authored by an admin?
 -- An item with no marker at all (never defined, or defined before
 -- this protection existed) is not admin-owned.
 catalogItemIsAdminOwned :: Text -> Text -> StorageEngine -> Bool
@@ -440,7 +456,7 @@ catalogItemIsAdminOwned ns name eng =
     Right pval -> roleFromText (unPValue pval) == RAdmin
     Left _     -> False
 
--- | Refuse a non-admin's write into @^_CATALOG@ that would touch an
+-- | Refuse a non-admin's write into @^%CATALOG@ that would touch an
 -- admin-authored item. Non-admin write access to the catalog is
 -- otherwise intentional -- it is the only way a non-admin can define
 -- their own routines/functions -- so this protects only what an admin
@@ -457,7 +473,7 @@ catalogItemIsAdminOwned ns name eng =
 -- per-item check before writing (see their own docs), so the
 -- sanctioned path through those functions is unaffected by this one.
 -- This is wired in from 'Phase.State' only for a RAW SET/KILL/MERGE
--- reaching @^_CATALOG@ directly.
+-- reaching @^%CATALOG@ directly.
 checkCatalogAccess :: Role -> [PValue] -> StorageEngine -> Maybe Text
 checkCatalogAccess actingRole subs eng
   | actingRole >= RAdmin = Nothing
@@ -465,7 +481,7 @@ checkCatalogAccess actingRole subs eng
       case map unPValue subs of
         (ns : name : _)
           | catalogItemIsAdminOwned ns name eng ->
-              Just ("^_CATALOG(" <> ns <> "," <> name <> ") was defined by an admin and can only be modified by an admin")
+              Just ("^%CATALOG(" <> ns <> "," <> name <> ") was defined by an admin and can only be modified by an admin")
           | otherwise -> Nothing
         _ ->
-          Just "modifying more than one ^_CATALOG(namespace,name) item at once requires the admin role"
+          Just "modifying more than one ^%CATALOG(namespace,name) item at once requires the admin role"

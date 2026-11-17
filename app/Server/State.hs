@@ -13,7 +13,7 @@
 --
 --   * A 'TVar' mapping token digests to 'Session' records (M2).
 --
--- Config-value resolution (D9): 'configValue' reads @^_CONFIG("server", k)@
+-- Config-value resolution (D9): 'configValue' reads @^%CONFIG("server", k)@
 -- from the live snapshot and falls back to the hard-coded default, so a live
 -- SET takes effect without a restart unless a CLI flag pins the value.
 module Server.State
@@ -38,7 +38,7 @@ module Server.State
   , withBoundedEngineLock
   , tryEngineLock
 
-    -- * Effective limits: flag, then ^_CONFIG(\"server\", name), then default
+    -- * Effective limits: flag, then ^%CONFIG(\"server\", name), then default
   , effMaxBodyBytes
   , effExecTimeoutMs
   , effExecTimeoutMaxMs
@@ -129,7 +129,7 @@ newServerState cfg dbPath eng = do
 -- Config-value resolution (D9)
 -- --------------------------------------------------------------------
 
--- | Read @^_CONFIG("server", key)@ from the current live snapshot, parse it
+-- | Read @^%CONFIG("server", key)@ from the current live snapshot, parse it
 -- as an 'Int', and fall back to the default when absent or unparseable.
 -- The CLI flag (already resolved by the caller) takes precedence; pass
 -- 'Just n' from the flag to bypass this entirely.
@@ -142,7 +142,7 @@ configValueInt key def mFlag snap =
   case mFlag of
     Just n  -> n
     Nothing ->
-      case readLive "_CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
+      case readLive "%CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
         Right pv | [(n, "")] <- reads (T.unpack (unPValue pv)), n > 0 -> n
         _                                                              -> def
 
@@ -156,7 +156,7 @@ configValueText key def mFlag snap =
   case mFlag of
     Just t  -> t
     Nothing ->
-      case readLive "_CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
+      case readLive "%CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
         Right pv | not (T.null (unPValue pv)) -> unPValue pv
         _                                     -> def
 
@@ -165,7 +165,7 @@ configValueText key def mFlag snap =
 -- --------------------------------------------------------------------
 --
 -- Each limit is resolved on every use, in this order: the command-line
--- flag (when given it pins the value), then @^_CONFIG("server", name)@
+-- flag (when given it pins the value), then @^%CONFIG("server", name)@
 -- read from the request's snapshot, then the built-in default.  Reading
 -- the snapshot means a committed @SET@ applies from the next request.
 
@@ -187,15 +187,15 @@ effMaxBlobBytes      cfg = configValueInt "maxBlobBytes"       defaultMaxBlobByt
 -- Config-source resolution (M3 §6.3 status)
 -- --------------------------------------------------------------------
 
--- | The source of a config value: the CLI flag, the database @^_CONFIG@, or the built-in default.
+-- | The source of a config value: the CLI flag, the database @^%CONFIG@, or the built-in default.
 -- Used by @GET /v1/admin/status@ to populate the @config@ object.
-configSourceInt :: Text       -- ^ Config key (the @^_CONFIG(\"server\", key)@ name)
+configSourceInt :: Text       -- ^ Config key (the @^%CONFIG(\"server\", key)@ name)
                 -> Maybe Int  -- ^ CLI-pinned value
                 -> Snapshot
                 -> Text       -- ^ \"flag\", \"config\", or \"default\"
 configSourceInt _key (Just _) _snap = "flag"
 configSourceInt key  Nothing  snap  =
-  case readLive "_CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
+  case readLive "%CONFIG" [mkValue "server", mkValue key] (snapEngine snap) of
     Right pv | [(n, "")] <- reads (T.unpack (unPValue pv)), n > (0 :: Int) -> "config"
     _                                                                        -> "default"
 

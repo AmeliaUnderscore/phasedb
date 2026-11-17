@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The ^_CATALOG system global repository for namespaces, functions, routines,
+-- | The ^%CATALOG system global repository for namespaces, functions, routines,
 -- constants, and primitive version control.
 --
 -- In Phase, system metadata, routines, and namespace mappings are stored natively
--- in the hierarchical global array ^_CATALOG. Every modification to a function or
+-- in the hierarchical global array ^%CATALOG. Every modification to a function or
 -- constant automatically archives the previous version under the HISTORY branch,
 -- providing durable, database-backed version tracking and rollback capabilities.
 module Phase.Catalog
@@ -31,7 +31,16 @@ import qualified Data.Text as T
 import Phase.AST (PValue (..), VarKind (..), mkValue)
 import Phase.Auth (Role (..), lookupUserRole, roleFromText, roleToText)
 import Phase.Lines (LogicalLine (..), buildLogicalLines)
-import Phase.State (Env, EvalError (..), envCurrentUser, envStorage, killRef, orderRef, readRef, writeRef)
+import Phase.State
+  ( Env
+  , EvalError (..)
+  , envCurrentUser
+  , envStorage
+  , killCatalogRef
+  , orderRef
+  , readRef
+  , writeCatalogRef
+  )
 import Phase.Stmt (parseLogicalLine)
 
 -- | Subscript under an item recording which role authored its CURRENT
@@ -44,7 +53,7 @@ authorRoleSubscript = "AUTHOR_ROLE"
 
 -- | Global array name used for the system catalog.
 catalogGlobalName :: Text
-catalogGlobalName = "_CATALOG"
+catalogGlobalName = "%CATALOG"
 
 -- | The kind of catalog item.
 data ItemKind
@@ -63,23 +72,23 @@ textToKind "CONSTANT" = KindConstant
 textToKind "ROUTINE"  = KindRoutine
 textToKind _          = KindFunction
 
--- | Define or update an item in ^_CATALOG.
+-- | Define or update an item in ^%CATALOG.
 -- If the item already exists, its previous content and metadata are archived into
--- ^_CATALOG(namespace, name, "HISTORY", version) and its version counter is incremented.
+-- ^%CATALOG(namespace, name, "HISTORY", version) and its version counter is incremented.
 --
 -- Returns 'Either' now that 'Phase.State.writeRef'/'killRef' do (a
 -- permission denial partway through this chain, e.g. the acting
 -- user's role doesn't permit writing at all, must stop the whole
 -- definition, not silently continue with some fields updated and
 -- others not). Ordinary routine/constant definitions are NOT
--- admin-gated by this module itself, only @^_USERS@/@^_CONFIG@ are
+-- admin-gated by this module itself, only @^%USERS@/@^%CONFIG@ are
 -- hardcoded admin-only (see 'Phase.Auth'), so any user with plain
 -- write access can define a NEW routine, or edit one no admin has
 -- ever touched. What IS gated: redefining an item whose CURRENT
 -- version was itself authored by an admin (see 'authorRoleSubscript')
 -- requires the acting user to be an admin too. A separate, coarser
 -- version of this same rule ('Phase.Auth.checkCatalogAccess') covers a
--- raw SET/KILL/MERGE that reaches @^_CATALOG@ directly, bypassing this
+-- raw SET/KILL/MERGE that reaches @^%CATALOG@ directly, bypassing this
 -- function entirely.
 defineItem :: Text -> Text -> ItemKind -> Maybe [Text] -> Text -> Env -> Either EvalError Env
 defineItem ns name kind mParams content env = do
@@ -96,7 +105,7 @@ defineItem ns name kind mParams content env = do
                        Left _           -> False
   if curVer > 0 && isAdminOwned && actingRole < RAdmin
     then Left (PermissionDenied (envCurrentUser env)
-                 ("^_CATALOG(" <> ns <> "," <> name <> ") was defined by an admin and can only be modified by an admin"))
+                 ("^%CATALOG(" <> ns <> "," <> name <> ") was defined by an admin and can only be modified by an admin"))
     else defineItemUnchecked ns name kind mParams content actingRole curVer env
 
 -- | The actual write, once 'defineItem' has decided it is allowed.
@@ -116,34 +125,34 @@ defineItemUnchecked ns name kind mParams content actingRole curVer env = do
                           Right val -> Just val
                           Left _    -> Nothing
             verKey = mkValue (T.pack (show curVer))
-        e1 <- writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "HISTORY", verKey] oldContent env
-        e2 <- writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "HISTORY", verKey, mkValue "KIND"] (mkValue oldKind) e1
+        e1 <- writeCatalogRef [mkValue ns, mkValue name, mkValue "HISTORY", verKey] oldContent env
+        e2 <- writeCatalogRef [mkValue ns, mkValue name, mkValue "HISTORY", verKey, mkValue "KIND"] (mkValue oldKind) e1
         case oldParams of
-          Just p  -> writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "HISTORY", verKey, mkValue "PARAMS"] p e2
+          Just p  -> writeCatalogRef [mkValue ns, mkValue name, mkValue "HISTORY", verKey, mkValue "PARAMS"] p e2
           Nothing -> pure e2
       else pure env
 
   -- 3. Write new version and metadata
   let newVer = curVer + 1
       newVerVal = mkValue (T.pack (show newVer))
-  eNew1 <- writeRef Global catalogGlobalName [mkValue ns, mkValue name] (mkValue content) envWithHistory
-  eNew2 <- writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "VERSION"] newVerVal eNew1
-  eNew3 <- writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "KIND"] (mkValue (kindToText kind)) eNew2
+  eNew1 <- writeCatalogRef [mkValue ns, mkValue name] (mkValue content) envWithHistory
+  eNew2 <- writeCatalogRef [mkValue ns, mkValue name, mkValue "VERSION"] newVerVal eNew1
+  eNew3 <- writeCatalogRef [mkValue ns, mkValue name, mkValue "KIND"] (mkValue (kindToText kind)) eNew2
   eNew4 <- case mParams of
-             Just params -> writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "PARAMS"] (mkValue (T.intercalate "," params)) eNew3
-             Nothing     -> killRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue "PARAMS"] eNew3
+             Just params -> writeCatalogRef [mkValue ns, mkValue name, mkValue "PARAMS"] (mkValue (T.intercalate "," params)) eNew3
+             Nothing     -> killCatalogRef [mkValue ns, mkValue name, mkValue "PARAMS"] eNew3
   -- 4. Record who authored this version, so a future 'defineItem' can
   -- tell whether it may be replaced by a non-admin.
-  writeRef Global catalogGlobalName [mkValue ns, mkValue name, mkValue authorRoleSubscript] (mkValue (roleToText actingRole)) eNew4
+  writeCatalogRef [mkValue ns, mkValue name, mkValue authorRoleSubscript] (mkValue (roleToText actingRole)) eNew4
 
--- | Lookup an item by name, trying the requested namespace first and falling back to "_GLOBAL".
+-- | Lookup an item by name, trying the requested namespace first and falling back to "%GLOBAL".
 lookupItem :: Text -> Text -> Env -> Maybe (ItemKind, [Text], Text)
 lookupItem ns name env =
   case lookupExact ns name env of
     Just item -> Just item
     Nothing ->
-      if ns /= "_GLOBAL"
-        then lookupExact "_GLOBAL" name env
+      if ns /= "%GLOBAL"
+        then lookupExact "%GLOBAL" name env
         else Nothing
   where
     lookupExact nSpace n env' =
@@ -190,7 +199,7 @@ revertItem ns name targetVer env =
                             Left _           -> Nothing
          in defineItem ns name histKind histParams histContent env
 
--- | List all namespaces present in ^_CATALOG.
+-- | List all namespaces present in ^%CATALOG.
 listNamespaces :: Env -> [Text]
 listNamespaces env =
   let getNS cur =
@@ -234,7 +243,7 @@ parseSignature sig =
          in (T.strip name, Just (filter (not . T.null) params))
 
 -- | Ingest a multi-line routine source text and register all column-0
--- tags into ^_CATALOG, but only after each tag's own body has been
+-- tags into ^%CATALOG, but only after each tag's own body has been
 -- checked against the REAL Phase statement grammar
 -- ('Phase.Stmt.parseLogicalLine'), exactly the same check
 -- 'Phase.Eval.invokeTarget' already re-runs on every single call.

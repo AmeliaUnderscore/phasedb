@@ -18,6 +18,7 @@ module Phase.Exec
     -- * Execute Phase source
   , runCommand
   , runCommandNoFlush
+  , parseLocatedLines
 
     -- * Admin operations
   , adminCheckpoint
@@ -44,7 +45,7 @@ import Phase.Auth
   )
 import Phase.Catalog (parseSignature, registerRoutineTags)
 import Phase.Eval (evalExpr, evalState, runRoutine)
-import Phase.Lines (LogicalLine (..), buildLogicalLines)
+import Phase.Lines (LogicalLine (..), buildLogicalLinesWithSource, sourcePositionAt)
 import Phase.State
   ( Env (..)
   , EvalError
@@ -61,7 +62,9 @@ import Phase.Storage.Engine
   , takeCheckpoint
   )
 import Phase.Storage.Types (TxId)
-import Phase.Stmt (parseLogicalLine)
+import Phase.Stmt (parseLogicalLineAt)
+import Text.Parsec (ParseError, errorPos)
+import Text.Parsec.Pos (sourceColumn)
 
 -- --------------------------------------------------------------------
 -- Result types
@@ -92,7 +95,7 @@ data RunResult
   | RunError !EvalError !Env      -- ^ Phase ran and returned an error;
                                   --   the env is the ORIGINAL one (no side
                                   --   effects, matching REPL behaviour).
-  | RunParseError !Text           -- ^ The source could not be parsed.
+  | RunParseError !Int !Int !Text -- ^ Source line, column, and parse message.
   deriving (Show)
 
 -- --------------------------------------------------------------------
@@ -136,7 +139,8 @@ runCommandWith flush input nsOverride env0 = do
   now <- getCurrentTime
   let ns   = if T.null nsOverride then envCurrentNamespace env0 else nsOverride
       env  = env0 { envNow = now, envCurrentNamespace = ns }
-      lls  = buildLogicalLines input
+      locatedLls = buildLogicalLinesWithSource input
+      lls = [ll | (_, _, ll) <- locatedLls]
   case lls of
     [] -> pure (RunOk RunOutput
                   { roOutput = "", roValue = Nothing
@@ -145,7 +149,7 @@ runCommandWith flush input nsOverride env0 = do
       let hasTagDef = any (\ll -> case llTag ll of Just _ -> True; Nothing -> False) lls
       in if hasTagDef
            then registerTags flush ns input lls env
-           else executeLines flush lls env
+           else executeLines flush locatedLls env
 
 -- | Handle routine-tag (column-0 definition) input.
 registerTags :: (Env -> IO Env) -> Text -> Text -> [LogicalLine] -> Env -> IO RunResult
@@ -162,10 +166,14 @@ registerTags flush ns input lls env =
               , rrEnv    = env'' })
 
 -- | Handle ordinary Phase statement / bare-expression input.
-executeLines :: (Env -> IO Env) -> [LogicalLine] -> Env -> IO RunResult
+executeLines :: (Env -> IO Env) -> [(Int, [(Int, Int)], LogicalLine)] -> Env -> IO RunResult
 executeLines flush lls env =
-  case mapM parseLogicalLine lls of
-    Left err -> pure (RunParseError (T.pack ("parse error: " ++ show err)))
+  case parseLocatedLines lls of
+    Left (positions, err) ->
+      let pos = errorPos err
+          (lineNo, columnNo) = sourcePositionAt positions (sourceColumn pos)
+      in pure (RunParseError lineNo columnNo
+                 ("parse error: " <> parseErrorDetails err))
     Right [Line _ _ [PredStmt Nothing (SExpr expr)]] -> do
       -- Single bare expression: evaluate without side effects.
       evalResult <- evalState (evalExpr expr) env
@@ -187,6 +195,21 @@ executeLines flush lls env =
                   , roValue  = Nothing
                   , roLastTx = seLastTx (envStorage env'')
                   , roEnv    = clearOutput env'' })
+
+parseLocatedLines
+  :: [(Int, [(Int, Int)], LogicalLine)]
+  -> Either ([(Int, Int)], ParseError) [Line]
+parseLocatedLines [] = Right []
+parseLocatedLines ((lineNo, positions, ll) : rest) =
+  case parseLogicalLineAt lineNo 1 ll of
+    Left err -> Left (positions, err)
+    Right parsed -> (parsed :) <$> parseLocatedLines rest
+
+parseErrorDetails :: ParseError -> Text
+parseErrorDetails err =
+  let rendered = T.pack (show err)
+      (_, details) = T.breakOn "\n" rendered
+  in if T.null details then rendered else T.strip details
 
 -- | Flush pending WAL records from the environment's storage engine.
 flushEnv :: Env -> IO Env
@@ -267,7 +290,7 @@ applyAddUser username salt hash roleText env =
                 , (mkValue "passwordSalt", mkValue salt)
                 ]
               applyWrite envE (field, val) =
-                writeRef Global "_USERS" [mkValue username, field] val envE
+                writeRef Global "%USERS" [mkValue username, field] val envE
               result = foldl (\acc w -> acc >>= flip applyWrite w) (Right env) writes
           in case result of
                Left err   -> Left (AdminOther (formatError err))
@@ -285,4 +308,3 @@ adminAddUser username password roleText env = do
   case applyAddUser username salt hash roleText env of
     Left err   -> pure (Left err)
     Right env' -> Right <$> flushEnv env'
-

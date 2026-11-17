@@ -8,6 +8,7 @@ module Server.Json
   ( -- * Response envelopes
     runEnvelope
   , errorEnvelope
+  , errorEnvelopeAt
   , serverErrorEnvelope
   , transportError
 
@@ -79,11 +80,19 @@ runEnvelope output mVal lastTx elapsedMs reqId mRegistered =
 
 -- | Phase-level error response (§4.1).  HTTP 200, ok: false.
 errorEnvelope :: EvalError -> TxId -> Int -> Text -> ByteString
-errorEnvelope err lastTx elapsedMs reqId =
+errorEnvelope err = errorEnvelopeLocated err Nothing
+
+-- | Phase-level error response with a source position for editor diagnostics.
+errorEnvelopeAt :: EvalError -> Int -> Int -> TxId -> Int -> Text -> ByteString
+errorEnvelopeAt err line column =
+  errorEnvelopeLocated err (Just (line, column))
+
+errorEnvelopeLocated :: EvalError -> Maybe (Int, Int) -> TxId -> Int -> Text -> ByteString
+errorEnvelopeLocated err mLocation lastTx elapsedMs reqId =
   encode $ object
     [ "ok"        .= False
     , "output"    .= ("" :: Text)
-    , "error"     .= evalErrorJson err
+    , "error"     .= evalErrorJsonAt err mLocation
     , "lastTx"    .= lastTx
     , "elapsedMs" .= elapsedMs
     , "requestId" .= reqId
@@ -218,14 +227,18 @@ blobUploadBody pointer hash size reqId =
 -- Error code extraction
 -- --------------------------------------------------------------------
 
--- | Build the @error@ object from an 'EvalError'.
-evalErrorJson :: EvalError -> Value
-evalErrorJson err =
+evalErrorJsonAt :: EvalError -> Maybe (Int, Int) -> Value
+evalErrorJsonAt err mLocation =
   let (code, msg, mCond) = evalErrorParts err
-  in object [ "code"      .= code
-            , "message"   .= msg
-            , "condition" .= maybe Null conditionJson mCond
-            ]
+      locationFields = case mLocation of
+        Nothing -> []
+        Just (line, column) ->
+          [ "location" .= object [ "line" .= line, "column" .= column ] ]
+  in object
+       ([ "code" .= code
+        , "message" .= msg
+        , "condition" .= maybe Null conditionJson mCond
+        ] ++ locationFields)
 
 -- | Extract the code (text between angle brackets per §4.1), the full
 -- formatted message, and a condition object for 'Signaled' errors.

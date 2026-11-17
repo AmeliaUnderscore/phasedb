@@ -86,6 +86,8 @@
 module Phase.Lines
   ( LogicalLine (..)
   , buildLogicalLines
+  , buildLogicalLinesWithSource
+  , sourcePositionAt
   , endsWithBareDo
   , opensBlock
   , needsContinuation
@@ -119,14 +121,39 @@ data LogicalLine = LogicalLine
 -- an intermediate "line with unresolved continuation" type that
 -- nothing else needs.
 buildLogicalLines :: Text -> [LogicalLine]
-buildLogicalLines = assignBlockDepths . joinedLines
+buildLogicalLines = map (\(_, _, ll) -> ll) . buildLogicalLinesWithSource
+
+-- | Build logical lines together with the physical source line on which
+-- each logical line begins. Continuation lines keep the location of the
+-- line they extend.
+buildLogicalLinesWithSource :: Text -> [(Int, [(Int, Int)], LogicalLine)]
+buildLogicalLinesWithSource src =
+  let located = joinContinuations
+        [ (lineNo, classify line)
+        | (lineNo, line) <- zip [1 ..] (T.lines src)
+        ]
+  in zipWith (\(lineNo, positions, _) ll -> (lineNo, positions, ll))
+       located (assignBlockDepths [ll | (_, _, ll) <- located])
+
+-- | Translate a one-based logical-text column into the physical source
+-- coordinate of that character. A position just past the text maps just
+-- after its final source character.
+sourcePositionAt :: [(Int, Int)] -> Int -> (Int, Int)
+sourcePositionAt [] _ = (1, 1)
+sourcePositionAt positions column =
+  case drop (max 0 (column - 1)) positions of
+    (position : _) -> position
+    [] -> let (lineNo, columnNo) = last positions in (lineNo, columnNo + 1)
 
 -- | The logical lines BEFORE explicit-block depths are assigned: tags
 -- classified, continuations joined, 'llDepth' still just the dot
 -- count. 'needsContinuation' reads this form, since it must see which
 -- openers are still waiting for their @END@.
 joinedLines :: Text -> [LogicalLine]
-joinedLines src = joinContinuations (map classify (T.lines src))
+joinedLines src = [ll | (_, _, ll) <- joinContinuations
+  [ (lineNo, classify line)
+  | (lineNo, line) <- zip [1 ..] (T.lines src)
+  ]]
 
 -- --------------------------------------------------------------------
 -- Step 1: classify each physical line, tag? depth? bare-DO-ending?
@@ -136,7 +163,8 @@ joinedLines src = joinContinuations (map classify (T.lines src))
 -- this as an internal type (not exported) since a caller should only
 -- ever see the post-joining 'LogicalLine'.
 data RawLine = RawLine
-  { rlDepth   :: Int
+  { rlSourceColumn :: Int
+  , rlDepth   :: Int
   , rlTag     :: Maybe Text
   , rlGlued   :: Bool  -- ^ True when this line had an explicit @|@
                        -- hard-join marker right after its depth-dots.
@@ -163,8 +191,9 @@ classify line
       let (firstWord, rest) = T.break (\c -> c == ' ' || c == '\t') line
           baseWord = T.takeWhile (\c -> c /= ':' && c /= '(' && c /= '=') firstWord
       in if isTagIdentifier c0 baseWord && not (isCommandKeyword (T.toUpper baseWord))
-           then RawLine 0 (Just firstWord) False (T.stripStart rest)
-           else RawLine 0 Nothing False line
+           then let text = T.stripStart rest
+                in RawLine (T.length line - T.length text + 1) 0 (Just firstWord) False text
+           else RawLine 1 0 Nothing False line
 
   -- Otherwise: an ordinary statement line. It may be a plain-indented
   -- line (depth 0, "conventionally indented by at least one space"
@@ -185,7 +214,8 @@ classify line
             Just ('|', rest) -> (True, rest)
             _                -> (False, afterDots)
           text = T.stripStart afterGlue
-      in RawLine depth Nothing glued text
+          sourceColumn = T.length line - T.length text + 1
+      in RawLine sourceColumn depth Nothing glued text
 
 -- --------------------------------------------------------------------
 -- Step 2: join continuations
@@ -214,16 +244,19 @@ classify line
 -- we join with NO space instead, the old handbook behavior,
 -- preserved as an opt-in escape hatch for splitting a token
 -- mid-word.
-joinContinuations :: [RawLine] -> [LogicalLine]
+joinContinuations :: [(Int, RawLine)] -> [(Int, [(Int, Int)], LogicalLine)]
 joinContinuations = go Nothing
   where
     -- 'acc' is the logical line currently being accumulated, if any:
-    -- (depth, tag, textSoFar). Nothing at the very start or right
+    -- (source line, source positions, depth, tag, text, text positions).
+    -- Nothing at the very start or right
     -- after flushing.
-    go :: Maybe (Int, Maybe Text, Text) -> [RawLine] -> [LogicalLine]
+    go :: Maybe (Int, [(Int, Int)], Int, Maybe Text, Text)
+       -> [(Int, RawLine)]
+       -> [(Int, [(Int, Int)], LogicalLine)]
     go acc [] = flush acc
-    go acc (rl : rest)
-      | RawLine tagLikeDepth (Just tagName) _glued txt <- rl =
+    go acc ((sourceLine, rl) : rest)
+      | RawLine sourceColumn tagLikeDepth (Just tagName) _glued txt <- rl =
           -- A tag line always starts a NEW logical line. A tag
           -- itself can never be a continuation target or a
           -- continuation of anything, since continuation is decided
@@ -232,7 +265,8 @@ joinContinuations = go Nothing
           -- handbook never describes as continuable. (Its own
           -- 'rlGlued' is meaningless and ignored, per the field's own
           -- doc.)
-          flush acc ++ go (Just (tagLikeDepth, Just tagName, txt)) rest
+          let positions = linePositions sourceLine sourceColumn txt
+          in flush acc ++ go (Just (sourceLine, positions, tagLikeDepth, Just tagName, txt)) rest
 
       | otherwise =
           case acc of
@@ -242,8 +276,9 @@ joinContinuations = go Nothing
               -- it starts a new logical line regardless of its own
               -- dot depth or glue marker (both are meaningless with
               -- no line above to join onto).
-              go (Just (rlDepth rl, Nothing, rlText rl)) rest
-            Just (accDepth, accTag, accText) ->
+              let positions = linePositions sourceLine (rlSourceColumn rl) (rlText rl)
+              in go (Just (sourceLine, positions, rlDepth rl, Nothing, rlText rl)) rest
+            Just (accSourceLine, accPositions, accDepth, accTag, accText) ->
               let reachable = if opensBlock accText then accDepth + 1 else accDepth
               in if rlDepth rl > reachable
                    then
@@ -255,14 +290,26 @@ joinContinuations = go Nothing
                      let joined = if rlGlued rl
                                     then accText <> rlText rl
                                     else accText <> " " <> rlText rl
-                     in go (Just (accDepth, accTag, joined)) rest
+                         continuationPositions =
+                           linePositions sourceLine (rlSourceColumn rl) (rlText rl)
+                         joinedPositions = if rlGlued rl
+                           then accPositions ++ continuationPositions
+                           else accPositions ++ [(sourceLine, rlSourceColumn rl)] ++ continuationPositions
+                     in go (Just (accSourceLine, joinedPositions, accDepth, accTag, joined)) rest
                    else
                      -- New statement at this depth.
-                     flush acc ++ go (Just (rlDepth rl, Nothing, rlText rl)) rest
+                     let positions = linePositions sourceLine (rlSourceColumn rl) (rlText rl)
+                     in flush acc ++ go (Just (sourceLine, positions, rlDepth rl, Nothing, rlText rl)) rest
 
-    flush :: Maybe (Int, Maybe Text, Text) -> [LogicalLine]
+    flush :: Maybe (Int, [(Int, Int)], Int, Maybe Text, Text)
+          -> [(Int, [(Int, Int)], LogicalLine)]
     flush Nothing = []
-    flush (Just (d, tag, txt)) = [LogicalLine d tag txt]
+    flush (Just (sourceLine, positions, d, tag, txt)) =
+      [(sourceLine, positions, LogicalLine d tag txt)]
+
+    linePositions :: Int -> Int -> Text -> [(Int, Int)]
+    linePositions lineNo firstColumn txt =
+      [(lineNo, columnNo) | columnNo <- [firstColumn .. firstColumn + T.length txt - 1]]
 
 -- | Does this (already-joined-so-far) logical line's text end with a
 -- BARE @DO@ as its own trailing word, i.e. is the very last

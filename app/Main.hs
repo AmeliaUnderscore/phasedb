@@ -32,7 +32,8 @@ import Phase.Catalog
   , revertItem
   )
 import Phase.Eval (evalExpr, evalState, runRoutine)
-import Phase.Lines (LogicalLine (..), buildLogicalLines, needsContinuation)
+import Phase.Lines (LogicalLine (..), buildLogicalLinesWithSource, needsContinuation, sourcePositionAt)
+import Phase.Exec (parseLocatedLines)
 import Phase.State (Env (..), clearOutput, formatError, getOutputText, initEnv, writeRef)
 import Phase.Storage.Engine
   ( StorageEngine (..)
@@ -44,7 +45,7 @@ import Phase.Storage.Engine
   , releaseDbLock
   , takeCheckpoint
   )
-import Phase.Stmt (parseLogicalLine)
+import Phase.Stmt (parseErrorPosition)
 
 -- --------------------------------------------------------------------
 -- ANSI helpers (no extra dependency, escape sequences only)
@@ -80,7 +81,7 @@ dimMsg s = coloured ansiDim s
 -- prompt argument here, used as the label passed to getInputLine).
 mkPrompt :: Text -> String
 mkPrompt ns
-  | ns == "_GLOBAL" = coloured (ansiBold ++ ansiCyan) "phase" ++ coloured ansiBold "# "
+  | ns == "%GLOBAL" = coloured (ansiBold ++ ansiCyan) "phase" ++ coloured ansiBold "# "
   | otherwise       = coloured (ansiBold ++ ansiCyan) ("phase[" ++ T.unpack ns ++ "]") ++ coloured ansiBold "# "
 
 -- | Continuation prompt shown while accumulating a multi-line block.
@@ -136,7 +137,7 @@ replCompletion prefix =
 -- | Phase REPL (handbook Part XIV):
 -- Maintains session state (locals and in-memory globals), executes statements,
 -- prints WRITE output, evaluates/echoes bare expressions with "- : <value>",
--- and manages ^_CATALOG namespaces, functions, and version history.
+-- and manages ^%CATALOG namespaces, functions, and version history.
 --
 -- Usage: phasedb-hs [dbfile]
 --   dbfile defaults to "phase.db" in the current directory.
@@ -332,8 +333,8 @@ main = do
 
               | trimmed == ".namespaces" -> do
                   let nss = listNamespaces env
-                  outputStrLn (infoMsg "Namespaces in ^_CATALOG:")
-                  mapM_ (\ns' -> outputStrLn ("  - " ++ T.unpack ns')) (if null nss then ["_GLOBAL"] else nss)
+                  outputStrLn (infoMsg "Namespaces in ^%CATALOG:")
+                  mapM_ (\ns' -> outputStrLn ("  - " ++ T.unpack ns')) (if null nss then ["%GLOBAL"] else nss)
                   loop dbPath env
 
               | ".fns" `T.isPrefixOf` trimmed -> do
@@ -343,7 +344,7 @@ main = do
                   if null items
                     then outputStrLn (dimMsg ("No functions found in namespace: " ++ T.unpack targetNS))
                     else do
-                      outputStrLn (infoMsg ("Items in ^_CATALOG(" ++ T.unpack targetNS ++ "):"))
+                      outputStrLn (infoMsg ("Items in ^%CATALOG(" ++ T.unpack targetNS ++ "):"))
                       mapM_ (\(name, kind, ver) ->
                         outputStrLn ("  [" ++ show kind ++ " v" ++ show ver ++ "] " ++ T.unpack name)) items
                   loop dbPath env
@@ -463,7 +464,7 @@ main = do
                               loop dbPath env
                             else if lookupUserRole username (envStorage env) /= RNone
                               -- 'lookupUserRole' defaults to 'RNone' for a
-                              -- username with no '^_USERS(username,"role")'
+                              -- username with no '^%USERS(username,"role")'
                               -- node at all, so this also catches "exists
                               -- with explicitly no access" as "exists",
                               -- the point is not to silently reset an
@@ -487,9 +488,9 @@ main = do
                                             salt <- liftIO generateSalt
                                             let hash = hashPassword pwd1 salt
                                                 result = do
-                                                  e1 <- writeRef Global "_USERS" [mkValue username, mkValue "role"] (mkValue (roleToText (roleFromText roleText))) env
-                                                  e2 <- writeRef Global "_USERS" [mkValue username, mkValue "passwordHash"] (mkValue hash) e1
-                                                  writeRef Global "_USERS" [mkValue username, mkValue "passwordSalt"] (mkValue salt) e2
+                                                  e1 <- writeRef Global "%USERS" [mkValue username, mkValue "role"] (mkValue (roleToText (roleFromText roleText))) env
+                                                  e2 <- writeRef Global "%USERS" [mkValue username, mkValue "passwordHash"] (mkValue hash) e1
+                                                  writeRef Global "%USERS" [mkValue username, mkValue "passwordSalt"] (mkValue salt) e2
                                             case result of
                                               Left err -> do
                                                 outputStrLn (errorMsg (formatError err))
@@ -555,7 +556,8 @@ main = do
       now <- getCurrentTime
       let env    = env0 { envNow = now }
           curNS  = envCurrentNamespace env
-          lls    = buildLogicalLines input
+          locatedLls = buildLogicalLinesWithSource input
+          lls    = [ll | (_, _, ll) <- locatedLls]
       case lls of
         [] -> pure env
         _  -> do
@@ -569,12 +571,25 @@ main = do
                 let definedTags = [t | LogicalLine _ (Just t) _ <- lls]
                 mapM_ (\t -> do
                   let (name, _) = parseSignature t
-                  TIO.putStrLn (T.pack (infoMsg ("Registered " ++ T.unpack curNS ++ "." ++ T.unpack name ++ " in ^_CATALOG")))
+                  TIO.putStrLn (T.pack (infoMsg ("Registered " ++ T.unpack curNS ++ "." ++ T.unpack name ++ " in ^%CATALOG")))
                   ) definedTags
                 flushEnv env'
-            else case mapM parseLogicalLine lls of
-              Left err -> do
-                TIO.putStrLn (T.pack (errorMsg (T.pack ("parse error: " ++ show err))))
+            else case parseLocatedLines locatedLls of
+              Left (positions, err) -> do
+                let (_, logicalColumn) = parseErrorPosition err
+                    (lineNo, columnNo) = sourcePositionAt positions logicalColumn
+                    sourceText = case drop (lineNo - 1) (T.lines input) of
+                      (lineText : _) -> lineText
+                      [] -> ""
+                    caret = T.replicate (max 0 (columnNo - 1)) " " <> "^"
+                    diagnostic = T.unlines
+                      [ "parse error at line " <> T.pack (show lineNo)
+                          <> ", column " <> T.pack (show columnNo)
+                      , "  | " <> sourceText
+                      , "  | " <> caret
+                      , T.pack (show err)
+                      ]
+                TIO.putStrLn (T.pack (errorMsg diagnostic))
                 pure env
               Right [Line _ _ [PredStmt Nothing (SExpr expr)]] -> do
                 -- Bare expression: evaluate and echo "- : value"
@@ -607,7 +622,7 @@ main = do
       , "  " ++ dimMsg ".help"           ++ "                    this message"
       , "  " ++ dimMsg ".quit / .exit"   ++ "            exit the REPL  (also Ctrl-D)"
       , "  " ++ dimMsg ".ns"             ++ "                      show current namespace"
-      , "  " ++ dimMsg ".namespaces"     ++ "              list all namespaces in ^_CATALOG"
+      , "  " ++ dimMsg ".namespaces"     ++ "              list all namespaces in ^%CATALOG"
       , "  " ++ dimMsg ".fns [ns]"       ++ "               list functions/constants in a namespace"
       , "  " ++ dimMsg ".history <n> [ns]" ++ "        show version history for a catalog item"
       , "  " ++ dimMsg ".revert <n> <v> [ns]" ++ "   revert a catalog item to an earlier version"
@@ -620,4 +635,3 @@ main = do
       , "  continues automatically.  Use " ++ dimMsg ":{" ++ " / " ++ dimMsg ":}" ++ " for explicit blocks."
       , "  " ++ dimMsg "Ctrl-C" ++ " discards the current line.  " ++ dimMsg "Ctrl-D" ++ " exits."
       ]
-

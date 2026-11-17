@@ -144,7 +144,7 @@ runGroup ctx groupName tests = do
 -- global access would otherwise be denied.
 --
 -- Every test using this trusts the SAME code path production actually
--- runs (an admin account existing in @^_USERS@, checked by
+-- runs (an admin account existing in @^%USERS@, checked by
 -- 'Phase.Auth.checkReadAccess'/'checkWriteAccess'), rather than a
 -- parallel "tests always succeed" bypass that could silently diverge
 -- from real enforcement.
@@ -318,6 +318,16 @@ testParserGroup ctx = do
     (parseExpr "$DATA(X)")
     (FuncCall "$DATA" [Var (mkRef Local "X" [])])
 
+  assertIsRight ctx "parseExpr '$CHANGED(^[TX]CLIENTES)'"
+    (parseExpr "$CHANGED(^[TX]CLIENTES)")
+    (FuncCall "$CHANGED"
+      [Var (mkTimeTravelRef "CLIENTES" (Var (mkRef Local "TX" [])) [])])
+
+  assertIsRight ctx "parseExpr 'LCHANGED(^[TX]CLIENTES)'"
+    (parseExpr "LCHANGED(^[TX]CLIENTES)")
+    (FuncCall "LCHANGED"
+      [Var (mkTimeTravelRef "CLIENTES" (Var (mkRef Local "TX" [])) [])])
+
   assertIsRight ctx "parseExpr '$ORDER(^A(1))'"
     (parseExpr "$ORDER(^A(1))")
     (FuncCall "$ORDER" [Var (mkRef Global "A" [Lit (mkValue "1")])])
@@ -361,6 +371,17 @@ testLinesGroup ctx = do
     [ LogicalLine 0 Nothing "FOR EACH K IN ^ORDERS DO"
     , LogicalLine 1 Nothing "MERGE A=B WRITE 1"
     ]
+
+  let locatedContinuations = buildLogicalLinesWithSource "WRITE\n. ONE\n.. TWO"
+  case locatedContinuations of
+    [(_, positions, _)] -> do
+      assertEqual ctx "single-dot continuation source map starts after dot and space"
+        (sourcePositionAt positions 7) (2, 3)
+      assertEqual ctx "multiple-dot continuation source map starts after both dots"
+        (sourcePositionAt positions 11) (3, 4)
+    other ->
+      runAssert ctx "single- and multiple-dot lines continue the same logical line"
+        False (show other)
 
   -- 3. Hard join with '|'
   assertEqual ctx "buildLogicalLines continuation with '|' hard join (no space)"
@@ -484,9 +505,9 @@ testStmtGroup ctx = do
 
   -- The root namespace is named with a leading underscore; this used
   -- to be a parse error, so it could not be written explicitly.
-  assertIsRight ctx "DO FOOBAR^_GLOBAL(1) (explicit root namespace)"
-    (parseLogicalLine (LogicalLine 0 Nothing "DO FOOBAR^_GLOBAL(1)"))
-    (Line 0 Nothing [PredStmt Nothing (SDo (Just (CallTarget (Just "FOOBAR") (Just "_GLOBAL") (Just [CallArgVal (Lit (mkValue "1"))]))))])
+  assertIsRight ctx "DO FOOBAR^%GLOBAL(1) (explicit root namespace)"
+    (parseLogicalLine (LogicalLine 0 Nothing "DO FOOBAR^%GLOBAL(1)"))
+    (Line 0 Nothing [PredStmt Nothing (SDo (Just (CallTarget (Just "FOOBAR") (Just "%GLOBAL") (Just [CallArgVal (Lit (mkValue "1"))]))))])
 
   -- 7. QUIT / RETURN / NEW / KILL
   assertIsRight ctx "QUIT (bare)"
@@ -804,14 +825,14 @@ testEvalStmtGroup ctx = do
       assertEqual ctx "Join: london(2) excluded" (dataRef Local "london" [mkValue "2"] env) 0
 
   -- 13. Expression-position CALL
-  let Right envWithDouble = defineItem "_GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " RETURN X*2" adminEnv
+  let Right envWithDouble = defineItem "%GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " RETURN X*2" adminEnv
   callResult1 <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL DOUBLE(21),!") of Right ls -> ls; Left _ -> []) envWithDouble
   case callResult1 of
     Left err -> runAssert ctx "CALL DOUBLE(21)" False (show err)
     Right env -> assertEqual ctx "CALL DOUBLE(21) output" (getOutputText env) "42\n"
 
   -- 14. Multi-value CALL / RETURN destructuring
-  let Right envWithTotal = defineItem "_GLOBAL" "CALCTAX" KindFunction (Just ["orders", "rate"]) " RETURN orders,orders*rate" adminEnv
+  let Right envWithTotal = defineItem "%GLOBAL" "CALCTAX" KindFunction (Just ["orders", "rate"]) " RETURN orders,orders*rate" adminEnv
   callResult2 <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " SET total,tax = CALL CALCTAX(100,0.2)") of Right ls -> ls; Left _ -> []) envWithTotal
   case callResult2 of
     Left err -> runAssert ctx "Multi-value CALL destructuring" False (show err)
@@ -826,7 +847,7 @@ testEvalStmtGroup ctx = do
     res -> runAssert ctx "Arity mismatch should fail" False (show res)
 
   -- 16. Reference parameter &ref
-  let Right envWithDoubleIt = defineItem "_GLOBAL" "DOUBLEIT" KindFunction (Just ["n"]) " SET n=n*2\n QUIT" adminEnv
+  let Right envWithDoubleIt = defineItem "%GLOBAL" "DOUBLEIT" KindFunction (Just ["n"]) " SET n=n*2\n QUIT" adminEnv
   callResult4 <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " SET x=21\n DO DOUBLEIT(&x)\n WRITE x,!") of Right ls -> ls; Left _ -> []) envWithDoubleIt
   case callResult4 of
     Left err -> runAssert ctx "Reference parameter &ref" False (show err)
@@ -960,25 +981,25 @@ testEvalStmtGroup ctx = do
     Left err -> runAssert ctx "Cross-namespace CALL SQUARE^MATH" False (show err)
     Right env -> assertEqual ctx "Cross-namespace CALL SQUARE^MATH output" (getOutputText env) "36\n"
 
-  -- Unqualified lookup from _GLOBAL must NOT see MATH's function.
+  -- Unqualified lookup from %GLOBAL must NOT see MATH's function.
   crossCallUnqualified <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL SQUARE(6),!") of Right ls -> ls; Left _ -> []) envMathSquare
   case crossCallUnqualified of
-    Left (UndefinedLabel "SQUARE" Nothing) -> runAssert ctx "Unqualified CALL SQUARE from _GLOBAL does not see MATH" True ""
-    res -> runAssert ctx "Unqualified CALL SQUARE from _GLOBAL does not see MATH" False (show (fmap getOutputText res))
+    Left (UndefinedLabel "SQUARE" Nothing) -> runAssert ctx "Unqualified CALL SQUARE from %GLOBAL does not see MATH" True ""
+    res -> runAssert ctx "Unqualified CALL SQUARE from %GLOBAL does not see MATH" False (show (fmap getOutputText res))
 
-  -- Qualified lookup still falls back to _GLOBAL when the named
+  -- Qualified lookup still falls back to %GLOBAL when the named
   -- namespace lacks the tag (Part V fallback, via 'lookupItem').
-  let Right envGreeting = defineItem "_GLOBAL" "GREETING" KindFunction (Just []) " RETURN \"hi\"" envMathSquare
+  let Right envGreeting = defineItem "%GLOBAL" "GREETING" KindFunction (Just []) " RETURN \"hi\"" envMathSquare
   crossFallback <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL GREETING^MATH(),!") of Right ls -> ls; Left _ -> []) envGreeting
   case crossFallback of
-    Left err -> runAssert ctx "Qualified CALL falls back to _GLOBAL" False (show err)
-    Right env -> assertEqual ctx "Qualified CALL falls back to _GLOBAL output" (getOutputText env) "hi\n"
+    Left err -> runAssert ctx "Qualified CALL falls back to %GLOBAL" False (show err)
+    Right env -> assertEqual ctx "Qualified CALL falls back to %GLOBAL output" (getOutputText env) "hi\n"
 
-  -- Explicit _GLOBAL qualification is equivalent to the bare form.
-  crossGlobal <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL GREETING^_GLOBAL(),!") of Right ls -> ls; Left _ -> []) envGreeting
+  -- Explicit %GLOBAL qualification is equivalent to the bare form.
+  crossGlobal <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL GREETING^%GLOBAL(),!") of Right ls -> ls; Left _ -> []) envGreeting
   case crossGlobal of
-    Left err -> runAssert ctx "CALL GREETING^_GLOBAL" False (show err)
-    Right env -> assertEqual ctx "CALL GREETING^_GLOBAL output" (getOutputText env) "hi\n"
+    Left err -> runAssert ctx "CALL GREETING^%GLOBAL" False (show err)
+    Right env -> assertEqual ctx "CALL GREETING^%GLOBAL output" (getOutputText env) "hi\n"
 
   -- A qualified name that exists nowhere is an error naming the namespace.
   crossMissing <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " WRITE CALL NOPE^MATH(),!") of Right ls -> ls; Left _ -> []) envGreeting
@@ -1008,7 +1029,7 @@ testEvalStmtGroup ctx = do
   -- 28. Reference parameter whose formal name equals the caller's
   -- variable name. 'aliasVar' used to map it to itself, and
   -- 'resolveLocalName' then looped forever on the first read.
-  let Right envSameName = defineItem "_GLOBAL" "BUMP" KindFunction (Just ["x"]) " SET x=x+1\n QUIT" adminEnv
+  let Right envSameName = defineItem "%GLOBAL" "BUMP" KindFunction (Just ["x"]) " SET x=x+1\n QUIT" adminEnv
   sameNameResult <- runRoutine (case mapM parseLogicalLine (buildLogicalLines " SET x=41\n DO BUMP(&x)\n WRITE x,!") of Right ls -> ls; Left _ -> []) envSameName
   case sameNameResult of
     Left err -> runAssert ctx "Reference parameter with same name as caller variable" False (show err)
@@ -1017,42 +1038,42 @@ testEvalStmtGroup ctx = do
 testCatalogGroup :: TestContext -> IO ()
 testCatalogGroup ctx = do
   adminEnv <- testAdminEnv
-  -- 1. Define function in _GLOBAL (Version 1)
-  let Right e1 = defineItem "_GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " WRITE X*2,!" adminEnv
+  -- 1. Define function in %GLOBAL (Version 1)
+  let Right e1 = defineItem "%GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " WRITE X*2,!" adminEnv
   assertEqual ctx "Catalog: lookup DOUBLE v1"
-    (lookupItem "_GLOBAL" "DOUBLE" e1)
+    (lookupItem "%GLOBAL" "DOUBLE" e1)
     (Just (KindFunction, ["X"], " WRITE X*2,!"))
   assertEqual ctx "Catalog: version 1 counter"
-    (readRef Global "_CATALOG" [mkValue "_GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e1)
+    (readRef Global "%CATALOG" [mkValue "%GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e1)
     (Right (mkValue "1"))
   assertEqual ctx "Catalog: v1 has empty history"
-    (getItemHistory "_GLOBAL" "DOUBLE" e1)
+    (getItemHistory "%GLOBAL" "DOUBLE" e1)
     []
 
-  -- 2. Update function in _GLOBAL (Version 2)
-  let Right e2 = defineItem "_GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " WRITE X*3,!" e1
+  -- 2. Update function in %GLOBAL (Version 2)
+  let Right e2 = defineItem "%GLOBAL" "DOUBLE" KindFunction (Just ["X"]) " WRITE X*3,!" e1
   assertEqual ctx "Catalog: lookup DOUBLE v2"
-    (lookupItem "_GLOBAL" "DOUBLE" e2)
+    (lookupItem "%GLOBAL" "DOUBLE" e2)
     (Just (KindFunction, ["X"], " WRITE X*3,!"))
   assertEqual ctx "Catalog: version 2 counter"
-    (readRef Global "_CATALOG" [mkValue "_GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e2)
+    (readRef Global "%CATALOG" [mkValue "%GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e2)
     (Right (mkValue "2"))
   assertEqual ctx "Catalog: v2 archives v1 in history"
-    (getItemHistory "_GLOBAL" "DOUBLE" e2)
+    (getItemHistory "%GLOBAL" "DOUBLE" e2)
     [(1, " WRITE X*2,!")]
 
   -- 3. Revert to Version 1 (creates Version 3 with v1 content)
-  case revertItem "_GLOBAL" "DOUBLE" 1 e2 of
+  case revertItem "%GLOBAL" "DOUBLE" 1 e2 of
     Left err -> runAssert ctx "Catalog revertItem" False (show err)
     Right e3 -> do
       assertEqual ctx "Catalog: reverted content matches v1"
-        (lookupItem "_GLOBAL" "DOUBLE" e3)
+        (lookupItem "%GLOBAL" "DOUBLE" e3)
         (Just (KindFunction, ["X"], " WRITE X*2,!"))
       assertEqual ctx "Catalog: version after revert is 3"
-        (readRef Global "_CATALOG" [mkValue "_GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e3)
+        (readRef Global "%CATALOG" [mkValue "%GLOBAL", mkValue "DOUBLE", mkValue "VERSION"] e3)
         (Right (mkValue "3"))
       assertEqual ctx "Catalog: history contains v1 and v2"
-        (getItemHistory "_GLOBAL" "DOUBLE" e3)
+        (getItemHistory "%GLOBAL" "DOUBLE" e3)
         [(1, " WRITE X*2,!"), (2, " WRITE X*3,!")]
 
   -- 4. Namespaces & Fallback Resolution
@@ -1060,7 +1081,7 @@ testCatalogGroup ctx = do
   assertEqual ctx "Catalog: lookup in specific namespace"
     (lookupItem "Billing" "CALCTAX" eNS)
     (Just (KindFunction, ["AMT"], " WRITE AMT*0.2,!"))
-  assertEqual ctx "Catalog: fallback from Billing to _GLOBAL for DOUBLE"
+  assertEqual ctx "Catalog: fallback from Billing to %GLOBAL for DOUBLE"
     (lookupItem "Billing" "DOUBLE" eNS)
     (Just (KindFunction, ["X"], " WRITE X*3,!"))
   assertEqual ctx "Catalog: lookup in unrelated namespace fails"
@@ -1068,13 +1089,13 @@ testCatalogGroup ctx = do
     Nothing
 
   -- 5. Constants in Catalog
-  let Right eConst = defineItem "_GLOBAL" "PI" KindConstant Nothing "3.14159" e2
+  let Right eConst = defineItem "%GLOBAL" "PI" KindConstant Nothing "3.14159" e2
   piResult <- evalState (evalExpr (Var (mkRef Local "PI" []))) eConst
   case piResult of
     Left err  -> runAssert ctx "Constant PI evaluation" False (show err)
     Right val -> assertEqual ctx "Constant PI value" val (mkValue "3.14159")
 
-  -- 6. Execute Function via DO dispatch from ^_CATALOG
+  -- 6. Execute Function via DO dispatch from ^%CATALOG
   let callScript = " DO DOUBLE(21)"
   case mapM parseLogicalLine (buildLogicalLines callScript) of
     Left pErr -> runAssert ctx "DO DOUBLE parse" False (show pErr)
@@ -1084,13 +1105,13 @@ testCatalogGroup ctx = do
         Left evalErr -> runAssert ctx "DO DOUBLE execution" False (show evalErr)
         Right envEnd -> assertEqual ctx "DO DOUBLE(21) output" (getOutputText envEnd) "42\n"
 
-  -- 7. Native Global Queries on ^_CATALOG
-  assertEqual ctx "$DATA on ^_CATALOG node duality"
-    (dataRef Global "_CATALOG" [mkValue "_GLOBAL", mkValue "DOUBLE"] e2)
+  -- 7. Native Global Queries on ^%CATALOG
+  assertEqual ctx "$DATA on ^%CATALOG node duality"
+    (dataRef Global "%CATALOG" [mkValue "%GLOBAL", mkValue "DOUBLE"] e2)
     11
-  assertEqual ctx "listNamespaces from ^_CATALOG"
+  assertEqual ctx "listNamespaces from ^%CATALOG"
     (listNamespaces eNS)
-    ["Billing", "_GLOBAL"]
+    ["%GLOBAL", "Billing"]
   assertEqual ctx "listItems in Billing namespace"
     (listItems "Billing" eNS)
     [("CALCTAX", KindFunction, 1)]
@@ -1109,6 +1130,12 @@ testStorageGroup ctx = do
   assertEqual ctx "Storage: Tx sequence 1" tx1 1
   assertEqual ctx "Storage: Tx sequence 2" tx2 2
   assertEqual ctx "Storage: Tx sequence 3" tx3 3
+  txTimestamp <- transactionTimestamp tx2 eng3
+  assertEqual ctx "Storage: transaction timestamp is available for a retained commit"
+    txTimestamp (Just dummyTime)
+  missingTimestamp <- transactionTimestamp 99 eng3
+  assertEqual ctx "Storage: unknown transaction has no timestamp"
+    missingTimestamp Nothing
 
   -- Live vs Time Travel reads
   assertEqual ctx "Storage: Live read is latest (150)"
@@ -1120,6 +1147,12 @@ testStorageGroup ctx = do
   assertEqual ctx "Storage: Time-travel read at tx 2 (120)" tt2 (Right (mkValue "120"))
   tt3 <- readAtTx 3 "ORDERS" [mkValue "1", mkValue "PRICE"] eng3
   assertEqual ctx "Storage: Time-travel read at tx 3 (150)" tt3 (Right (mkValue "150"))
+  latestAt1 <- latestChangedAtTx 1 "ORDERS" [mkValue "1"] eng3
+  assertEqual ctx "Storage: $CHANGED finds a descendant write at tx 1" latestAt1 1
+  latestAt2 <- latestChangedAtTx 2 "ORDERS" [mkValue "1"] eng3
+  assertEqual ctx "Storage: $CHANGED respects an absolute upper bound" latestAt2 2
+  noChangeAt0 <- latestChangedAtTx 0 "ORDERS" [mkValue "1"] eng3
+  assertEqual ctx "Storage: $CHANGED returns zero before the first change" noChangeAt0 0
   tt0 <- readAtTx 0 "ORDERS" [mkValue "1", mkValue "PRICE"] eng3
   assertIsLeft ctx "Storage: Time-travel read before creation (tx 0) is undefined" tt0
 
@@ -1226,6 +1259,23 @@ testStorageGroup ctx = do
           Left e     -> runAssert ctx name False (show e)
           Right env' -> assertEqual ctx name (getOutputText env') expected
 
+  let lchangedWalkSrc = unlines
+        [ " SET ^LCHANGEDDEMO(1,\"NAME\")=\"Alpha\""
+        , " SET ^LCHANGEDDEMO(1,\"EMAIL\")=\"old@example.test\""
+        , " SET ^LCHANGEDDEMO(1,\"NAME\")=\"Beta\""
+        , " SET TX=$TX"
+        , " SET TX=$CHANGED(^[TX]LCHANGEDDEMO(1))"
+        , " DO WITH @TX(TX)"
+        , " . ZWRITE ^LCHANGEDDEMO(1)"
+        , " SET TX=TX-1"
+        , " SET TX=$CHANGED(^[TX]LCHANGEDDEMO(1))"
+        , " DO WITH @TX(TX) @BIND(^LCHANGEDDEMO)"
+        , " . ZWRITE ^LCHANGEDDEMO(1)"
+        ]
+  expectOut "$CHANGED walks backward through descendant commits and pinned subtree reads" adminEnv
+    lchangedWalkSrc
+    "{\"EMAIL\":\"old@example.test\",\"NAME\":\"Beta\"}\n{\"EMAIL\":\"old@example.test\",\"NAME\":\"Alpha\"}\n"
+
   expectOut "DO WITH @TX(^[-2]...) pins bare reads inside the block, not after it" adminEnv
     (abg ++ " DO WITH @TX(^[-2]ITEM(1))\n. WRITE ^ITEM(1),!\n WRITE ^ITEM(1),!\n")
     "Alpha\nGamma\n"
@@ -1264,7 +1314,7 @@ testStorageGroup ctx = do
     "Beta,Alpha\n"
 
   -- The pin travels through a CALL made inside the block.
-  let Right envShow = defineItem "_GLOBAL" "SHOW" KindFunction (Just []) " RETURN ^ITEM(1)" adminEnv
+  let Right envShow = defineItem "%GLOBAL" "SHOW" KindFunction (Just []) " RETURN ^ITEM(1)" adminEnv
   expectOut "the pin carries through a CALL made inside the block" envShow
     (abg ++ " DO WITH @TX(^[-2]ITEM(1))\n. WRITE CALL SHOW(),!\n WRITE CALL SHOW(),!\n")
     "Alpha\nGamma\n"
@@ -1370,8 +1420,8 @@ testStorageGroup ctx = do
     "01\n"
 
   -- Single-call forms: one call inside its own pin scope.
-  let Right envBind1 = defineItem "_GLOBAL" "SHOWAB" KindFunction (Just []) " RETURN ^A(1)_\",\"_^B(1)" adminEnv
-      Right envBind  = defineItem "_GLOBAL" "SHOWW" KindFunction (Just []) (T.pack (dropWhileEnd' showAB)) envBind1
+  let Right envBind1 = defineItem "%GLOBAL" "SHOWAB" KindFunction (Just []) " RETURN ^A(1)_\",\"_^B(1)" adminEnv
+      Right envBind  = defineItem "%GLOBAL" "SHOWW" KindFunction (Just []) (T.pack (dropWhileEnd' showAB)) envBind1
       dropWhileEnd' = reverse . dropWhile (== '\n') . reverse
   expectOut "DO WITH @TX(...) @BIND(...) TAG() pins one call; the pin carries into it" envBind
     (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A) SHOWW()\n")
@@ -1516,8 +1566,8 @@ testStorageGroup ctx = do
     "a2\na1\n"
 
   -- Single-call forms: one call inside its own pin scope.
-  let Right envBind1 = defineItem "_GLOBAL" "SHOWAB" KindFunction (Just []) " RETURN ^A(1)_\",\"_^B(1)" adminEnv
-      Right envBind  = defineItem "_GLOBAL" "SHOWW" KindFunction (Just []) (T.pack (dropWhileEnd' showAB)) envBind1
+  let Right envBind1 = defineItem "%GLOBAL" "SHOWAB" KindFunction (Just []) " RETURN ^A(1)_\",\"_^B(1)" adminEnv
+      Right envBind  = defineItem "%GLOBAL" "SHOWW" KindFunction (Just []) (T.pack (dropWhileEnd' showAB)) envBind1
       dropWhileEnd' = reverse . dropWhile (== '\n') . reverse
   expectOut "DO WITH @TX(...) @BIND(...) TAG() pins one call; the pin carries into it" envBind
     (pairSrc ++ " DO WITH " ++ pinA ++ " @BIND(^A) SHOWW()\n")
@@ -1642,11 +1692,11 @@ testStorageGroup ctx = do
   -- Permissions are checked per merged leaf, exactly as a SET would.
   -- TESTADMIN is the only admin, so demoting it must be refused whether
   -- it arrives by SET or by MERGE.
-  do r <- runPhaseIn adminEnv " SET ^_USERS(\"TESTADMIN\",\"role\")=\"read\"\n"
+  do r <- runPhaseIn adminEnv " SET ^%USERS(\"TESTADMIN\",\"role\")=\"read\"\n"
      case r of
        Left (PermissionDenied _ _) -> runAssert ctx "control: SET demoting the last admin is refused" True ""
        other -> runAssert ctx "control: SET demoting the last admin is refused" False (show (fmap getOutputText other))
-  do r <- runPhaseIn adminEnv " SET src(\"aaa\")=\"1\",src(\"role\")=\"read\"\n MERGE ^_USERS(\"TESTADMIN\")=src\n"
+  do r <- runPhaseIn adminEnv " SET src(\"aaa\")=\"1\",src(\"role\")=\"read\"\n MERGE ^%USERS(\"TESTADMIN\")=src\n"
      case r of
        Left (PermissionDenied _ _) -> runAssert ctx "MERGE demoting the last admin is refused like a SET" True ""
        other -> runAssert ctx "MERGE demoting the last admin is refused like a SET" False (show (fmap getOutputText other))
@@ -1801,6 +1851,8 @@ testStorageGroup ctx = do
       assertEqual ctx "Storage: Recovered live CITY"
         (readLive "CUSTOMERS" [mkValue "101", mkValue "CITY"] recoveredEng)
         (Right (mkValue "Tokyo"))
+      latestRecovered <- latestChangedAtTx 4 "CUSTOMERS" [mkValue "101"] recoveredEng
+      assertEqual ctx "Storage: $CHANGED finds the newest descendant write after WAL recovery" latestRecovered 3
       recoveredTt1 <- readAtTx 1 "CUSTOMERS" [mkValue "101", mkValue "NAME"] recoveredEng
       assertEqual ctx "Storage: Recovered time travel NAME at tx 1" recoveredTt1 (Right (mkValue "Alice"))
 
@@ -1825,6 +1877,8 @@ testStorageGroup ctx = do
           -- specifically exercises readAtTx's deep-replay fallback.
           deepTt <- readAtTx 1 "CUSTOMERS" [mkValue "101", mkValue "NAME"] reopenedEng
           assertEqual ctx "Storage: Deep time-travel through a checkpoint still finds pre-checkpoint history" deepTt (Right (mkValue "Alice"))
+          deepLatest <- latestChangedAtTx 1 "CUSTOMERS" [mkValue "101"] reopenedEng
+          assertEqual ctx "Storage: $CHANGED replays pre-checkpoint history on demand" deepLatest 1
 
           -- 8b. CITY was written once (tx 2) and never touched again,
           -- so it survives entirely as a checkpoint entry with no
@@ -2054,7 +2108,7 @@ testChildCountGroup ctx = do
     Right env -> assertEqual ctx "$CHILDCOUNT subscripted path -> 2" (getOutputText env) "2\n"
 
 -- --------------------------------------------------------------------
--- Security: null subscripts, ^_CATALOG ownership, last-admin safeguard
+-- Security: null subscripts, ^%CATALOG ownership, last-admin safeguard
 -- --------------------------------------------------------------------
 
 -- --------------------------------------------------------------------
@@ -2169,9 +2223,9 @@ testSecurityGroup ctx = do
     (either formatError (const "ok") (mergeRef (Global, "G", [mkValue ""]) (Global, "H", []) adminEnv))
     (formatError (NullSubscript "G" [mkValue ""]))
 
-  -- 2. ^_CATALOG: a non-admin can still define their own routines, but
+  -- 2. ^%CATALOG: a non-admin can still define their own routines, but
   -- cannot overwrite one an admin has authored.
-  let Right envWithWriter = writeRef Global "_USERS" [mkValue "WRITER", mkValue "role"] (mkValue "write") adminEnv
+  let Right envWithWriter = writeRef Global "%USERS" [mkValue "WRITER", mkValue "role"] (mkValue "write") adminEnv
       Right envAdminSquare = defineItem "MATH" "SQUARE" KindFunction (Just ["X"]) " RETURN X*X" envWithWriter
       writerEnv = envAdminSquare { envCurrentUser = "WRITER" }
 
@@ -2198,40 +2252,40 @@ testSecurityGroup ctx = do
                 other -> runAssert ctx "Function becomes protected once an admin has touched it" False (show (fmap (const "ok") other))
 
   -- The same protection applies to a raw SET/KILL that bypasses
-  -- 'defineItem' entirely and reaches ^_CATALOG directly.
-  case writeRef Global "_CATALOG" [mkValue "MATH", mkValue "SQUARE"] (mkValue "malicious") writerEnv of
-    Left (PermissionDenied "WRITER" _) -> runAssert ctx "Raw SET ^_CATALOG cannot overwrite an admin-owned item" True ""
-    other -> runAssert ctx "Raw SET ^_CATALOG cannot overwrite an admin-owned item" False (show (fmap (const "ok") other))
-  case writeRef Global "_CATALOG" [mkValue "MATH", mkValue "NEWTHING"] (mkValue "body") writerEnv of
-    Left err -> runAssert ctx "Raw SET ^_CATALOG can still create a new item" False (show err)
-    Right _  -> runAssert ctx "Raw SET ^_CATALOG can still create a new item" True ""
-  case killRef Global "_CATALOG" [mkValue "MATH"] writerEnv of
-    Left (PermissionDenied "WRITER" _) -> runAssert ctx "Non-admin cannot KILL a whole ^_CATALOG namespace" True ""
-    other -> runAssert ctx "Non-admin cannot KILL a whole ^_CATALOG namespace" False (show (fmap (const "ok") other))
-  case killRef Global "_CATALOG" [mkValue "MATH"] envAdminSquare of
-    Left err -> runAssert ctx "Admin CAN KILL a whole ^_CATALOG namespace" False (show err)
-    Right _  -> runAssert ctx "Admin CAN KILL a whole ^_CATALOG namespace" True ""
+  -- 'defineItem' entirely and reaches ^%CATALOG directly.
+  case writeRef Global "%CATALOG" [mkValue "MATH", mkValue "SQUARE"] (mkValue "malicious") writerEnv of
+    Left (PermissionDenied "WRITER" _) -> runAssert ctx "Raw SET ^%CATALOG cannot overwrite an admin-owned item" True ""
+    other -> runAssert ctx "Raw SET ^%CATALOG cannot overwrite an admin-owned item" False (show (fmap (const "ok") other))
+  case writeRef Global "%CATALOG" [mkValue "MATH", mkValue "NEWTHING"] (mkValue "body") writerEnv of
+    Left err -> runAssert ctx "Raw SET ^%CATALOG can still create a new item" False (show err)
+    Right _  -> runAssert ctx "Raw SET ^%CATALOG can still create a new item" True ""
+  case killRef Global "%CATALOG" [mkValue "MATH"] writerEnv of
+    Left (PermissionDenied "WRITER" _) -> runAssert ctx "Non-admin cannot KILL a whole ^%CATALOG namespace" True ""
+    other -> runAssert ctx "Non-admin cannot KILL a whole ^%CATALOG namespace" False (show (fmap (const "ok") other))
+  case killRef Global "%CATALOG" [mkValue "MATH"] envAdminSquare of
+    Left err -> runAssert ctx "Admin CAN KILL a whole ^%CATALOG namespace" False (show err)
+    Right _  -> runAssert ctx "Admin CAN KILL a whole ^%CATALOG namespace" True ""
 
-  -- 3. ^_USERS: an admin can never remove or demote the sole remaining
-  -- admin account. (Only an admin can reach ^_USERS writes at all --
+  -- 3. ^%USERS: an admin can never remove or demote the sole remaining
+  -- admin account. (Only an admin can reach ^%USERS writes at all --
   -- 'checkWriteAccess' already hardcodes that -- so this is purely
   -- about protecting an admin from locking themselves out.)
-  case killRef Global "_USERS" [mkValue "TESTADMIN"] adminEnv of
+  case killRef Global "%USERS" [mkValue "TESTADMIN"] adminEnv of
     Left (PermissionDenied "TESTADMIN" _) -> runAssert ctx "Cannot KILL the sole admin account" True ""
     other -> runAssert ctx "Cannot KILL the sole admin account" False (show (fmap (const "ok") other))
-  case writeRef Global "_USERS" [mkValue "TESTADMIN", mkValue "role"] (mkValue "write") adminEnv of
+  case writeRef Global "%USERS" [mkValue "TESTADMIN", mkValue "role"] (mkValue "write") adminEnv of
     Left (PermissionDenied "TESTADMIN" _) -> runAssert ctx "Cannot demote the sole admin account" True ""
     other -> runAssert ctx "Cannot demote the sole admin account" False (show (fmap (const "ok") other))
-  case killRef Global "_USERS" [] adminEnv of
-    Left (PermissionDenied "TESTADMIN" _) -> runAssert ctx "Cannot KILL ^_USERS entirely while an admin exists" True ""
-    other -> runAssert ctx "Cannot KILL ^_USERS entirely while an admin exists" False (show (fmap (const "ok") other))
+  case killRef Global "%USERS" [] adminEnv of
+    Left (PermissionDenied "TESTADMIN" _) -> runAssert ctx "Cannot KILL ^%USERS entirely while an admin exists" True ""
+    other -> runAssert ctx "Cannot KILL ^%USERS entirely while an admin exists" False (show (fmap (const "ok") other))
   -- A non-admin user's own record can still be removed freely...
-  case killRef Global "_USERS" [mkValue "WRITER"] envWithWriter of
+  case killRef Global "%USERS" [mkValue "WRITER"] envWithWriter of
     Left err -> runAssert ctx "A non-admin user's own record can still be KILLed" False (show err)
     Right _  -> runAssert ctx "A non-admin user's own record can still be KILLed" True ""
   -- ...and once a SECOND admin exists, the first can be removed too.
-  let Right envTwoAdmins = writeRef Global "_USERS" [mkValue "ADMIN2", mkValue "role"] (mkValue "admin") adminEnv
-  case killRef Global "_USERS" [mkValue "TESTADMIN"] envTwoAdmins of
+  let Right envTwoAdmins = writeRef Global "%USERS" [mkValue "ADMIN2", mkValue "role"] (mkValue "admin") adminEnv
+  case killRef Global "%USERS" [mkValue "TESTADMIN"] envTwoAdmins of
     Left err -> runAssert ctx "The original admin CAN be removed once a second admin exists" False (show err)
     Right _  -> runAssert ctx "The original admin CAN be removed once a second admin exists" True ""
 
@@ -2517,12 +2571,14 @@ testEvaluateGroup ctx = do
   -- EVALUATE is not a scope
   r12 <- run (T.unlines [" SET S=1", " EVALUATE S", " WHEN 1 WRITE \"one\"  QUIT", " END EVALUATE", " WRITE \"after\""])
   assertEqual ctx "EVALUATE: QUIT in a clause leaves the enclosing routine" r12 (Right "one")
-  let Right envSign = defineItem "_GLOBAL" "SIGN" KindFunction (Just ["N"]) (T.unlines
+  let envSign = case defineItem "%GLOBAL" "SIGN" KindFunction (Just ["N"]) (T.unlines
         [ " EVALUATE TRUE"
         , " WHEN N>0 RETURN \"pos\""
         , " WHEN N<0 RETURN \"neg\""
         , " END EVALUATE"
-        , " RETURN \"zero\"" ]) adminEnv
+        , " RETURN \"zero\"" ]) adminEnv of
+        Right env -> env
+        Left err  -> error ("defineItem SIGN: " ++ show err)
   mapM_ (\(n, want) -> do
            res <- runRoutine (case mapM parseLogicalLine (buildLogicalLines (" WRITE CALL SIGN(" <> n <> ")")) of Right ls -> ls; Left _ -> []) envSign
            assertEqual ctx ("EVALUATE: RETURN in a clause returns from the function, N=" ++ T.unpack n)
@@ -2675,11 +2731,11 @@ testConditionsGroup ctx = do
   assertEqual ctx "a handler inside a FOR body is applied per iteration" r18 (Right "1s3")
 
   -- ---- signals from inside calls ----
-  let Right envThrow = defineItem "_GLOBAL" "THROW" KindFunction (Just []) " SIGNAL <FROMFN>(where: \"fn\")" adminEnv
+  let Right envThrow = defineItem "%GLOBAL" "THROW" KindFunction (Just []) " SIGNAL <FROMFN>(where: \"fn\")" adminEnv
   r19 <- runIn envThrow (T.unlines [ "DO", "WRITE CALL THROW()", "CATCH <FROMFN> AS e", "WRITE e(\"where\")", "END DO" ])
   assertEqual ctx "a signal raised in a called function, in expression position, is caught by the caller's block"
     r19 (Right "fn")
-  let Right envDecl = defineItem "_GLOBAL" "THROW2" KindFunction (Just []) " SIGNAL <D>(undeclared: 1)" envThrow
+  let Right envDecl = defineItem "%GLOBAL" "THROW2" KindFunction (Just []) " SIGNAL <D>(undeclared: 1)" envThrow
   r20 <- runIn envDecl (T.unlines [ " CONDITION <D>(only)", " DO", " WRITE CALL THROW2()", " CATCH <D>", " WRITE \"c\"", " END DO" ])
   assertEqual ctx "CONDITION declarations belong to their own routine: the callee is not bound by the caller's"
     r20 (Right "c")
@@ -2719,13 +2775,13 @@ testConditionsGroup ctx = do
   r30 <- run (T.unlines
     [ " SET n=0", "DO", "    SET n=n+1", "    IF n<3 SIGNAL <AGAIN>", "    WRITE \"n=\",n", "HANDLE <AGAIN>", "    IF 1 DO", "    . RETRY", "    WRITE \"unreachable\"", "END DO" ])
   assertEqual ctx "RETRY inside a nested block of the clause unwinds all the way out" r30 (Right "n=3")
-  r31 <- run (T.unlines [ " SET ^_CONFIG(\"retry\",\"max\")=5", " DO", " SIGNAL <X>", " HANDLE <X>", " RETRY", " END DO" ])
+  r31 <- run (T.unlines [ " SET ^%CONFIG(\"retry\",\"max\")=5", " DO", " SIGNAL <X>", " HANDLE <X>", " RETRY", " END DO" ])
   assertEqual ctx "a plain RETRY that never succeeds hits the configured ceiling"
     (either (\e -> "RETRY limit reached" `T.isInfixOf` formatError e && "5 times" `T.isInfixOf` formatError e) (const False) r31) True
   r32 <- run (T.unlines [ " DO", " SIGNAL <X>", " HANDLE <X>", " RETRY", " END DO" ])
   assertEqual ctx "the default ceiling is 1000"
     (either (\e -> "1000 times" `T.isInfixOf` formatError e) (const False) r32) True
-  r33 <- run (T.unlines [ " SET ^_CONFIG(\"retry\",\"max\")=3", " SET n=0", " DO", " SET n=n+1", " SIGNAL <X>", " HANDLE <X>", " RETRY 10 TIMES", " WRITE \"n=\",n", " END DO" ])
+  r33 <- run (T.unlines [ " SET ^%CONFIG(\"retry\",\"max\")=3", " SET n=0", " DO", " SET n=n+1", " SIGNAL <X>", " HANDLE <X>", " RETRY 10 TIMES", " WRITE \"n=\",n", " END DO" ])
   assertEqual ctx "the ceiling also bounds a counted RETRY"
     (either (\e -> "RETRY limit reached" `T.isInfixOf` formatError e) (const False) r33) True
 
@@ -2735,7 +2791,7 @@ testConditionsGroup ctx = do
   assertEqual ctx "RETRY in a CATCH clause is a <SYNTAX> error (only HANDLE retries)" (isRetryMisuse r35) True
   r36 <- run (T.unlines [ " DO", " RETRY", " HANDLE <X>", " WRITE 1", " END DO" ])
   assertEqual ctx "RETRY in the body of a block, not in a HANDLE clause, is a <SYNTAX> error" (isRetryMisuse r36) True
-  let Right envRetryer = defineItem "_GLOBAL" "RETRYER" KindFunction (Just []) (T.unlines [ " RETRY", " RETURN 1" ]) adminEnv
+  let Right envRetryer = defineItem "%GLOBAL" "RETRYER" KindFunction (Just []) (T.unlines [ " RETRY", " RETURN 1" ]) adminEnv
   r37 <- runIn envRetryer (T.unlines [ " DO", " SIGNAL <X>", " HANDLE <X>", " SET v=CALL RETRYER()", " END DO" ])
   assertEqual ctx "RETRY inside a function called from a HANDLE clause is not lexically in it" (isRetryMisuse r37) True
   r38 <- run " HANDLE <X>"
@@ -2757,7 +2813,7 @@ testConditionsGroup ctx = do
   assertEqual ctx "after the block ends the handler is gone: plain error again" r44 (Left DivideByZero)
   r45 <- run (T.unlines [ "DO", "SIGNAL <X>", "CATCH <X>", "END DO", "WRITE 1/0" ])
   assertEqual ctx "...also after a caught signal" r45 (Left DivideByZero)
-  let Right envDiv = defineItem "_GLOBAL" "DIVIDER" KindFunction (Just []) " RETURN 1/0" adminEnv
+  let Right envDiv = defineItem "%GLOBAL" "DIVIDER" KindFunction (Just []) " RETURN 1/0" adminEnv
   r46 <- runIn envDiv (T.unlines [ "DO", "WRITE CALL DIVIDER()", "CATCH <DIVIDE-BY-ZERO>", "WRITE \"in callee\"", "END DO" ])
   assertEqual ctx "a handler applies to everything in its dynamic extent, callees included" r46 (Right "in callee")
 
@@ -2879,12 +2935,49 @@ testExecGroup ctx = do
   -- 4. A parse error produces RunParseError.
   r4 <- runCommand " SET" "" adminEnv
   case r4 of
-    RunParseError _ ->
+    RunParseError _ _ _ ->
       runAssert ctx "runCommand: bare SET -> RunParseError" True ""
     other ->
       runAssert ctx "runCommand: bare SET -> RunParseError" False (show other)
 
-  -- 5. A namespace override is respected: the env going in has _GLOBAL but
+  -- 5. Parse errors retain their physical source line in multi-line input.
+  r4b <- runCommand " WRITE 1\n    SET" "" adminEnv
+  case r4b of
+    RunParseError line column _ ->
+      runAssert ctx "runCommand: multiline parse error reports source line and indentation"
+        (line == 2 && column > 1) (show (line, column))
+    other ->
+      runAssert ctx "runCommand: multiline parse error reports its source line" False (show other)
+
+  -- 6. A parser error on a dot-depth continuation maps back to that physical line.
+  let continuationSource =
+        "SET TX=$TX\nFOR\n. SET TX=$CHANGED(^[TX]CLIENTES)\n. QUIT:TX=0\n"
+        <> ". DO WITH @TX(TX) @BIND(^CLIENTES)\n.. ZWRITE ^CLIENTES\n. SET TX=TX-1"
+  r4c <- runCommand continuationSource "" adminEnv
+  case r4c of
+    RunParseError line column _ ->
+      let sourceLines = T.lines continuationSource
+          validPosition = line >= 1 && line <= length sourceLines
+            && column >= 1 && column <= T.length (sourceLines !! (line - 1)) + 1
+      in runAssert ctx "runCommand: continuation error points into its physical source line"
+           (validPosition && (line, column) == (3, 6)) (show (line, column))
+    other ->
+      runAssert ctx "runCommand: continuation input reports a parse error" False (show other)
+
+  whenWrite <- runCommand " SET ^WHENTEST=1" "" adminEnv
+  case whenWrite of
+    RunOk (RunOutput _ _ _ writtenEnv) -> do
+      whenRead <- runCommand "$WHEN($TX)" "" writtenEnv
+      case whenRead of
+        RunOk (RunOutput _ (Just timestamp) _ _) ->
+          runAssert ctx "runCommand: $WHEN($TX) returns an ISO transaction timestamp"
+            (not (T.null timestamp) && "T" `T.isInfixOf` timestamp) (T.unpack timestamp)
+        other ->
+          runAssert ctx "runCommand: $WHEN($TX) returns a timestamp" False (show other)
+    other ->
+      runAssert ctx "runCommand: setup write for $WHEN succeeds" False (show other)
+
+  -- 7. A namespace override is respected: the env going in has %GLOBAL but
   --    the override puts "Billing" in envCurrentNamespace.
   r5 <- runCommand " NAMESPACE Billing\n WRITE $DATA(^NOOP),!" "Billing" adminEnv
   case r5 of
@@ -2894,7 +2987,7 @@ testExecGroup ctx = do
     other ->
       runAssert ctx "runCommand: namespace override" False (show other)
 
-  -- 6. A global write is durable: the env returned has an advanced lastTx.
+  -- 8. A global write is durable: the env returned has an advanced lastTx.
   r6 <- runCommand " SET ^EXECTEST(1)=\"v\"" "" adminEnv
   case r6 of
     RunOk (RunOutput _ Nothing tx env') -> do
@@ -3296,8 +3389,8 @@ testHttpProtocolGroup ctx = withApi "protocol" id $ \api -> do
 
   -- tag registration -------------------------------------------------------------
   reg <- adminShot api "GREET(n)\n WRITE \"hi \",n,!"
-  assertEqual ctx "routine-tag definition: ok, registered [_GLOBAL.GREET]"
-    (okOf reg, jget ["registered"] (bodyJson reg)) (Just True, Just (Aeson.toJSON ["_GLOBAL.GREET" :: T.Text]))
+  assertEqual ctx "routine-tag definition: ok, registered [%GLOBAL.GREET]"
+    (okOf reg, jget ["registered"] (bodyJson reg)) (Just True, Just (Aeson.toJSON ["%GLOBAL.GREET" :: T.Text]))
   call <- adminShot api " DO GREET(\"bob\")"
   assertEqual ctx "a registered tag is visible to the next request" (outOf call) (Just "hi bob\n")
   regNs <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
@@ -3358,9 +3451,9 @@ testHttpLimitsGroup ctx = do
     assertEqual ctx "output under the cap works" (outOf small) (Just "fits\n")
 
   withApi "config-db" id $ \api -> do
-    _ <- adminShot api " SET ^_CONFIG(\"server\",\"maxOutputBytes\")=30"
+    _ <- adminShot api " SET ^%CONFIG(\"server\",\"maxOutputBytes\")=30"
     r <- adminShot api " FOR I=1:1:10 WRITE \"xxxxxxxxxx\""
-    assertEqual ctx "D9: ^_CONFIG(\"server\",...) applies without a restart (maxOutputBytes)"
+    assertEqual ctx "D9: ^%CONFIG(\"server\",...) applies without a restart (maxOutputBytes)"
       (codeOf r) (Just "OUTPUT LIMIT")
 
   -- Timing tests use a session (Bearer): a one-shot request pays a PBKDF2 on
@@ -3429,6 +3522,13 @@ testHttpExecutionGroup ctx = withApi "execution" id $ \api -> do
   assertEqual ctx "failure after earlier writes: leaves no trace" (codeOf a1) (Just "UNDEFINED VARIABLE")
   lt2 <- lastTxOf <$> adminShot api "^T(1)"
   assertEqual ctx "failed request does not advance lastTx" lt2 lt
+  badSyntax <- adminShot api " WRITE 1\n    SET"
+  let syntaxBody = bodyJson badSyntax
+  assertEqual ctx "syntax error includes the physical source line"
+    (jInt ["error", "location", "line"] syntaxBody) (Just 2)
+  runAssert ctx "syntax error column includes the source indentation"
+    (maybe False (> 1) (jInt ["error", "location", "column"] syntaxBody))
+    (show syntaxBody)
   v3 <- snapVer api
   assertEqual ctx "failed request does not publish a snapshot" v3 v2
 
@@ -3519,7 +3619,7 @@ testHttpSessionGroup ctx = withApi "sessions" id $ \api -> do
   assertEqual ctx "login: 201 Created" (statusOf l) 201
   assertEqual ctx "login: token is 64 lowercase hex chars" (maybe False isHex64 (jText ["token"] lj)) True
   assertEqual ctx "login: user, role and namespace reported"
-    (jText ["user"] lj, jText ["role"] lj, jText ["namespace"] lj) (Just "admin", Just "admin", Just "_GLOBAL")
+    (jText ["user"] lj, jText ["role"] lj, jText ["namespace"] lj) (Just "admin", Just "admin", Just "%GLOBAL")
   assertEqual ctx "login: idleTimeoutSeconds and expiresAt present"
     (jInt ["idleTimeoutSeconds"] lj, jText ["expiresAt"] lj /= Nothing) (Just 1800, True)
   tk1 <- tokenFor api "admin" "secret123"
@@ -3549,7 +3649,7 @@ testHttpSessionGroup ctx = withApi "sessions" id $ \api -> do
   cur <- http api "GET" "/v1/sessions/current" [bearerH tok] ""
   assertEqual ctx "GET current: user, role, namespace"
     (statusOf cur, jText ["user"] (bodyJson cur), jText ["role"] (bodyJson cur), jText ["namespace"] (bodyJson cur))
-    (200, Just "admin", Just "admin", Just "_GLOBAL")
+    (200, Just "admin", Just "admin", Just "%GLOBAL")
   noTok <- http api "GET" "/v1/sessions/current" [] ""
   assertEqual ctx "GET current without a token: 401" (statusOf noTok, codeOf noTok) (401, Just "UNAUTHENTICATED")
   unknownTok <- http api "GET" "/v1/sessions/current" [bearerH (BSC.replicate 64 'a')] ""
@@ -3599,7 +3699,7 @@ testHttpSessionGroup ctx = withApi "sessions" id $ \api -> do
 
   -- tag registration inside a session
   regS <- sessExec api a "SESSTAG()\n WRITE \"st\",!"
-  assertEqual ctx "session: tag registration returns registered names" (jget ["registered"] (bodyJson regS)) (Just (Aeson.toJSON ["_GLOBAL.SESSTAG" :: T.Text]))
+  assertEqual ctx "session: tag registration returns registered names" (jget ["registered"] (bodyJson regS)) (Just (Aeson.toJSON ["%GLOBAL.SESSTAG" :: T.Text]))
   callS <- sessExec api b " DO SESSTAG"
   assertEqual ctx "session: a tag registered in one session is callable from another" (outOf callS) (Just "st\n")
 
@@ -3619,7 +3719,7 @@ testHttpSessionRolesGroup ctx = withApi "session-roles" id $ \api -> do
   r2 <- sessExec api rd " SET ^R(2)=\"y\""
   assertEqual ctx "reader session writing a global: ok false PROTECT" (statusOf r2, okOf r2, codeOf r2) (200, Just False, Just "PROTECT")
   -- revocation (§5.3, D8): a role change takes effect on the next request, mid-session
-  _ <- adminShot api " SET ^_USERS(\"writer\",\"role\")=\"none\""
+  _ <- adminShot api " SET ^%USERS(\"writer\",\"role\")=\"none\""
   after <- sessExec api wr " SET ^R(3)=\"z\""
   assertEqual ctx "revoked role takes effect on the next request of an existing session"
     (statusOf after, codeOf after) (403, Just "FORBIDDEN")
@@ -3820,7 +3920,7 @@ testHttpAdminGroup ctx = do
   -- 2. GET /v1/admin/status
   withApi "admin-status" (\c -> c { cfgExecTimeoutMs = Just 4200 }) $ \api -> do
     let aH = basicH "admin" "secret123"
-    _ <- adminShot api " SET ^_CONFIG(\"server\",\"maxBodyBytes\")=2000000"
+    _ <- adminShot api " SET ^%CONFIG(\"server\",\"maxBodyBytes\")=2000000"
     st <- http api "GET" "/v1/admin/status" [aH] ""
     let sj = bodyJson st
     assertEqual ctx "status: 200 ok" (statusOf st, okOf st) (200, Just True)
@@ -4329,27 +4429,27 @@ testHttpM5Group ctx = do
     r11 <- http api "PUT" "/v1/blobs" [basicH "writer" "pw-writer"] "0123456789A"
     assertEqual ctx "PUT blob > max-blob-bytes -> 413" (statusOf r11) 413
 
-  -- 5. Protection of ^_BLOBS / ^_BLOB array
+  -- 5. Protection of ^%CATALOG / ^%BLOB array
   withApi "m5-blob-protection" id $ \api -> do
-    -- Admin cannot SET ^_BLOBS directly
+    -- Admin cannot SET ^%CATALOG directly
     rSetBlobsAdmin <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
-                        "{\"command\":\"SET ^_BLOBS(1)=\\\"fake\\\"\"}"
-    assertEqual ctx "SET ^_BLOBS by admin fails" (okOf rSetBlobsAdmin) (Just False)
+                        "{\"command\":\"SET ^%CATALOG(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^%CATALOG by admin fails" (okOf rSetBlobsAdmin) (Just False)
 
-    -- Admin cannot SET ^_BLOB directly
+    -- Admin cannot SET ^%BLOB directly
     rSetBlobAdmin <- http api "POST" "/v1/execute" [basicH "admin" "secret123", jsonCT]
-                       "{\"command\":\"SET ^_BLOB(1)=\\\"fake\\\"\"}"
-    assertEqual ctx "SET ^_BLOB by admin fails" (okOf rSetBlobAdmin) (Just False)
+                       "{\"command\":\"SET ^%BLOB(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^%BLOB by admin fails" (okOf rSetBlobAdmin) (Just False)
 
-    -- Writer cannot SET ^_BLOBS
+    -- Writer cannot SET ^%CATALOG
     rSetBlobsWriter <- http api "POST" "/v1/execute" [basicH "writer" "pw-writer", jsonCT]
-                         "{\"command\":\"SET ^_BLOBS(1)=\\\"fake\\\"\"}"
-    assertEqual ctx "SET ^_BLOBS by writer fails" (okOf rSetBlobsWriter) (Just False)
+                         "{\"command\":\"SET ^%CATALOG(1)=\\\"fake\\\"\"}"
+    assertEqual ctx "SET ^%CATALOG by writer fails" (okOf rSetBlobsWriter) (Just False)
 
-    -- Reader cannot read ^_BLOBS
+    -- Reader cannot read ^%CATALOG
     rReadBlobsReader <- http api "POST" "/v1/execute" [basicH "reader" "pw-reader", jsonCT]
-                          "{\"command\":\"WRITE ^_BLOBS(1)\"}"
-    assertEqual ctx "Read ^_BLOBS by reader fails" (okOf rReadBlobsReader) (Just False)
+                          "{\"command\":\"WRITE ^%CATALOG(1)\"}"
+    assertEqual ctx "Read ^%CATALOG by reader fails" (okOf rReadBlobsReader) (Just False)
 
   -- 6. Disabling host filesystem I/O statements in API sessions
   withApi "m5-file-io-disabled" id $ \api -> do
@@ -4570,11 +4670,11 @@ main = do
   runGroup ctx "Phase.Eval (Expr)" testEvalExprGroup
   runGroup ctx "Phase.Eval (Stmt & Routine)" testEvalStmtGroup
   runGroup ctx "ZMERGE / ZWRITE JSON Commands" testZMergeZWriteGroup
-  runGroup ctx "Phase.Catalog (^_CATALOG Repository & Versioning)" testCatalogGroup
+  runGroup ctx "Phase.Catalog (^%CATALOG Repository & Versioning)" testCatalogGroup
   runGroup ctx "Phase.Storage (MVCC, WAL, Transactions, Time Travel & Locks)" testStorageGroup
   runGroup ctx "$CHILDCOUNT intrinsic" testChildCountGroup
   runGroup ctx "REF(...) dynamic references (Part VI §1)" testRefDynamicGroup
-  runGroup ctx "Security (null subscripts, ^_CATALOG ownership, last-admin safeguard)" testSecurityGroup
+  runGroup ctx "Security (null subscripts, ^%CATALOG ownership, last-admin safeguard)" testSecurityGroup
   runGroup ctx "Naked references and $PIECE/$EXTRACT SET targets" testNakedAndLvalueGroup
   runGroup ctx "Phase.Auth: verifyPassword constant-time (M0 Prereq 3)" testVerifyPasswordGroup
   runGroup ctx "Phase.Auth: bootstrap / authenticate (M0 Prereq 1-2)" testAuthBootstrapGroup
@@ -4596,4 +4696,3 @@ main = do
     else do
       putStrLn "\ESC[32mAll PhaseDB tests passed successfully!\ESC[0m"
       exitSuccess
-

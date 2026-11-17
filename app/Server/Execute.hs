@@ -59,7 +59,7 @@ data ExecOutcome
       }
   | ExecError !EvalError !TxId
   | ExecTimeout
-  | ExecParseError !Text
+  | ExecParseError !Int !Int !Text
   | ExecBusy                           -- ^ Engine lock wait timed out (503)
   deriving (Show)
 
@@ -71,7 +71,7 @@ data ExecOutcome
 executeOneShot :: ServerState
                -> Text   -- ^ Authenticated username
                -> Text   -- ^ Phase source
-               -> Text   -- ^ Namespace ("" → "_GLOBAL")
+               -> Text   -- ^ Namespace ("" → "%GLOBAL")
                -> Int    -- ^ Timeout in milliseconds
                -> Int    -- ^ Max output bytes
                -> IO ExecOutcome
@@ -149,8 +149,8 @@ runWithSnapshotExec ss snap0 cmd ns env0 timeoutMs fin = do
 -- environment on success (what a session continues from), 'Nothing' on
 -- any failure.
 handleResult :: ServerState -> Snapshot -> Env -> Text -> Text -> Int -> (Env -> Env) -> RunResult -> IO (ExecOutcome, Maybe Env)
-handleResult _ss _snap0 _env0 _cmd _ns _timeoutMs _fin (RunParseError msg) =
-  pure (ExecParseError msg, Nothing)
+handleResult _ss _snap0 _env0 _cmd _ns _timeoutMs _fin (RunParseError line column msg) =
+  pure (ExecParseError line column msg, Nothing)
 
 handleResult _ss snap0 _env0 _cmd _ns _timeoutMs _fin (RunError err _) =
   pure (ExecError err (seLastTx (snapEngine snap0)), Nothing)
@@ -218,8 +218,8 @@ commitWrite ss snap0 env0 cmd ns timeoutMs fin finish env = do
               else pure (locked, (finishR (seLastTx (envStorage envR')), Just envR'))
           Just (RunError err _) ->
             pure (locked, (ExecError err (seLastTx eng'), Nothing))
-          Just (RunParseError msg) ->
-            pure (locked, (ExecParseError msg, Nothing))
+          Just (RunParseError line column msg) ->
+            pure (locked, (ExecParseError line column msg, Nothing))
   pure (maybe (ExecBusy, Nothing) id mResult)
 
 -- | Flush pending WAL (masked) and atomically update the snapshot.
@@ -305,7 +305,7 @@ mkEnv :: Text -> Text -> StorageEngine -> LockTable -> Int -> Env
 mkEnv user ns eng lks maxOut =
   (initEnvWithStorage eng)
     { envCurrentUser      = user
-    , envCurrentNamespace = if T.null ns then "_GLOBAL" else ns
+    , envCurrentNamespace = if T.null ns then "%GLOBAL" else ns
     , envLocks            = lks
     , envFileIOEnabled    = False
     , envMaxOutputBytes   = Just maxOut

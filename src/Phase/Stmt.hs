@@ -96,6 +96,8 @@
 module Phase.Stmt
   ( pLine
   , parseLogicalLine
+  , parseLogicalLineAt
+  , parseErrorPosition
   ) where
 
 import Data.Char (isSpace)
@@ -103,6 +105,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Text.Parsec
+import Text.Parsec.Pos (newPos)
 import Phase.AST
 import qualified Phase.AST as AST
 import Phase.Lines (LogicalLine (..))
@@ -116,7 +119,19 @@ import Phase.Parser (PParser, caseInsensitiveKeywordString, pCallTarget, pCompar
 -- | Parse one already-joined logical line's text into a full 'Line',
 -- carrying over the depth/tag that 'Phase.Lines' already worked out.
 parseLogicalLine :: LogicalLine -> Either ParseError AST.Line
-parseLogicalLine ll = runParser (pLine ll <* eof) () "" (llText ll)
+parseLogicalLine = parseLogicalLineAt 1 1
+
+-- | Parse a logical line while retaining its physical source line in
+-- Parsec's error position.
+parseLogicalLineAt :: Int -> Int -> LogicalLine -> Either ParseError AST.Line
+parseLogicalLineAt lineNumber columnNumber ll =
+  runParser (setPosition (newPos "" lineNumber columnNumber) *> pLine ll <* eof) () "" (llText ll)
+
+-- | Extract one-based line and column coordinates from a parse failure.
+parseErrorPosition :: ParseError -> (Int, Int)
+parseErrorPosition err =
+  let pos = errorPos err
+  in (sourceLine pos, sourceColumn pos)
 
 -- | The statement-level parser for one logical line's text: repeatedly
 -- parses one full 'PredStmt' (keyword, its own postcondition, then

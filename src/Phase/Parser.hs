@@ -270,10 +270,21 @@ pAtom :: PParser Expr
 pAtom =
       try pCallExpr
   <|> pParenExpr
+  <|> try pChangedCall
   <|> pFuncCall
   <|> pStringLit
   <|> pNumberLit
   <|> (Var <$> pRef)
+
+-- | @$CHANGED(ref)@ returns the latest transaction at or before the
+-- reference's snapshot that changed the global node or one of its
+-- descendants.
+pChangedCall :: PParser Expr
+pChangedCall = do
+  name <- try ("$CHANGED" <$ caseInsensitiveKeywordString "$CHANGED")
+      <|> ("LCHANGED" <$ caseInsensitiveKeywordString "LCHANGED")
+  args <- between (char '(') (char ')') (pExpr `sepBy` char ',')
+  pure (FuncCall name args)
 
 -- | Argument to a call: pass-by-reference (&ref, Part II §2) or pass-by-value (expression).
 --
@@ -520,8 +531,8 @@ pRef = try pRefDynamic <|> try pNamespaceGlobal <|> try pNakedGlobal <|> pBareGl
 
 -- | A namespace-or-tag identifier. Allows a LEADING '_' (same reasoning
 -- as 'pIdentifier': nothing can sit to its left, so it can never be
--- the concatenation operator) so that @_GLOBAL@, the Catalog's root
--- namespace, can be written explicitly: @CALL FOOBAR^_GLOBAL(X)@.
+-- the concatenation operator) so that @%GLOBAL@, the Catalog's root
+-- namespace, can be written explicitly: @CALL FOOBAR^%GLOBAL(X)@.
 pNamespaceIdentifier :: PParser Text
 pNamespaceIdentifier = do
   c0 <- letter <|> char '%' <|> char '_'
@@ -534,7 +545,7 @@ pNamespaceIdentifier = do
 -- than reimplemented there), so fixing it here fixes every call site
 -- at once.
 --
--- Allows a LEADING '_' (so @^_CATALOG@/@^_CONFIG@/@^_USERS@-style
+-- Allows a LEADING '_' (so @^%CATALOG@/@^%CONFIG@/@^%USERS@-style
 -- special-global names, previously unreachable from real Phase source
 -- text, now parse) but deliberately NOT an internal one after the
 -- first character. This distinction matters: '_' is ALSO the string
@@ -544,16 +555,16 @@ pNamespaceIdentifier = do
 -- ambiguous between "one identifier named A_B" and "A concatenated
 -- with B". A LEADING underscore has no such ambiguity: concatenation
 -- always needs a real operand on both sides, and there is nothing to
--- the left of the very first character of a name, so @_USERS@ read on
+-- the left of the very first character of a name, so @%USERS@ read on
 -- its own can only ever be one identifier, never a concatenation.
 -- This was a real, previously-invisible bug: the whole "special
 -- global" convention this codebase already relies on used names that
 -- could never actually be written in a real Phase script, because
--- @^_CATALOG@ and friends were ONLY ever constructed directly in
+-- @^%CATALOG@ and friends were ONLY ever constructed directly in
 -- Haskell (e.g. 'Phase.Catalog.catalogGlobalName' as a literal
 -- 'Text'), never round-tripped through this parser, so nothing ever
 -- exercised this path until an admin tried to
--- @WRITE ^_USERS(...)@ directly from a script and hit a raw parse
+-- @WRITE ^%USERS(...)@ directly from a script and hit a raw parse
 -- error instead of reaching the special global they were plainly
 -- meant to be able to name.
 pIdentifier :: PParser Text

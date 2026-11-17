@@ -1,0 +1,107 @@
+@startuml
+title Arquitectura de PhaseDB: motor de base de datos y servidor HTTP
+
+top to bottom direction
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam wrapWidth 190
+
+actor "Usuario de la REPL" as UsuarioREPL
+actor "Cliente HTTP" as ClienteHTTP
+database "Archivo .db\nWAL binario y puntos de control" as ArchivoDB
+
+package "Puntos de entrada" as Entradas {
+  component "REPL\napp/Main.hs" as REPL
+  component "Servidor HTTP\napp/Server.hs" as Servidor
+  component "Warp / Warp-TLS\nHTTP(S)" as Warp
+}
+
+package "Servidor HTTP (app/Server)" as Api {
+  component "Rutas y manejadores\nServer.Routes\nWAI / API v1" as Rutas
+  component "Autenticación\nServer.Auth" as AuthHTTP
+  component "Sesiones\nServer.Session" as Sesiones
+  component "Ejecución de solicitudes\nServer.Execute" as ExecHTTP
+  component "JSON y configuración\nServer.Json / Server.Config" as JsonConfig
+  component "Estado compartido\nServer.State\nIORef: instantánea confirmada\nMVar: bloqueo de confirmación\nTVar: sesiones" as EstadoHTTP
+}
+
+package "Núcleo PhaseDB (biblioteca)" as Nucleo {
+  component "Ejecución de comandos\nPhase.Exec" as ExecPhase
+  component "Líneas lógicas\nPhase.Lines" as Lineas
+  component "Parser de expresiones y sentencias\nPhase.Parser / Phase.Stmt" as Parser
+  component "Evaluador\nPhase.Eval" as Evaluador
+  component "Entorno de ejecución\nPhase.State" as Entorno
+  component "Catálogo y rutinas\nPhase.Catalog" as Catalogo
+  component "Usuarios y roles\nPhase.Auth" as AuthPhase
+}
+
+package "Motor de almacenamiento" as Almacenamiento {
+  component "Motor\nPhase.Storage.Engine\nMVCC, lecturas históricas,\nrecuperación y puntos de control" as Motor
+  component "Árboles globales dispersos\nPhase.Tree" as Arboles
+  component "Transacciones y conflictos\nPhase.Storage.Transaction" as Tx
+  component "WAL binario y recuperación\nPhase.Storage.WAL" as WAL
+  component "Tipos y registros\nPhase.Storage.Types" as Tipos
+  component "Sincronización a disco\nPhase.Storage.Sync" as Sync
+  component "LOCK / UNLOCK\nPhase.Storage.Lock" as Locks
+}
+
+UsuarioREPL --> REPL : comandos Phase
+ClienteHTTP --> Warp : solicitud HTTP / HTTPS
+Servidor --> Warp : inicia la aplicación WAI
+Warp --> Rutas : solicitud
+Rutas --> AuthHTTP : credenciales Basic / Bearer
+Rutas --> Sesiones : token y estado de sesión
+Rutas --> JsonConfig : cuerpo, límites y respuestas JSON
+Rutas --> ExecHTTP : comando autenticado
+ExecHTTP --> EstadoHTTP : lee instantánea / serializa escrituras
+ExecHTTP --> ExecPhase : runCommandNoFlush
+AuthHTTP --> AuthPhase : verifica usuarios y roles
+EstadoHTTP --> Sesiones : tabla concurrente
+EstadoHTTP --> Locks : tabla compartida de LOCK
+
+REPL --> Nucleo : usa directamente módulos Phase
+ExecPhase --> Lineas : normaliza la entrada
+Lineas --> Parser : líneas lógicas
+Parser --> Evaluador : AST
+Evaluador --> Entorno : evalúa y actualiza Env
+Evaluador --> Catalogo : busca rutinas y funciones
+ExecPhase --> Catalogo : registra tags y rutinas
+Nucleo --> Motor : globales, catálogo y usuarios
+Entorno --> Locks : LOCK / UNLOCK por job
+
+Servidor --> Motor : bloqueo exclusivo y apertura de .db
+REPL --> Motor : bloqueo exclusivo y apertura de .db
+EstadoHTTP --> Motor : publica la instantánea confirmada
+Motor --> Arboles : estado global en memoria
+Motor --> Tx : cambios y validación de EXPECTING
+Motor --> Tipos : TxId, revisiones y operaciones WAL
+Motor --> WAL : reproduce y agrega registros
+WAL --> Sync : vacía y sincroniza el archivo
+WAL --> ArchivoDB : confirmaciones y puntos de control
+Motor --> ArchivoDB : compactación y recuperación
+
+note right of ExecHTTP
+  Flujo de ejecución HTTP:
+  1. Ejecuta sobre una instantánea sin bloquear lectores.
+  2. Si no hay escritura, devuelve el resultado.
+  3. Si hay escritura, toma el bloqueo de confirmación.
+  4. Si la instantánea cambió, reejecuta una vez bajo el bloqueo.
+  5. Vacía el WAL y publica la nueva instantánea.
+  Los errores o tiempos de espera descartan el entorno.
+end note
+
+note right of WAL
+  El archivo .db conserva registros binarios con prefijo de longitud.
+  Los puntos de control se intercalan con los registros de cambios.
+  Al abrir, el motor recupera el archivo y reproduce los cambios
+  posteriores al último punto de control.
+end note
+
+legend bottom
+  Las flechas muestran dependencias y flujo de datos principales,
+  no una secuencia temporal exacta. La REPL y HTTP son dos entradas
+  distintas al núcleo PhaseDB; ambas usan el mismo motor persistente.
+endlegend
+@enduml

@@ -36,6 +36,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Calendar (diffDays, fromGregorian)
 import Data.Time.Clock (utctDay, utctDayTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 
 import Phase.AST
 import Phase.Catalog
@@ -44,6 +45,7 @@ import Phase.Lines (buildLogicalLines)
 import Phase.State
 import Phase.Stmt (parseLogicalLine)
 import Phase.Storage.Lock (acquireLocks, releaseAllOwnerLocks, releaseLocks)
+import Phase.Storage.Engine (transactionTimestamp)
 import Phase.Storage.Types (GlobalPath (..), TxId)
 import Phase.Value
 
@@ -673,7 +675,17 @@ resolveIntrinsicRef (RefNaked subExprs) = do
   mTx <- implicitPin kind name
   pure (kind, name, subs, mTx)
 
-evalIntrinsic :: Text -> [Expr] -> Eval PValue
+evalIntrinsic fn [Var ref] | fn `elem` ["$CHANGED", "LCHANGED"] = do
+  (kind, targetName, subs, mTx) <- resolveIntrinsicRef ref
+  if kind /= Global
+    then throwError (SyntaxError "$CHANGED requires a global reference")
+    else do
+      env <- getEnv
+      result <- liftIO (latestChangedAtTxRef mTx targetName subs env)
+      case result of
+        Left err -> throwError err
+        Right tx -> pure (mkValue (T.pack (show tx)))
+
 evalIntrinsic "$DATA" [Var ref] = do
   (kind, targetName, subs, mTx) <- resolveIntrinsicRef ref
   case mTx of
@@ -790,6 +802,17 @@ evalIntrinsic "$JOB" [] = do
 evalIntrinsic "$TX" [] = do
   env <- getEnv
   pure (mkValue (envTxId env))
+
+evalIntrinsic "$WHEN" [txExpr] = do
+  txVal <- evalExpr txExpr
+  let txNumber = round (Sci.toRealFloat (toNumber txVal) :: Double) :: Integer
+  if txNumber <= 0 || txNumber > fromIntegral (maxBound :: TxId)
+    then pure (mkValue "")
+    else do
+      env <- getEnv
+      mTimestamp <- liftIO
+        (transactionTimestamp (fromIntegral txNumber) (envStorage env))
+      pure (mkValue (maybe "" (T.pack . iso8601Show) mTimestamp))
 
 evalIntrinsic "$HOROLOG" [] = do
   env <- getEnv
@@ -1163,7 +1186,7 @@ evalStmt (SRetry mCount seedExprs) _ _ = do
           let limit = retryLimit env
           when (envRetryCount env >= limit) $
             throwError (CustomError ("RETRY limit reached: this block has already been re-entered "
-                                     <> T.pack (show limit) <> " times (^_CONFIG(\"retry\",\"max\"))"))
+                                     <> T.pack (show limit) <> " times (^%CONFIG(\"retry\",\"max\"))"))
           seeds <- mapM (\(f, e) -> (,) f <$> evalExpr e) seedExprs
           modifyEnv (\e -> e { envRetry = Just seeds })
           pure (QuitFrame Nothing)

@@ -27,6 +27,8 @@ module Phase.Storage.Engine
     -- * Time Travel (Part VII)
   , readAtTx
   , readAtTime
+  , latestChangedAtTx
+  , transactionTimestamp
   , dataAtTx
   , orderAtTx
   , getTreeAtTx
@@ -476,6 +478,87 @@ readAtTxResident targetTx global subs eng =
                   Just val -> Right val
                   Nothing  -> Left (StorageUndefinedVar global subs)
 
+-- | Find the latest transaction at or before 'targetTx' that changed
+-- the named path itself or any descendant. Returns 0 when no matching
+-- change exists in the retained history.
+latestChangedAtTx :: TxId -> Text -> [PValue] -> StorageEngine -> IO TxId
+latestChangedAtTx targetTx global subs eng = do
+  let resident = latestChangedAtTxResident targetTx global subs eng
+  if resident > 0 || targetTx == 0
+    then pure resident
+    else case seWalPath eng of
+      Nothing -> pure resident
+      Just path -> do
+        records <- readWalRecords path
+        let (baseEngine, recordsToTarget) = case findCheckpointBeforeTx targetTx records of
+              Just (idx, cpTx, cpTs, cpEntries) ->
+                ( (loadCheckpointEntries cpTs cpEntries initStorageEngine) { seLastTx = cpTx }
+                , drop (idx + 1) records
+                )
+              Nothing -> (initStorageEngine, records)
+            deepEngine = replayFrom baseEngine (takeWhileUpToTx targetTx recordsToTarget)
+        pure (latestChangedAtTxResident targetTx global subs deepEngine)
+
+-- | Look up the commit timestamp for a transaction. Prefer exact commit
+-- markers in the WAL (including queued records); retained MVCC revisions
+-- provide the best available timestamp for compacted or in-memory history.
+transactionTimestamp :: TxId -> StorageEngine -> IO (Maybe UTCTime)
+transactionTimestamp tx eng
+  | tx == 0 = pure Nothing
+  | otherwise = do
+      let pending = timestampInRecords (sePendingWal eng)
+      case pending of
+        Just timestamp -> pure (Just timestamp)
+        Nothing -> case seWalPath eng of
+          Nothing -> pure (timestampInHistory tx eng)
+          Just path -> do
+            records <- readWalRecords path
+            pure (timestampInRecords records `orElse` timestampInHistory tx eng)
+  where
+    timestampInRecords records =
+      foldl' pick Nothing records
+      where
+        pick found (WalRecord _ (WalCommit committedTx timestamp _))
+          | committedTx == tx = Just timestamp
+          | otherwise = found
+        pick found (WalRecord _ (WalCheckpoint checkpointTx timestamp _))
+          | checkpointTx == tx = Just timestamp
+          | otherwise = found
+        pick found _ = found
+
+    timestampInHistory target engine =
+      case
+        [ revTimestamp revision
+        | revisions <- Map.elems (seHistory engine)
+        , revision <- revisions
+        , revTx revision == target
+        ] of
+        (timestamp : _) -> Just timestamp
+        [] -> Nothing
+
+    orElse (Just value) _ = Just value
+    orElse Nothing alternative = alternative
+
+latestChangedAtTxResident :: TxId -> Text -> [PValue] -> StorageEngine -> TxId
+latestChangedAtTxResident targetTx global subs eng =
+  let prefix = map toSubKey subs
+      withinPath (g, path) =
+        g == global && take (length prefix) path == prefix
+      historicalTxs =
+        [ revTx revision
+        | (path, revisions) <- Map.toList (seHistory eng)
+        , withinPath path
+        , revision <- revisions
+        , revTx revision <= targetTx
+        ]
+      latestTxs =
+        [ tx
+        | (path, tx) <- Map.toList (seLastTxMap eng)
+        , withinPath path
+        , tx <= targetTx
+        ]
+  in foldl' max 0 (historicalTxs ++ latestTxs)
+
 -- | Reconstruct the complete global 'Node' tree as it existed at a past transaction ID.
 getTreeAtTx :: TxId -> Text -> StorageEngine -> IO (Maybe Node)
 getTreeAtTx targetTx global eng
@@ -867,12 +950,12 @@ flushWal eng =
 -- --------------------------------------------------------------------
 
 -- | Read the configured commit/byte checkpoint thresholds from
--- @^_CONFIG("checkpoint","commits")@ / @^_CONFIG("checkpoint","bytes")@
+-- @^%CONFIG("checkpoint","commits")@ / @^%CONFIG("checkpoint","bytes")@
 --, an ordinary global, read the same way any other global is (see
 -- 'readLive'), NOT a Haskell-level config file or CLI flag. This is
 -- deliberate: it means the thresholds are configured through Phase's
--- own @SET@ syntax, consistent with how @^_CATALOG@ already stores
--- routines and @^_USERS@ stores accounts, the database configures
+-- own @SET@ syntax, consistent with how @^%CATALOG@ already stores
+-- routines and @^%USERS@ stores accounts, the database configures
 -- itself via its own data model, rather than needing an out-of-band
 -- mechanism.
 --
@@ -889,7 +972,7 @@ checkpointThresholds eng =
   where
     readPositiveConfig :: [Text] -> Maybe Int
     readPositiveConfig path =
-      case readLive "_CONFIG" (map mkValue path) eng of
+      case readLive "%CONFIG" (map mkValue path) eng of
         Left _ -> Nothing
         Right pval ->
           case reads (T.unpack (unPValue pval)) of
@@ -897,7 +980,7 @@ checkpointThresholds eng =
             _                     -> Nothing
 
 -- | After a flush, check the accumulated commit/byte counters against
--- whatever thresholds are currently configured in @^_CONFIG@, and
+-- whatever thresholds are currently configured in @^%CONFIG@, and
 -- automatically take a checkpoint (resetting both counters) if either
 -- is met or exceeded. Called from 'flushPendingWal', the one 'IO'
 -- boundary every commit path already funnels through, so this needs

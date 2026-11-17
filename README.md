@@ -55,11 +55,11 @@ Part I core is largely in place:
   `$PIECE`, `$TEST`, `$JOB`, `$TX`), plus statement-level control flow
   (`SET`, `KILL`, `WRITE`, `IF`/`ELSE`, `FOR`, `DO`, `GOTO`, `QUIT`,
   `RETURN`, `NEW`, `MERGE`).
-- `Phase.Catalog`, system global repository `^_CATALOG` for namespaces,
+- `Phase.Catalog`, system global repository `^%CATALOG` for namespaces,
   routines, functions, and constants with primitive version control.
   Every update to a function or constant automatically archives its
-  prior code and metadata into `^_CATALOG(namespace, name, "HISTORY", version)`.
-  Supports same-namespace lookup with automatic fallback to `_GLOBAL`
+  prior code and metadata into `^%CATALOG(namespace, name, "HISTORY", version)`.
+  Supports same-namespace lookup with automatic fallback to `%GLOBAL`
   (Part V), rollback (`revertItem`), and introspection via `$DATA`/`$ORDER`.
 - `Phase.Storage`, persistent MVCC storage engine, transactions, WAL,
   snapshot checkpoints, and advisory lock management:
@@ -238,7 +238,7 @@ called **without switching the active namespace with `NAMESPACE`**:
  WRITE CALL SQUARE^MATH(6),!     ; SQUARE in namespace MATH, whatever NAMESPACE is active
  DO SHOUT^MATH("hi")
  GOTO FINISH^MATH
- WRITE CALL GREETING^_GLOBAL(),! ; explicit root namespace
+ WRITE CALL GREETING^%GLOBAL(),! ; explicit root namespace
 ```
 
 Rules:
@@ -247,14 +247,14 @@ Rules:
   `MATH^SQUARE(6)` would mean tag `MATH` in namespace `SQUARE`. The
   shape `A^B` can only have one reading, so there is no namespace-first
   form.
-- The named namespace is searched first, then `_GLOBAL` (Part V
-  fallback, unchanged). `TAG^_GLOBAL` looks only in `_GLOBAL`, which is
+- The named namespace is searched first, then `%GLOBAL` (Part V
+  fallback, unchanged). `TAG^%GLOBAL` looks only in `%GLOBAL`, which is
   what an unqualified `TAG` finds when the active namespace has no such
-  tag. It also gives a way to reach `_GLOBAL`'s version when the
+  tag. It also gives a way to reach `%GLOBAL`'s version when the
   active namespace defines a tag of the same name.
 - `CALL` stays mandatory in expression position. `$$TAG^NS(...)` is
   still rejected on purpose (handbook: `$$` is out of scope).
-- `_GLOBAL` can now be written after `^`; `pNamespaceIdentifier`
+- `%GLOBAL` can now be written after `^`; `pNamespaceIdentifier`
   previously rejected a leading underscore.
 - Bare `GOTO ^NAMESPACE` / `DO ^NAMESPACE` (line-0 entry) is still
   unsupported and reports `<UNDEFINED ROUTINE>`.

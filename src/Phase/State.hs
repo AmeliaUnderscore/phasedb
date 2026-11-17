@@ -22,7 +22,9 @@ module Phase.State
     -- * Variable & Storage Access
   , readRef
   , writeRef
+  , writeCatalogRef
   , killRef
+  , killCatalogRef
   , killAllLocals
   , dataRef
   , orderRef
@@ -34,6 +36,7 @@ module Phase.State
   , effectivePin
   , enterPinScope
   , readAtTxRef
+  , latestChangedAtTxRef
   , dataAtTxRef
   , orderAtTxRef
 
@@ -69,6 +72,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Phase.AST (Line, PValue (..), VarKind (..), mkValue)
 import Phase.Auth
   ( checkCatalogAccess
+  , checkCatalogMutationAccess
   , checkReadAccess
   , checkUsersKillSafety
   , checkUsersSetSafety
@@ -87,6 +91,7 @@ import Phase.Storage.Engine
   , dataLive
   , getTreeAtTx
   , initStorageEngine
+  , latestChangedAtTx
   , orderLive
   , readAtTx
   , readLive
@@ -267,7 +272,7 @@ data Env = Env
     -- blob work does not need to touch 'Env' at all.
   , envRoutines         :: !(Map (Maybe Text) [Line]) -- ^ Loaded routines (Nothing = current script)
   , envCurrentRoutine   :: !(Maybe Text)
-  , envCurrentNamespace :: !Text       -- ^ Active namespace (defaults to "_GLOBAL", Part V)
+  , envCurrentNamespace :: !Text       -- ^ Active namespace (defaults to "%GLOBAL", Part V)
   , envPC               :: !(Int, Int) -- ^ Current (Line index, Statement index)
   , envJobId            :: !Text       -- ^ $JOB string
   , envTxId             :: !Text       -- ^ $TX string
@@ -367,12 +372,12 @@ data Env = Env
 -- real wall-clock time (most of them) can use this default as-is.
 --
 -- Similarly sets 'envCurrentUser' to a fixed, unprivileged-by-default
--- placeholder ("_nobody") rather than an empty string, an empty
+-- placeholder ("%nobody") rather than an empty string, an empty
 -- username is exactly the kind of value that could accidentally
 -- collide with something meaningful elsewhere (e.g. a lookup that
 -- silently treats "no user set" as "the default user"), whereas a
 -- name that can never be a REAL registered account name (usernames
--- come from @^_USERS@'s own subscripts, which a real login always
+-- come from @^%USERS@'s own subscripts, which a real login always
 -- populates with something a person typed) fails safe: every
 -- permission check simply denies it, exactly as it should for a
 -- session nobody has actually authenticated. A real interactive
@@ -398,12 +403,12 @@ initEnvWithStorage storage = Env
   , envFileIOEnabled    = True
   , envRoutines         = Map.empty
   , envCurrentRoutine   = Nothing
-  , envCurrentNamespace = "_GLOBAL"
+  , envCurrentNamespace = "%GLOBAL"
   , envPC               = (0, 0)
   , envJobId            = "1"
   , envTxId             = T.pack (show (seLastTx storage))
   , envNow              = posixSecondsToUTCTime 0
-  , envCurrentUser      = "_nobody"
+  , envCurrentUser      = "%nobody"
   , envPinnedTx         = Nothing
   , envPinOverrides     = Map.empty
   , envBindScope        = Nothing
@@ -418,12 +423,12 @@ initEnvWithStorage storage = Env
 
 -- | The ceiling on how many times one handled block may be re-entered by
 -- RETRY, a guard against a handler that retries forever on an error that
--- never goes away. Read from @^_CONFIG("retry","max")@, an ordinary
+-- never goes away. Read from @^%CONFIG("retry","max")@, an ordinary
 -- global like the checkpoint thresholds (so it is set with Phase's own
 -- SET, by an administrator); 1000 when unset or not a positive integer.
 retryLimit :: Env -> Int
 retryLimit env =
-  case readLive "_CONFIG" [mkValue "retry", mkValue "max"] (envStorage env) of
+  case readLive "%CONFIG" [mkValue "retry", mkValue "max"] (envStorage env) of
     Right v | [(n, "")] <- reads (T.unpack (unPValue v)), n > 0 -> n
     _                                                           -> 1000
 
@@ -441,7 +446,7 @@ resolveLocalName name env =
 -- | Read a value from a local or global variable at a given subscript path.
 -- | Read a local or global variable. Global reads go through
 -- 'Phase.Auth.checkReadAccess' first (role level + per-global
--- denylist + the hardcoded @^_USERS@/@^_CONFIG@ admin-only rule),
+-- denylist + the hardcoded @^%USERS@/@^%CONFIG@ admin-only rule),
 -- local reads need no such check, since locals are per-session and
 -- never shared/protected data.
 readRef :: VarKind -> Text -> [PValue] -> Env -> Either EvalError PValue
@@ -567,6 +572,18 @@ readAtTxRef tx name subs env =
         Right val -> Right val
         Left _    -> Left (UndefinedVariable ("^[" <> T.pack (show tx) <> "]" <> name) subs)
 
+-- | Find the latest change in a global subtree at a transaction, subject
+-- to the same global read permissions as ordinary and time-travel reads.
+latestChangedAtTxRef :: Maybe TxId -> Text -> [PValue] -> Env -> IO (Either EvalError TxId)
+latestChangedAtTxRef mTx name subs env =
+  case checkReadAccess (envCurrentUser env) name (envStorage env) of
+    Just reason -> pure (Left (PermissionDenied (envCurrentUser env) reason))
+    Nothing -> Right <$> latestChangedAtTx
+      (maybe (seLastTx (envStorage env)) id mTx)
+      name
+      subs
+      (envStorage env)
+
 -- | @$ORDER@ as of a past transaction ID (see
 -- 'Phase.Storage.Engine.orderAtTx'). A global the user may not read
 -- yields the empty string, same as the live 'orderRef' does for a
@@ -596,9 +613,9 @@ dataAtTxRef tx name subs env =
 -- 'Nothing' for the new value means this is a KILL, not a SET.
 checkReservedGlobalWrite :: Text -> [PValue] -> Maybe PValue -> Env -> Maybe Text
 checkReservedGlobalWrite rawName subs mNewVal env
-  | rawName == "_CATALOG" =
+  | rawName == "%CATALOG" =
       checkCatalogAccess (lookupUserRole (envCurrentUser env) (envStorage env)) subs (envStorage env)
-  | rawName == "_USERS" =
+  | rawName == "%USERS" =
       case mNewVal of
         Just newVal -> checkUsersSetSafety subs newVal (envStorage env)
         Nothing     -> checkUsersKillSafety subs (envStorage env)
@@ -606,13 +623,22 @@ checkReservedGlobalWrite rawName subs mNewVal env
 
 -- | Write a value to a local or global variable at a given subscript
 -- path. Global writes go through 'Phase.Auth.checkWriteAccess' (and,
--- for @^_CATALOG@/@^_USERS@, 'checkReservedGlobalWrite') first;
+-- for @^%CATALOG@/@^%USERS@, 'checkReservedGlobalWrite') first;
 -- denial returns 'Left' with no change to 'Env' at all. Rejects a
 -- null-string subscript anywhere in the path, for either kind.
 writeRef :: VarKind -> Text -> [PValue] -> PValue -> Env -> Either EvalError Env
-writeRef _ rawName subs _ _
+writeRef = writeRefWith False
+
+-- | Write one catalog value on behalf of 'Phase.Catalog'. This trusted
+-- path skips only the global-level restrictions; role, denylist, and
+-- subscript-aware catalog ownership checks still apply.
+writeCatalogRef :: [PValue] -> PValue -> Env -> Either EvalError Env
+writeCatalogRef = writeRefWith True Global "%CATALOG"
+
+writeRefWith :: Bool -> VarKind -> Text -> [PValue] -> PValue -> Env -> Either EvalError Env
+writeRefWith _ _ rawName subs _ _
   | any (T.null . unPValue) subs = Left (NullSubscript rawName subs)
-writeRef kind rawName subs val env =
+writeRefWith catalogApiWrite kind rawName subs val env =
   case kind of
     Local ->
       let name = resolveLocalName rawName env
@@ -620,7 +646,7 @@ writeRef kind rawName subs val env =
           node' = setNode subs val node
       in Right env { envLocals = Map.insert name node' (envLocals env) }
     Global ->
-      case checkWriteAccess (envCurrentUser env) rawName (envStorage env)
+      case globalWriteCheck catalogApiWrite rawName env
              `mplus` checkReservedGlobalWrite rawName subs (Just val) env of
         Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
         Nothing ->
@@ -651,10 +677,29 @@ writeRef kind rawName subs val env =
                          node' = setNode subs val node
                      in Right env { envGlobals = Map.insert rawName node' (envGlobals env) }
 
+globalWriteCheck :: Bool -> Text -> Env -> Maybe Text
+globalWriteCheck True "%CATALOG" env =
+  checkCatalogMutationAccess (envCurrentUser env) (envStorage env)
+globalWriteCheck False "%CATALOG" env
+  | not (envFileIOEnabled env) =
+      Just "%CATALOG is managed by the blob API; use PUT /v1/blobs to add blobs"
+  | otherwise =
+      checkCatalogMutationAccess (envCurrentUser env) (envStorage env)
+globalWriteCheck _ rawName env =
+  checkWriteAccess (envCurrentUser env) rawName (envStorage env)
+
 -- | Delete a variable or subscripted subtree. Same permission
 -- treatment as 'writeRef'.
 killRef :: VarKind -> Text -> [PValue] -> Env -> Either EvalError Env
-killRef kind rawName subs env =
+killRef = killRefWith False
+
+-- | Delete a catalog value on behalf of 'Phase.Catalog', with the same
+-- scoped authorization as 'writeCatalogRef'.
+killCatalogRef :: [PValue] -> Env -> Either EvalError Env
+killCatalogRef = killRefWith True Global "%CATALOG"
+
+killRefWith :: Bool -> VarKind -> Text -> [PValue] -> Env -> Either EvalError Env
+killRefWith catalogApiWrite kind rawName subs env =
   case kind of
     Local ->
       let name = resolveLocalName rawName env
@@ -665,7 +710,7 @@ killRef kind rawName subs env =
             Nothing    -> Right env { envLocals = Map.delete name (envLocals env) }
             Just node' -> Right env { envLocals = Map.insert name node' (envLocals env) }
     Global ->
-      case checkWriteAccess (envCurrentUser env) rawName (envStorage env)
+      case globalWriteCheck catalogApiWrite rawName env
              `mplus` checkReservedGlobalWrite rawName subs Nothing env of
         Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
         Nothing ->
@@ -759,7 +804,7 @@ childCountRef kind rawName subs env =
 --
 -- * every merged path goes through the same per-value reserved-global
 --   checks a SET does ('checkReservedGlobalWrite', the last-admin
---   safeguard on @^_USERS@, ownership on @^_CATALOG@), ALL of them
+--   safeguard on @^%USERS@, ownership on @^%CATALOG@), ALL of them
 --   before anything is written, so a refused leaf means nothing at all
 --   was merged;
 -- * inside an active transaction the paths are STAGED, like 'writeRef'
@@ -801,7 +846,7 @@ mergeRef (dstKind, dstRawName, dstSubs) (srcKind, srcRawName, srcSubs) env = do
       -- Every value under the source path, as a destination path + value.
       let leaves = [ (dstSubs ++ rel, val)
                    | (rel, val) <- maybe [] dumpTree (findSubNode srcSubs srcRoot) ]
-      case checkWriteAccess (envCurrentUser env) dstRawName (envStorage env) of
+      case globalWriteCheck False dstRawName env of
         Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
         Nothing -> Right ()
       case [ r | (subs, val) <- leaves
@@ -850,7 +895,7 @@ mergeJsonRef (dstKind, dstRawName, dstSubs) jsonVal env =
           dstRoot' = mergeNode dstSubs dstRoot [] jsonTree
       in Right env { envLocals = Map.insert dstName dstRoot' (envLocals env) }
     Global -> do
-      case checkWriteAccess (envCurrentUser env) dstRawName (envStorage env) of
+      case globalWriteCheck False dstRawName env of
         Just reason -> Left (PermissionDenied (envCurrentUser env) reason)
         Nothing -> Right ()
       let leaves = [ (dstSubs ++ rel, val) | (rel, val) <- dumpTree jsonTree ]

@@ -335,9 +335,9 @@ handleCreateSession ss guard uRef reqId req respond = do
                                   , envFileIOEnabled = False
                                   }
                   now <- getCurrentTime
-                  (token, _digest) <- newSession user "_GLOBAL" initEnv (ssSessions ss)
+                  (token, _digest) <- newSession user "%GLOBAL" initEnv (ssSessions ss)
                   let expiresAt = addUTCTime (fromIntegral maxS) now
-                  respond (jsonCreated (sessionBody token expiresAt idleS user (roleToText role) "_GLOBAL" reqId))
+                  respond (jsonCreated (sessionBody token expiresAt idleS user (roleToText role) "%GLOBAL" reqId))
 
 -- --------------------------------------------------------------------
 -- GET /v1/sessions/current  (M2)
@@ -796,10 +796,10 @@ handlePutBlob ss guard uRef reqId req respond = do
                         Nothing -> do
                           now <- getCurrentTime
                           let metaWrites =
-                                [ (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "size")]), (mkValue (T.pack (show (BS.length bs))), Nothing))
-                                , (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "contentType")]), (mkValue (TE.decodeUtf8 contentType), Nothing))
+                                [ (("%CATALOG", [toSubKey (mkValue hexHash), toSubKey (mkValue "size")]), (mkValue (T.pack (show (BS.length bs))), Nothing))
+                                , (("%CATALOG", [toSubKey (mkValue hexHash), toSubKey (mkValue "contentType")]), (mkValue (TE.decodeUtf8 contentType), Nothing))
                                 ] ++
-                                [ (("_BLOBS", [toSubKey (mkValue hexHash), toSubKey (mkValue "filename")]), (mkValue (TE.decodeUtf8 fn), Nothing))
+                                [ (("%CATALOG", [toSubKey (mkValue hexHash), toSubKey (mkValue "filename")]), (mkValue (TE.decodeUtf8 fn), Nothing))
                                 | Just fn <- [mFilename]
                                 ]
                               refWrites = case mRef of
@@ -864,7 +864,7 @@ handleGetBlobRef isHead ss guard uRef reqId req respond = do
                             Nothing ->
                               respond (jsonErr status404 (transportError "NOT_FOUND" "blob data not found" reqId))
                             Just bs -> do
-                              let ctype = case readLive "_BLOBS" [mkValue hexHash, mkValue "contentType"] eng of
+                              let ctype = case readLive "%CATALOG" [mkValue hexHash, mkValue "contentType"] eng of
                                     Right ct -> TE.encodeUtf8 (unPValue ct)
                                     Left _   -> "application/octet-stream"
                                   hdrs = [ (hContentType, ctype)
@@ -887,7 +887,7 @@ handleGetBlobHash isHead ss guard uRef reqId rawHash req respond =
           Nothing ->
             respond (jsonErr status404 (transportError "NOT_FOUND" "blob not found" reqId))
           Just bs -> do
-            let ctype = case readLive "_BLOBS" [mkValue hexHash, mkValue "contentType"] eng of
+            let ctype = case readLive "%CATALOG" [mkValue hexHash, mkValue "contentType"] eng of
                   Right ct -> TE.encodeUtf8 (unPValue ct)
                   Left _   -> "application/octet-stream"
                 hdrs = [ (hContentType, ctype)
@@ -909,8 +909,8 @@ outcomeResponse reqId elapsed lastTx = \case
     jsonOk (errorEnvelope err tx elapsed reqId)
   ExecTimeout ->
     jsonOk (serverErrorEnvelope "TIMEOUT" "<TIMEOUT> execution timed out" lastTx elapsed reqId)
-  ExecParseError msg ->
-    jsonOk (errorEnvelope (SyntaxError msg) lastTx elapsed reqId)
+  ExecParseError line column msg ->
+    jsonOk (errorEnvelopeAt (SyntaxError msg) line column lastTx elapsed reqId)
   ExecBusy ->
     jsonErr status503 (transportError "BUSY" "server is busy, try again" reqId)
 

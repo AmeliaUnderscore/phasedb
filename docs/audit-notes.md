@@ -20,7 +20,7 @@ items 1 and 2 are dormant.
    (so `^[-N]`, time travel and `EXPECTING` never saw it), lost a SET
    already staged against the same global inside a transaction, wrote
    uncommitted staged data into `seLive`, and skipped the per-value
-   `^_USERS` last-admin check a SET gets. Now a global `MERGE` is the
+   `^%USERS` last-admin check a SET gets. Now a global `MERGE` is the
    sequence of SETs it stands for: validated per merged path before
    anything is written, staged inside a transaction, and otherwise ONE
    atomic `commitTransaction` (one TxId). See CHANGELOG.
@@ -113,7 +113,7 @@ Reachable today unless marked latent.
     refuses to `KILL` or demote the database's SOLE remaining admin
     account (`checkUsersKillSafety`/`checkUsersSetSafety`, wired into
     `Phase.State.writeRef`/`killRef`), so an admin can no longer lock
-    themselves out even by accident. `_USERS` writes/kills already
+    themselves out even by accident. `%USERS` writes/kills already
     require `RAdmin` (`isHardcodedAdminOnlyGlobal`), so this only ever
     fires for an admin acting on themselves.
 24. No login throttling or lockout; the PBKDF2 cost is the only brake.
@@ -133,11 +133,11 @@ Reachable today unless marked latent.
 27. **Fixed, per the team's decision: non-admins keep catalog write access
     (the only way to define their own routines), but a definition an
     admin has authored is now protected.** `defineItem` records
-    `^_CATALOG(ns,name,"AUTHOR_ROLE")` on every write and refuses a
+    `^%CATALOG(ns,name,"AUTHOR_ROLE")` on every write and refuses a
     non-admin's attempt to replace an item whose current version is
     admin-authored (`Phase.Auth.checkCatalogAccess`, called from inside
     `defineItem` itself, so `revertItem` inherits it automatically). A
-    RAW `SET`/`KILL`/`MERGE` that reaches `^_CATALOG` directly --
+    RAW `SET`/`KILL`/`MERGE` that reaches `^%CATALOG` directly --
     bypassing `defineItem` entirely, which is how this was originally
     exploitable -- goes through the same check, wired into
     `Phase.State.writeRef`/`killRef`/`mergeRef`. A write that doesn't

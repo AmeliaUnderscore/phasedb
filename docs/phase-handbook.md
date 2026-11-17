@@ -594,7 +594,7 @@ END DO
 `RETRY n TIMES` lets the block run `n+1` times in total. Once `n`
 re-entries are used up, the `RETRY` does nothing and the handler body
 continues past it. A plain `RETRY` has a ceiling of
-`^_CONFIG("retry","max")` (default 1000) to prevent infinite loops on
+`^%CONFIG("retry","max")` (default 1000) to prevent infinite loops on
 errors that never resolve.
 
 `RETRY` is valid only inside a `HANDLE` body, not in `CATCH`, not in
@@ -816,12 +816,41 @@ WRITE ^[-1]ORDERS(1,"STATUS"),!  ; -> SHIPPED    (one commit back)
 WRITE ^[-2]ORDERS(1,"STATUS"),!  ; -> PENDING    (two commits back)
 ```
 
+For a complete subtree snapshot, use `DO WITH @TX(...)` and `ZWRITE`
+inside the pinned block. `$CHANGED(ref)` returns the greatest transaction
+at or before the reference's snapshot that changed that node or any of
+its descendants; it returns `0` when no earlier change exists. This lets
+a routine walk a record's history, including changes to child fields:
+
+```
+SET tx=$TX
+FOR
+. SET tx=$CHANGED(^[tx]ORDERS(id))
+. QUIT:tx=0
+. DO WITH @TX(tx) @BIND(^ORDERS)
+.. ZWRITE ^ORDERS(id)
+. SET tx=tx-1
+```
+
+`$CHANGED` includes a change made at the supplied snapshot. After each
+iteration, decrement the upper bound before searching again so the next
+call finds an earlier transaction. Without `@BIND(...)`, the block pins
+all globals; with it, only the named globals are pinned.
+
 `$TX` returns the last-committed transaction id as a string:
 
 ```
 SET snapshot=$TX
 ; ... more writes happen ...
 WRITE ^[snapshot]ORDERS(1,"STATUS"),!   ; reads the state at snapshot time
+```
+
+`$WHEN(tx)` returns the ISO-8601 UTC commit timestamp for a retained
+transaction, or `""` when the transaction has no retained timestamp:
+
+```
+SET changedAt=$CHANGED(^ORDERS(id))
+WRITE $WHEN(changedAt),!
 ```
 
 ## 2. Timestamps
@@ -1064,8 +1093,11 @@ ZWRITE ^CUSTOMERS(3,"balance")
 **Time-travel references are fully supported:**
 
 ```
-ZWRITE ^[-1]CUSTOMERS(3)        ; the subtree one commit ago
-ZWRITE ^[50]CUSTOMERS(3)        ; as of transaction 50
+DO WITH @TX(^[-1]CUSTOMERS(3)) @BIND(^CUSTOMERS)
+. ZWRITE ^CUSTOMERS(3)
+
+DO WITH @TX(50) @BIND(^CUSTOMERS)
+. ZWRITE ^CUSTOMERS(3)
 ```
 
 **Bare `ZWRITE`** dumps every local variable as `name=json` pairs:
@@ -1230,6 +1262,7 @@ MUMPS systems and is documented as accepted, not a bug.
 | `$HOROLOG` | `"days,seconds"`, days since 1840-12-31 and seconds since midnight                |
 | `$JOB`     | The current session's job identifier string                                         |
 | `$TX`      | The last-committed transaction id, as a string, used with time-travel brackets     |
+| `$WHEN(tx)` | ISO-8601 UTC commit timestamp for a retained transaction, or `""` if unavailable |
 
 Any other bare `$NAME` throws `<UNDEFINED VARIABLE>`.
 
@@ -1239,6 +1272,7 @@ Any other bare `$NAME` throws `<UNDEFINED VARIABLE>`.
 |-----------------------------------|-------|---------------------------------------------------------------------------------------------------------|
 | `$DATA(ref)`                      | 1     | Four-state existence check (Part I §6)                                                                  |
 | `$ORDER(ref)`                     | 1     | Next sibling subscript in collation order, or `""`. Ref must be subscripted. Not through time-travel.  |
+| `$CHANGED(ref)`                   | 1     | Latest transaction at or before the reference's snapshot that changed the global node or a descendant; `0` if none. |
 | `$GET(ref[,default])`             | 1–2   | Safe read; returns `default` (or `""`) instead of throwing on undefined. Works with time-travel refs.  |
 | `$LENGTH(str)`                    | 1     | Character count of `str`                                                                                |
 | `$EXTRACT(str[,start[,end]])`     | 1–3   | 1-indexed inclusive substring. `start` defaults to 1; `end` defaults to `start`                        |
@@ -1324,7 +1358,7 @@ phase# ^ORDERS(1,"PRICE")
 | `.quit` / `.exit`               | Close the database cleanly and exit                                          |
 | `.help`                         | Print the dot-command summary                                                |
 | `.ns`                           | Show the current namespace                                                   |
-| `.namespaces`                   | List all namespaces in `^_CATALOG`                                           |
+| `.namespaces`                   | List all namespaces in `^%CATALOG`                                           |
 | `.fns [ns]`                     | List functions and constants in a namespace                                  |
 | `.history name [ns]`            | Show version history for a catalog item                                      |
 | `.revert name ver [ns]`         | Revert a catalog item to an earlier version                                  |
@@ -1462,7 +1496,7 @@ Response (HTTP 201):
   "idleTimeoutSeconds": 1800,
   "user":               "alice",
   "role":               "write",
-  "namespace":          "_GLOBAL"
+  "namespace":          "%GLOBAL"
 }
 ```
 
@@ -1610,7 +1644,7 @@ GET /v1/admin/status
 }
 ```
 
-`source` is `flag`, `config` (from `^_CONFIG("server",…)`), or
+`source` is `flag`, `config` (from `^%CONFIG("server",…)`), or
 `default`. Status reads the committed snapshot and never waits for the
 engine lock.
 

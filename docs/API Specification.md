@@ -10,7 +10,7 @@ The API lets a remote client run Phase code as a specific PhaseDB user and get t
 
 - Run Phase source under a user's credentials, either as a single call (authenticate, run, return output) or inside a stateful session.
 - Every request is atomic and durable, as REPL input already is.
-- Use exactly the engine's existing authorization (roles, per-global denylist, admin-only `^_USERS`/`^_CONFIG`). No second permission system.
+- Use exactly the engine's existing authorization (roles, per-global denylist, admin-only `^%USERS`/`^%CONFIG`). No second permission system.
 - Admin operations that today exist only as REPL dot-commands: checkpoint, compact, add user.
 - Blob upload and download by reference (phase 2, after the blob store exists).
 
@@ -60,6 +60,14 @@ Failure of a Phase run (the run happened and the engine rejected it):
 { "ok": false, "output": "",
   "error": { "code": "DIVIDE BY ZERO", "message": "<DIVIDE BY ZERO>", "condition": null },
   "lastTx": 1234, "elapsedMs": 1, "requestId": "b1c2…" }
+```
+
+Syntax errors also include a one-based `location` in the `error` object, so
+editors can highlight the reported source position:
+
+```json
+{ "ok": false, "error": { "code": "SYNTAX", "message": "...",
+  "condition": null, "location": { "line": 3, "column": 8 } } }
 ```
 
 For an unhandled `SIGNAL`, `code` is the condition name and `condition` is `{ "name": "OOPS", "fields": { "reason": "bad" } }`.
@@ -131,11 +139,11 @@ Verified: passwords are PBKDF2-SHA256 at 100,000 iterations, and `verifyPassword
 Request (both execute endpoints):
 
 ```json
-{ "command": "SET ^T(1)=5\nWRITE ^T(1),!", "namespace": "_GLOBAL", "timeoutMs": 5000 }
+{ "command": "SET ^T(1)=5\nWRITE ^T(1),!", "namespace": "%GLOBAL", "timeoutMs": 5000 }
 ```
 
 - `command` is Phase source, possibly several lines. It goes through the same path as REPL input: `buildLogicalLines`, then either routine-tag registration or `runRoutine`. Block openers, `DO … END DO`, `EVALUATE` and handlers work as in a script.
-- `namespace` is optional; the default is the session's, or `_GLOBAL` for one-shot.
+- `namespace` is optional; the default is the session's, or `%GLOBAL` for one-shot.
 - `timeoutMs` is optional and capped by the server maximum.
 - If `command` is a single bare expression, `value` holds its result (the REPL's `- : value` echo) and `output` is empty.
 - If `command` defines column-0 routine tags, the response is `{ "ok": true, "registered": ["NS.NAME"], … }`.
@@ -147,7 +155,7 @@ Request (both execute endpoints):
 
 ```json
 { "token": "…", "expiresAt": "2026-10-13T20:00:00Z", "idleTimeoutSeconds": 1800,
-  "user": "SYSTEM", "role": "admin", "namespace": "_GLOBAL" }
+  "user": "SYSTEM", "role": "admin", "namespace": "%GLOBAL" }
 ```
 
 Two requests for one session never run concurrently: the second waits on a per-session lock, for at most `queueTimeoutMs` (else 503 `BUSY`) (D6).
@@ -176,7 +184,7 @@ These are the library functions behind `.checkpoint`, `.compact` and `.adduser`,
 
 - `fileSizeBytes` is the size of the database file at the time of the request.
 - `version` is the package version from the `.cabal` file (§12, item 10).
-- `config` has one entry for each of the eight resource limits of §9.1, keyed by its `^_CONFIG("server", name)` name. `value` is the effective value, and `source` is `flag`, `config` or `default`, following the order of D9.
+- `config` has one entry for each of the eight resource limits of §9.1, keyed by its `^%CONFIG("server", name)` name. `value` is the effective value, and `source` is `flag`, `config` or `default`, following the order of D9.
 - `sessionCount` is taken after expired sessions have been swept (§8).
 
 **`POST /v1/admin/checkpoint`** takes no body (an empty body or `{}` is accepted). It appends a checkpoint record to the WAL. This is non-destructive and is not a transaction, so `lastTx` is unchanged. Failure: `CHECKPOINT FAILED`.
@@ -202,7 +210,7 @@ Bytes live inside the database file, as decided; this is the HTTP surface only.
 
 - `PUT /v1/blobs`, body is the raw bytes (`Content-Type` stored as metadata; `X-Phase-Filename` optional). Streamed and hashed incrementally, so memory stays bounded. Optional `?ref=^GLOBAL(subs)` sets that node to `BLOB:<hash>` in the same WAL transaction as the blob. Response: `{ "ok": true, "pointer": "BLOB:<hash>", "hash": "…", "size": n }`. Requires write role and write access to `ref`'s global.
 - `GET`/`HEAD /v1/blobs?ref=^GLOBAL(subs)`, the server reads that node **with the caller's credentials**, requires its value to be a `BLOB:` pointer, then streams the bytes with `Content-Type` and `Content-Length`. The caller therefore needs read access to the pointing global: no way to reach a blob through a global they are denied.
-- `GET /v1/blobs/{hash}`, bare-hash access, admin only. `^_BLOBS` is readable by admins only, so hashes cannot be enumerated.
+- `GET /v1/blobs/{hash}`, bare-hash access, admin only. `^%CATALOG` is readable by admins only, so hashes cannot be enumerated.
 - Limits: `--max-blob-bytes`. Range requests are a later addition.
 - Blob statements that touch the server's filesystem (`BLOBSAVE`, `$BLOBWRITE` with a path) are disabled for API sessions; they raise `FILE ACCESS DISABLED`.
 
@@ -249,7 +257,7 @@ The engine is an immutable `StorageEngine` value, carried in `Env`. The REPL thr
 
 ### 9.1 Configuration
 
-Every setting has one of three sources, checked in this order (decision D9): a command-line flag or its `PHASEDB_*` environment variable, then `^_CONFIG("server", name)` in the database, then the built-in default. A flag **overrides** the database value. The database is read on each use, as `^_CONFIG("retry","max")` already is, so an administrator can change a limit with `SET` and it applies from the next request without a restart, unless a flag pins it. `GET /v1/admin/status` reports each effective value and its source (`flag`, `config` or `default`); the format is in §6.3.
+Every setting has one of three sources, checked in this order (decision D9): a command-line flag or its `PHASEDB_*` environment variable, then `^%CONFIG("server", name)` in the database, then the built-in default. A flag **overrides** the database value. The database is read on each use, as `^%CONFIG("retry","max")` already is, so an administrator can change a limit with `SET` and it applies from the next request without a restart, unless a flag pins it. `GET /v1/admin/status` reports each effective value and its source (`flag`, `config` or `default`); the format is in §6.3.
 
 Only resource limits can come from the database: `execTimeoutMs`, `execTimeoutMaxMs`, `maxOutputBytes`, `maxBodyBytes`, `sessionIdleSeconds`, `sessionMaxSeconds`, `maxSessions` and `queueTimeoutMs`. Settings that are needed before the database opens, or that affect exposure, are flags only: `--db`, `--listen`, `--port`, `--tls-cert`, `--tls-key`, `--cors-origin` and `--allow-insecure-basic`.
 
@@ -301,7 +309,7 @@ Tests come first for each milestone, in the existing runner, using `Network.Wai.
 - **Durability:** after `ok: true`, reopening the file shows the writes.
 - **Concurrency:** many parallel sessions incrementing one global lose no updates, and the final state equals some sequential order; a long-running read does not delay a concurrent write or other reads; a write that raced another is re-run exactly once and reflects the latest state; a read-only request never publishes anything; a `LOCK` held by one session blocks another and counts as a write; closing a session frees its locks; with `-N`, at least two requests are observed running at the same time.
 - **Sessions and locks:** a one-shot request's locks are released when it ends and publish nothing; an expired session's locks are released by the next request; a session running a request is not expired; a second request on a busy session gets 503 `BUSY` after `queueTimeoutMs`, or runs if the session frees up in time; a logout waits for a running request.
-- **Admin:** the effects of `users`, `checkpoint` and `compact` are visible to the very next request (a new user can log in at once, and the next write continues from the right `lastTx`); no admin operation reuses a transaction number; `users` answers `USER EXISTS` for a duplicate and 400 for an unknown role; two concurrent `users` requests for one name give one success; `compact` and `checkpoint` leave committed data readable and durable (reopening the file shows it); a non-admin gets 403 on every admin endpoint; `status` reports each effective setting with the right source for a flag, a `^_CONFIG` value and a default; writers that wait longer than `queueTimeoutMs` behind a compaction get 503 `BUSY`, and reads are not delayed by it.
+- **Admin:** the effects of `users`, `checkpoint` and `compact` are visible to the very next request (a new user can log in at once, and the next write continues from the right `lastTx`); no admin operation reuses a transaction number; `users` answers `USER EXISTS` for a duplicate and 400 for an unknown role; two concurrent `users` requests for one name give one success; `compact` and `checkpoint` leave committed data readable and durable (reopening the file shows it); a non-admin gets 403 on every admin endpoint; `status` reports each effective setting with the right source for a flag, a `^%CONFIG` value and a default; writers that wait longer than `queueTimeoutMs` behind a compaction get 503 `BUSY`, and reads are not delayed by it.
 - **Limits:** oversized body, oversized output, long-running loop (including a non-allocating one).
 - **Error mapping:** one test per `EvalError` constructor and for a signalled condition.
 - **Portability:** the suite runs on both a Linux and a Windows runner.
@@ -344,7 +352,7 @@ Each is a small change in the existing engine, with its own tests:
 | D6 | Concurrent requests in one session? | They queue, each for at most `queueTimeoutMs` (else 503 `BUSY`). A logout waits for a request of that session that is still running. |
 | D7 | Partial output on failure? | Dropped, as in the REPL. |
 | D8 | Re-validate role and denylist on every request? | Yes. |
-| D9 | Where do server settings live? | Flags override matching `^_CONFIG("server", …)` values (§9.1). |
+| D9 | Where do server settings live? | Flags override matching `^%CONFIG("server", …)` values (§9.1). |
 | D10 | Executables? | `phasedb-server` for the server; the REPL executable is renamed `phasedb`. |
 | D11 | What happens to the locks of a one-shot request? | It gets its own job id and its locks are released when it ends. The job id of a session is random, not derived from its token. |
 | D12 | How do expired sessions release their locks? | A sweep at the start of every request (not health), with no reaper thread. It skips sessions with a request in flight and is skipped when the engine lock is busy (try-lock). |

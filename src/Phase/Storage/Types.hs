@@ -102,7 +102,7 @@ data WalOp
   | WalBlob !Text !ByteString
     -- ^ A content-addressed blob (§6.5 / Part XI).  'Text' is the
     -- lower-case hex SHA-256 of the raw bytes; 'ByteString' is the
-    -- raw blob content.  Blobs are stored in @^_BLOBS@ metadata
+    -- raw blob content.  Blobs are stored in @^%CATALOG@ metadata
     -- (admin-only) and referenced from other globals as the string
     -- value @\"blob:\<hash\>\"@.  Blobs cannot be written via ordinary
     -- SET/KILL commands, only through the blob upload API, and they

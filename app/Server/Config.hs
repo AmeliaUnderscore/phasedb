@@ -2,7 +2,7 @@
 
 -- | Server configuration: all flags described in §9.1 of the HTTP spec.
 --
--- Three-tier resolution order (D9): CLI flag > @^_CONFIG("server", name)@
+-- Three-tier resolution order (D9): CLI flag > @^%CONFIG("server", name)@
 -- in the database > built-in default.  The database tier is consulted
 -- per-use in 'Server.State.configValue' rather than at startup, so a
 -- live @SET@ takes effect without a restart, unless a flag pins it.
