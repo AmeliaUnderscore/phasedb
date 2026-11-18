@@ -8,7 +8,7 @@
 # The app's API client defaults BASE to the same origin (""), so /v1/* is
 # handled by nginx inside the container and never leaves it.
 #
-#   docker build -t phasedb-ui:latest -f phasedb-ui/Dockerfile .
+#   docker build -t phasedb-ui:latest -f phasedb/phasedb-ui/Dockerfile .
 #   docker run --rm -p 5173:80 phasedb-ui:latest
 #
 # Dev (hot reload) on the host instead, point the app at PhaseDB:
@@ -19,10 +19,10 @@ FROM node:22-bookworm AS builder
 
 WORKDIR /build
 
-COPY phasedb-ui/package.json phasedb-ui/package-lock.json ./
+COPY phasedb/phasedb-ui/package.json phasedb/phasedb-ui/package-lock.json ./
 RUN npm ci
 
-COPY phasedb-ui/ ./
+COPY phasedb/phasedb-ui/ ./
 
 RUN npm run build
 

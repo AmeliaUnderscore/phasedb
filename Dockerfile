@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# phasedb-hs, PhaseDB HTTP server (Haskell / Warp).
+# phasedb, PhaseDB HTTP server (Haskell / Warp).
 #
 # Builds the `phasedb-server` executable from source (GHC 9.10 + cabal) and
 # ships a minimal runtime image. Default configuration: bind 127.0.0.1:8484,
 # database file `phase.db` in the working directory.
 #
-#   docker build -t phasedb-hs:latest -f phasedb-hs/Dockerfile .
+#   docker build -t phasedb:latest -f phasedb/Dockerfile .
 #   docker run --rm -it \
 #     -p 8484:8484 \
-#     -v $PWD/phase.db:/data/phase.db \
-#     phasedb-hs:latest --db /data/phase.db --listen 0.0.0.0 --port 8484
+#     -v $PWD/phase.db:/data/phase.db \         
+#     phasedb:latest --db /data/phase.db --listen 0.0.0.0 --port 8484
 #
 # The first build pulls GHC + cabal plus roughly 15 Hackage packages
 # (base, text, parsec, scientific, containers, time, ..., haskeline, warp,
@@ -28,16 +28,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy sources first so dependency rebuilding is skipped when only source
 # files change. This builds BOTH executables (phasedb REPL + phasedb-server).
-COPY phasedb-hs/phasedb-hs.cabal phasedb-hs/LICENSE phasedb-hs/CHANGELOG.md ./
-COPY phasedb-hs/src ./src
-COPY phasedb-hs/app ./app
+COPY phasedb/phasedb-hs.cabal phasedb/LICENSE phasedb/CHANGELOG.md ./
+COPY phasedb/src ./src
+COPY phasedb/app ./app
 
 RUN cabal update \
  && cabal build -O2 phasedb phasedb-server -j2 \
  && mkdir -p /out \
  && install -m 0755 "$(cabal list-bin -O2 phasedb-server)" /out/phasedb-server
 
-FROM debian:bookworm-slim AS phasedb-hs
+FROM debian:bookworm-slim AS phasedb
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates passwd libgmp10 libffi8 libncurses6 libtinfo6 curl \
@@ -49,8 +49,7 @@ WORKDIR /home/phasedb
 RUN mkdir -p /data && chown phasedb:phasedb /data
 
 COPY --from=builder /out/phasedb-server .
-COPY --chown=phasedb:phasedb phasedb-hs/phase.db /usr/share/phasedb/phase.db
-COPY phasedb-hs/docker-entrypoint.sh /usr/local/bin/phasedb-entrypoint
+COPY phasedb/docker-entrypoint.sh /usr/local/bin/phasedb-entrypoint
 RUN chmod 0755 /usr/local/bin/phasedb-entrypoint
 
 # The server binds 127.0.0.1:8484 by default and reads its database from
